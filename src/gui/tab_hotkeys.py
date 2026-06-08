@@ -345,6 +345,12 @@ def build_hotkeys_tab(ctx):
     version_label.setOpenExternalLinks(True)
     info_layout.addWidget(version_label)
 
+    check_updates_btn = QPushButton(tl('check_for_updates'))
+    check_updates_btn.clicked.connect(
+        lambda: send_queue.put(GUICommand(GUICommandType.CheckForUpdates))
+    )
+    info_layout.addWidget(check_updates_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
     repo_links_row = QHBoxLayout()
     repo_links_row.setSpacing(4)
     repo_links_row.addStretch()

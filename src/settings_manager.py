@@ -43,6 +43,9 @@ DEFAULT_SETTINGS = {
     "discard_duplicate_cards": True,
     # [launcher]
     "remember_chosen_clients": False,
+    # [updates]
+    "check_for_updates": True,
+    "auto_install_updates": False,
 }
 
 RESTART_REQUIRED_KEYS = {"locale"}

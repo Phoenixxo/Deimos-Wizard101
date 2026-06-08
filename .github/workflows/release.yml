@@ -97,12 +97,18 @@ jobs:
     - name: Install dependencies
       run: uv sync --group dev
 
+    - name: Build update helper (Rust)
+      shell: bash
+      run: |
+        cargo build --release --manifest-path libs/updater/Cargo.toml
+        ls -la libs/updater/target/release/deimos-updater.exe
+
     - name: Build with PyInstaller
       run: |
         uv run --group dev pyinstaller --noconfirm --clean Deimos.spec
         echo "Build completed successfully"
         dir dist
-    
+
     - name: Verify required files exist
       shell: bash
       run: |
@@ -117,21 +123,28 @@ jobs:
         fi
         echo "All required files found ✓"
         echo "Deimos.exe size: $(stat -c%s dist/Deimos.exe) bytes"
-    
+
+    - name: Generate checksum
+      shell: powershell
+      run: |
+        $hash = (Get-FileHash "dist/Deimos.exe" -Algorithm SHA256).Hash.ToLower()
+        "$hash  Deimos.exe" | Out-File -FilePath "dist/Deimos.exe.sha256" -Encoding ascii -NoNewline
+        Write-Host "SHA256: $hash"
+
     - name: Create release package
       shell: powershell
       run: |
         Write-Host "Creating release package..."
         New-Item -ItemType Directory -Path "release" -Force
-        
+
         # Copy files to release directory
         Copy-Item "dist/Deimos.exe" -Destination "release/"
         Copy-Item "LICENSE" -Destination "release/"
-        
+
         # Create zip file with version in name using PowerShell
         $zipName = "Deimos-${{ steps.version.outputs.VERSION_TAG }}.zip"
         Compress-Archive -Path "release/*" -DestinationPath $zipName -Force
-        
+
         Write-Host "Release package created: $zipName"
         Write-Host "Package contents:"
         Get-ChildItem "release" | Format-Table Name, Length
@@ -173,6 +186,8 @@ jobs:
           **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.LAST_TAG }}...${{ steps.version.outputs.VERSION_TAG }}
         files: |
           Deimos-${{ steps.version.outputs.VERSION_TAG }}.zip
+          dist/Deimos.exe
+          dist/Deimos.exe.sha256
         draft: false
         prerelease: ${{ contains(steps.version.outputs.VERSION_NUMBER, 'alpha') || contains(steps.version.outputs.VERSION_NUMBER, 'beta') || contains(steps.version.outputs.VERSION_NUMBER, 'rc') }}
       env:

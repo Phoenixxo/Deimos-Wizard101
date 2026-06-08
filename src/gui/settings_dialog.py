@@ -349,6 +349,16 @@ def show_settings_dialog(ctx):
 
     layout.addWidget(launcher_group)
 
+    # ---- Updates ----
+    updates_group = QGroupBox(tl('settings_updates'))
+    updates_form = QFormLayout(updates_group)
+    updates_form.setSpacing(4)
+
+    _add_checkbox(updates_form, 'check_for_updates', 'setting_check_for_updates')
+    _add_checkbox(updates_form, 'auto_install_updates', 'setting_auto_install_updates')
+
+    layout.addWidget(updates_group)
+
     layout.addStretch()
 
     # ---- Bottom buttons ----

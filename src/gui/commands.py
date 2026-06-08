@@ -88,6 +88,12 @@ class GUICommandType(Enum):
 
     UpdateSettings = auto()  # GUI -> Backend: dict of {key: value} pairs
 
+    # Auto-update
+    CheckForUpdates = auto()   # GUI -> Backend: trigger a manual update check (data: None)
+    ApplyUpdate = auto()       # GUI -> Backend: user accepted; download + apply (data: None)
+    ShowUpdatePrompt = auto()  # Backend -> GUI: data = {'version': str, 'notes_url': str}
+    UpdateProgress = auto()    # Backend -> GUI: data = ('status'|'progress'|'error', value)
+
 
 class GUIKeys:
     toggle_speedhack = "togglespeedhack"

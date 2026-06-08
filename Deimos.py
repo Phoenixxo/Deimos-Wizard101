@@ -45,6 +45,7 @@ from typing import List
 from src import gui as deimosgui
 from src.gui import GUIKeys
 import wizlaunch
+from src import updater
 from src.settings_manager import DeimosSettings
 from src.tokenizer import tokenize
 from src.deimoslang import vm
@@ -116,6 +117,8 @@ automatic_team_based_combat = False
 discard_duplicate_cards = True
 ignore_pet_level_up = False
 only_play_dance_game = False
+check_for_updates = True
+auto_install_updates = False
 
 settings = DeimosSettings()
 settings.migrate_theme_from_settings()
@@ -146,6 +149,8 @@ only_play_dance_game = _json_settings.get('only_play_dance_game', only_play_danc
 kill_minions_first = _json_settings.get('kill_minions_first', kill_minions_first)
 automatic_team_based_combat = _json_settings.get('automatic_team_based_combat', automatic_team_based_combat)
 discard_duplicate_cards = _json_settings.get('discard_duplicate_cards', discard_duplicate_cards)
+check_for_updates = _json_settings.get('check_for_updates', check_for_updates)
+auto_install_updates = _json_settings.get('auto_install_updates', auto_install_updates)
 
 while True:
 	if hasattr(sys, '_MEIPASS'):
@@ -208,50 +213,87 @@ def generate_timestamp() -> str:
 
 
 
-def run_updater():
-	download_file(url=f"{repo_path_raw}/{tool_name}Updater.exe", file_name=f'{tool_name}Updater.exe', delete_previous=True)
-	time.sleep(0.1)
-	subprocess.Popen(f'{tool_name}Updater.exe')
-	sys.exit()
+# Holds the ReleaseInfo for an update that has been found but not yet installed.
+available_release = None
 
 
-def get_latest_version() -> str:
-	update_server = None
+async def _check_for_updates(manual: bool = False):
+	"""Check GitHub for a newer release. Prompts the GUI (or auto-installs).
 
-	try:
-		update_server = read_webpage(f"{repo_path_raw}/LatestVersion.txt")
-	except:
-		time.sleep(0.1)
+	``manual`` distinguishes the user clicking "Check for Updates" (which always
+	reports a result) from the silent startup check (which stays quiet unless an
+	update is found).
+	"""
+	global available_release
 
-	if len(update_server) >= 1:
-		return update_server[0]
+	if not updater.is_frozen():
+		logger.debug("Update check skipped — not running as a frozen build.")
+		if manual:
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('uptodate', tool_version)))
+		return
+
+	info = await asyncio.to_thread(updater.get_latest_release, tool_author, repo_name)
+	if info is None:
+		logger.debug("Update check returned no release info.")
+		if manual:
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('checkfailed', None)))
+		return
+
+	if updater.is_newer(info.version, tool_version):
+		if not info.exe_url:
+			logger.warning(f"v{info.version} is available but has no downloadable exe asset.")
+			if manual:
+				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress,
+					('error', f'v{info.version} is available, but no auto-install package was found. Please update manually.')))
+			return
+
+		available_release = info
+		logger.info(f"Update available: v{info.version} (current v{tool_version}).")
+		if auto_install_updates and not manual:
+			await _do_apply_update()
+		else:
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ShowUpdatePrompt,
+				{'version': info.version, 'notes_url': info.notes_url}))
 	else:
-		return None
+		logger.debug(f"Deimos is up to date (v{tool_version}).")
+		if manual:
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('uptodate', tool_version)))
 
 
-def is_version_greater(version: str, comparison_version: str) -> bool:
-	# Compares the semantic version of two inputted versions and returns True if the first is greater
-	version_list = version.split('.')
-	comparison_version_list = comparison_version.split('.')
+async def _do_apply_update():
+	"""Download the pending update, unhook clients, then hand off to the helper."""
+	info = available_release
+	if info is None or not info.exe_url:
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('error', 'No update is available to install.')))
+		return
 
-	for i, v in enumerate(version_list):
-		current_v = int(v)
-		current_comparison_v = int(comparison_version_list[i])
-		if current_v > current_comparison_v:
-			return True
-		elif current_v < current_comparison_v:
-			return False
+	def _progress(pct):
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('progress', pct)))
 
-	return False
+	gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('status', 'Downloading update...')))
+	path = await asyncio.to_thread(updater.download_update, info.exe_url, info.sha256, progress_cb=_progress)
+	if path is None:
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('error', 'Download or verification failed. Please try again.')))
+		return
 
+	gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress, ('status', 'Closing clients and restarting...')))
 
-# def auto_update(latest_version: str = get_latest_version()):
-# 	remove_if_exists(f'{tool_name}-copy.exe')
-# 	remove_if_exists(f'{tool_name}Updater.exe')
-# 	time.sleep(0.1)
-# 	if auto_updating:
-# 		if is_version_greater(latest_version, tool_version):
-# 			run_updater()
+	# Unhook all clients cleanly before the executable is swapped out.
+	try:
+		await tool_finish()
+	except Exception as e:
+		logger.warning(f"Error during pre-update shutdown: {e}")
+
+	if not updater.apply_and_relaunch(path):
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateProgress,
+			('error', 'Could not start the updater. Please download the new version manually.')))
+		return
+
+	# The helper is now waiting on our PID. Close the GUI and hard-exit so it can
+	# replace the locked executable and relaunch it.
+	gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.Close))
+	await asyncio.sleep(0.5)
+	os._exit(0)
 
 
 
@@ -1680,6 +1722,10 @@ async def main():
 							if not walker.clients:
 								os._exit(0)
 							raise deimosgui.ToolClosedException
+						case deimosgui.GUICommandType.CheckForUpdates:
+							asyncio.create_task(_check_for_updates(manual=True))
+						case deimosgui.GUICommandType.ApplyUpdate:
+							asyncio.create_task(_do_apply_update())
 						case deimosgui.GUICommandType.ToggleOption:
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
@@ -2390,6 +2436,7 @@ async def main():
 							global questing_friend_tp, gear_switching_in_solo_zones, hitter_client
 							global ignore_pet_level_up, only_play_dance_game
 							global kill_minions_first, automatic_team_based_combat, discard_duplicate_cards
+							global check_for_updates, auto_install_updates
 							settings_dict = com.data
 							for key, value in settings_dict.items():
 								match key:
@@ -2410,6 +2457,8 @@ async def main():
 									case 'kill_minions_first': kill_minions_first = value
 									case 'automatic_team_based_combat': automatic_team_based_combat = value
 									case 'discard_duplicate_cards': discard_duplicate_cards = value
+									case 'check_for_updates': check_for_updates = value
+									case 'auto_install_updates': auto_install_updates = value
 							logger.debug(f'Settings updated: {list(settings_dict.keys())}')
 
 			except queue.Empty:
@@ -2678,6 +2727,10 @@ async def main():
 	await asyncio.sleep(2)
 	# logger.debug("1")
 
+	# Silent startup update check (frozen builds only; respects user setting)
+	if check_for_updates:
+		asyncio.create_task(_check_for_updates(manual=False))
+
 	async def ban_watcher():
 		known_ban = False
 		try:
@@ -2862,48 +2915,7 @@ def bool_to_string(input: bool):
 		return 'Disabled'
 
 
-# def handle_tool_updating():
-# 	version = get_latest_version()
-# 	update_server = None
-
-# 	try:
-# 		update_server = read_webpage(f"{repo_path_raw}/LatestVersion.txt")
-# 	except Exception as e:
-# 		print(f"Exception \"{type(e).__name__}\" occured when checking for updates: \"{e}\"")
-# 		return
-	
-# 	if update_server is None:
-# 		return
-
-# 	if update_server is not None and update_server[1].lower() == 'false':
-# 		raise KeyboardInterrupt
-
-# 	if update_server is not None:
-# 		version_specific_data = update_server[2:]
-# 		version_status_check = ' '.join(version_specific_data)
-
-# 		if tool_version in version_status_check:
-# 			version_status_index = index_with_str(version_specific_data, tool_version)
-# 			version_status = version_specific_data[version_status_index].split(' ')[1]
-
-# 			if version_status.lower() == 'false':
-# 				raise KeyboardInterrupt
-
-# 			elif version_status.lower() == 'force':
-# 				auto_update()
-
-# 		if version and auto_updating:
-# 			if is_version_greater(version, tool_version):
-# 				auto_update()
-
-# 			if not is_version_greater(tool_version, version):
-# 				config_update()
-
-
 if __name__ == "__main__":
-	# Validate configs and update the tool
-	# handle_tool_updating()
-
 	current_log = logger.add(f"logs/{tool_name} - {generate_timestamp()}.log", encoding='utf-8', enqueue=True, backtrace=True)
 
 	# Set up GUI queues before starting anything

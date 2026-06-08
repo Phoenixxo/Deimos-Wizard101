@@ -3,11 +3,90 @@ import pyperclip
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QListWidget, QListWidgetItem, QWidget, QMenu,
+    QLineEdit, QListWidget, QListWidgetItem, QWidget, QMenu, QProgressBar,
 )
 from PyQt6.QtCore import Qt, QSize
 
 from src.gui.commands import GUICommand, GUICommandType
+
+
+def show_update_dialog(parent, send_queue, version, notes_url, tool_name='Deimos', tl=None):
+    """Non-modal 'update available' prompt.
+
+    Returns the dialog, which exposes ``set_progress``/``set_status``/``set_error``
+    so the backend's progress messages can drive it. On accept it sends
+    ``ApplyUpdate`` and switches into a download-progress view.
+    """
+    _ = tl or (lambda k: k)
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(f"{tool_name} Update")
+    layout = QVBoxLayout(dialog)
+
+    headline = QLabel(f"<b>{tool_name} v{version}</b> is available.")
+    headline.setTextFormat(Qt.TextFormat.RichText)
+    layout.addWidget(headline)
+
+    if notes_url:
+        link = QLabel(f'<a href="{notes_url}">View changelog</a>')
+        link.setTextFormat(Qt.TextFormat.RichText)
+        link.setOpenExternalLinks(True)
+        layout.addWidget(link)
+
+    status_label = QLabel("")
+    status_label.setWordWrap(True)
+    status_label.hide()
+    layout.addWidget(status_label)
+
+    progress = QProgressBar()
+    progress.setRange(0, 100)
+    progress.hide()
+    layout.addWidget(progress)
+
+    btn_row = QHBoxLayout()
+    later_btn = QPushButton("Later")
+    update_btn = QPushButton("Update now")
+    update_btn.setDefault(True)
+    btn_row.addWidget(later_btn)
+    btn_row.addWidget(update_btn)
+    layout.addLayout(btn_row)
+
+    def on_update():
+        update_btn.setEnabled(False)
+        later_btn.setEnabled(False)
+        status_label.setText("Downloading update...")
+        status_label.show()
+        progress.setValue(0)
+        progress.show()
+        dialog.adjustSize()
+        send_queue.put(GUICommand(GUICommandType.ApplyUpdate))
+
+    update_btn.clicked.connect(on_update)
+    later_btn.clicked.connect(dialog.close)
+
+    def set_progress(pct):
+        progress.show()
+        progress.setValue(int(pct))
+
+    def set_status(msg):
+        status_label.setText(str(msg))
+        status_label.show()
+
+    def set_error(msg):
+        progress.hide()
+        status_label.setText(str(msg))
+        status_label.show()
+        update_btn.setEnabled(True)
+        later_btn.setEnabled(True)
+        update_btn.setText("Retry")
+
+    dialog.set_progress = set_progress
+    dialog.set_status = set_status
+    dialog.set_error = set_error
+
+    dialog.adjustSize()
+    dialog.show()
+    return dialog
 
 
 def show_ui_tree_popup(parent, send_queue, ui_tree_content, text_dict, copy_btn_factory, tl=None):
