@@ -1,3 +1,4 @@
+import html
 import re
 import pyperclip
 
@@ -8,6 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize
 
 from src.gui.commands import GUICommand, GUICommandType
+from src.gui.helpers import launcher_small_icon_btn, spinning_loader_widget
 
 
 def show_update_dialog(parent, send_queue, version, notes_url, tool_name='Deimos', tl=None):
@@ -85,6 +87,108 @@ def show_update_dialog(parent, send_queue, version, notes_url, tool_name='Deimos
     dialog.set_error = set_error
 
     dialog.adjustSize()
+    dialog.show()
+    return dialog
+
+
+def show_bot_search_popup(ctx, bot_tab):
+    """Popup listing registry bots compatible with the current zone and client count.
+
+    Opens in a 'searching' state; the backend's ``BotSearchResults`` message drives
+    it via the exposed ``set_results``. Each row can load the bot into the Bot tab
+    editor or import and run it through the existing bot machinery.
+    """
+    tl = ctx.tl
+    dialog = QDialog(ctx.window)
+    dialog.setWindowTitle(tl('bot_search_title'))
+    dialog.resize(520, 400)
+    layout = QVBoxLayout(dialog)
+
+    status_row = QHBoxLayout()
+    loader = spinning_loader_widget(ctx)
+    status_row.addWidget(loader)
+    status_label = QLabel(tl('bot_search_searching'))
+    status_label.setWordWrap(True)
+    status_row.addWidget(status_label, 1)
+    layout.addLayout(status_row)
+
+    listbox = QListWidget()
+    listbox.hide()
+    layout.addWidget(listbox, 1)
+
+    def _import_bot(path, run):
+        ctx.send_queue.put(GUICommand(GUICommandType.ImportSearchedBot, (path, run)))
+        ctx.tabs.setCurrentWidget(bot_tab)
+        dialog.close()
+
+    def _add_bot_row(bot):
+        item = QListWidgetItem()
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(4, 2, 4, 2)
+        row_layout.setSpacing(4)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+        meta_parts = [f"<b>{html.escape(str(bot.get('name', '?')))}</b>"]
+        if bot.get('author'):
+            meta_parts.append(html.escape(str(bot['author'])))
+        if bot.get('format'):
+            meta_parts.append(html.escape(str(bot['format'])))
+        if bot.get('clients'):
+            meta_parts.append(html.escape(f"@clients {bot['clients']}"))
+        if bot.get('is_general'):
+            meta_parts.append(tl('bot_search_general'))
+        title_label = QLabel(' &nbsp;·&nbsp; '.join(meta_parts))
+        title_label.setTextFormat(Qt.TextFormat.RichText)
+        text_col.addWidget(title_label)
+
+        description = str(bot.get('description') or '').strip()
+        if description:
+            short = description if len(description) <= 150 else description[:150] + '…'
+            desc_label = QLabel(short)
+            desc_label.setWordWrap(True)
+            desc_label.setToolTip(description)
+            text_col.addWidget(desc_label)
+        row_layout.addLayout(text_col, 1)
+
+        path = bot.get('path')
+        row_layout.addWidget(launcher_small_icon_btn(
+            ctx, ctx.svgs['import'], tl('bot_search_import'), lambda _=False, p=path: _import_bot(p, False)))
+        row_layout.addWidget(launcher_small_icon_btn(
+            ctx, ctx.svgs['play'], tl('bot_search_run'), lambda _=False, p=path: _import_bot(p, True)))
+
+        item.setSizeHint(row_widget.sizeHint())
+        listbox.addItem(item)
+        listbox.setItemWidget(item, row_widget)
+
+    def set_results(data):
+        loader.hide()
+        error = data.get('error')
+        if error:
+            error_keys = {'no_clients': 'bot_search_no_clients', 'no_zone': 'bot_search_no_zone'}
+            status_label.setText(tl(error_keys.get(error, 'bot_search_error')))
+            return
+        zone = data.get('zone', '')
+        count = data.get('client_count', 0)
+        bots = data.get('bots') or []
+        if not bots:
+            status_label.setText(tl('bot_search_no_results').format(zone, count))
+            return
+        status_label.setText(tl('bot_search_results_header').format(zone, count))
+        listbox.setUpdatesEnabled(False)
+        listbox.clear()
+        for bot in bots:
+            _add_bot_row(bot)
+        listbox.setUpdatesEnabled(True)
+        listbox.show()
+
+    dialog.set_results = set_results
+
+    close_btn = QPushButton(tl('close'))
+    close_btn.clicked.connect(dialog.close)
+    layout.addWidget(close_btn)
+
     dialog.show()
     return dialog
 

@@ -640,6 +640,15 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                                 pass
                         entity_popup_ref[0] = show_entity_list_popup(window, send_queue, widget_tags, tabs, dev_tab, camera_tab, tl=tl)
 
+                    case GUICommandType.BotSearchResults:
+                        dlg = getattr(ctx, 'bot_search_dialog', None)
+                        if dlg is not None:
+                            try:
+                                if dlg.isVisible():
+                                    dlg.set_results(com.data or {})
+                            except RuntimeError:
+                                ctx.bot_search_dialog = None
+
                     case GUICommandType.UpdateEntityListData:
                         popup = entity_popup_ref[0]
                         if popup is not None and popup.isVisible():

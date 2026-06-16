@@ -45,6 +45,7 @@ from typing import List
 from src import gui as deimosgui
 from src.gui import GUIKeys
 import wizlaunch
+from src import bot_registry
 from src import updater
 from src.settings_manager import DeimosSettings
 from src.tokenizer import tokenize
@@ -2227,6 +2228,41 @@ async def main():
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
+						case deimosgui.GUICommandType.SearchBots:
+							if not walker.clients or not foreground_client:
+								gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.BotSearchResults, {'error': 'no_clients'}))
+								continue
+							search_client = foreground_client
+							async def _search_bots():
+								try:
+									current_zone = await search_client.zone_name()
+								except Exception:
+									current_zone = None
+								if not current_zone:
+									gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.BotSearchResults, {'error': 'no_zone'}))
+									return
+								client_count = len(walker.clients)
+								try:
+									found_bots = await asyncio.to_thread(bot_registry.search_compatible_bots, current_zone, client_count)
+								except Exception as e:
+									logger.error(f'Bot registry search failed: {e}')
+									gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.BotSearchResults, {'error': 'network'}))
+									return
+								gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.BotSearchResults, {'zone': current_zone, 'client_count': client_count, 'bots': found_bots}))
+							asyncio.create_task(_search_bots())
+						case deimosgui.GUICommandType.ImportSearchedBot:
+							bot_path, run_after_import = com.data
+							async def _import_searched_bot(path: str, run: bool):
+								try:
+									bot_text = await asyncio.to_thread(bot_registry.fetch_bot_text, path)
+								except Exception as e:
+									logger.error(f'Failed to download bot {path}: {e}')
+									return
+								gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('bot_creator', bot_text)))
+								if run:
+									# Reuse the existing bot runner by re-enqueueing as a normal ExecuteBot command
+									recv_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ExecuteBot, bot_text))
+							asyncio.create_task(_import_searched_bot(bot_path, run_after_import))
 						case deimosgui.GUICommandType.SetPlaystyles:
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")

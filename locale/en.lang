@@ -111,6 +111,17 @@ import_bot=Import Bot
 export_bot=Export Bot
 run_bot=Run Bot
 kill_bot=Kill Bot
+search_bots=Search Compatible Bots
+bot_search_title=Compatible Bots
+bot_search_searching=Searching for compatible bots...
+bot_search_results_header=Bots for {0} with {1} client(s):
+bot_search_no_results=No compatible bots found for {0} with {1} client(s).
+bot_search_no_clients=No clients are hooked. Hook a client and try again.
+bot_search_no_zone=Could not read the current zone. Try again once the client has loaded in.
+bot_search_error=Could not reach the bot registry. Check your connection and try again.
+bot_search_general=General
+bot_search_import=Load into editor
+bot_search_run=Import and run
 
 # Combat
 import_playstyle=Import Playstyle

@@ -138,6 +138,17 @@ def build_bot_tab(ctx):
     def kill_bot_callback():
         ctx.send_queue.put(GUICommand(GUICommandType.KillBot))
 
+    def bot_search():
+        from src.gui.popups import show_bot_search_popup
+        existing = getattr(ctx, 'bot_search_dialog', None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+        ctx.bot_search_dialog = show_bot_search_popup(ctx, tab)
+        ctx.send_queue.put(GUICommand(GUICommandType.SearchBots))
+
     toggle_btn, set_bot_running = _make_toggle_btn(
         ctx, ctx.tl('run_bot'), ctx.tl('kill_bot'),
         run_bot_callback, kill_bot_callback, 'toggle_bot')
@@ -146,6 +157,7 @@ def build_bot_tab(ctx):
     recent_btn.clicked.disconnect()
     recent_btn.clicked.connect(lambda: show_recent_menu(ctx, 'bot', editor, recent_btn))
     btn_row.addStretch()
+    btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['search'], ctx.tl('search_bots'), bot_search))
     btn_row.addWidget(recent_btn)
     btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['import'], ctx.tl('import_bot'), bot_import))
     btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['export'], ctx.tl('export_bot'), bot_export))

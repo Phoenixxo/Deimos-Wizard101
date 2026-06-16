@@ -111,6 +111,17 @@ import_bot=导入脚本
 export_bot=导出脚本
 run_bot=运行脚本
 kill_bot=停止脚本
+search_bots=搜索可用脚本
+bot_search_title=可用脚本
+bot_search_searching=正在搜索可用脚本...
+bot_search_results_header={0}（{1} 个客户端）的可用脚本：
+bot_search_no_results=未找到适用于 {0}（{1} 个客户端）的脚本。
+bot_search_no_clients=没有已挂钩的客户端。请先挂钩客户端再试。
+bot_search_no_zone=无法读取当前区域。请等客户端加载完成后再试。
+bot_search_error=无法连接脚本仓库。请检查网络后重试。
+bot_search_general=通用
+bot_search_import=载入编辑器
+bot_search_run=导入并运行
 
 # 战斗
 import_playstyle=导入战斗风格
