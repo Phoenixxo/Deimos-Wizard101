@@ -649,6 +649,15 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                             except RuntimeError:
                                 ctx.bot_search_dialog = None
 
+                    case GUICommandType.BotPublishContext:
+                        dlg = getattr(ctx, 'bot_publish_dialog', None)
+                        if dlg is not None:
+                            try:
+                                if dlg.isVisible():
+                                    dlg.set_context(com.data or {})
+                            except RuntimeError:
+                                ctx.bot_publish_dialog = None
+
                     case GUICommandType.UpdateEntityListData:
                         popup = entity_popup_ref[0]
                         if popup is not None and popup.isVisible():

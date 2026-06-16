@@ -149,6 +149,19 @@ def build_bot_tab(ctx):
         ctx.bot_search_dialog = show_bot_search_popup(ctx, tab)
         ctx.send_queue.put(GUICommand(GUICommandType.SearchBots))
 
+    def bot_publish():
+        from src.gui.popups import show_bot_publish_popup
+        if not editor.toPlainText().strip():
+            return
+        existing = getattr(ctx, 'bot_publish_dialog', None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+        ctx.bot_publish_dialog = show_bot_publish_popup(ctx, editor.toPlainText())
+        ctx.send_queue.put(GUICommand(GUICommandType.PrepareBotPublish))
+
     toggle_btn, set_bot_running = _make_toggle_btn(
         ctx, ctx.tl('run_bot'), ctx.tl('kill_bot'),
         run_bot_callback, kill_bot_callback, 'toggle_bot')
@@ -161,6 +174,7 @@ def build_bot_tab(ctx):
     btn_row.addWidget(recent_btn)
     btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['import'], ctx.tl('import_bot'), bot_import))
     btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['export'], ctx.tl('export_bot'), bot_export))
+    btn_row.addWidget(ctx.registry.action_icon_btn(ctx.svgs['publish'], ctx.tl('publish_bot'), bot_publish))
     btn_row.addWidget(toggle_btn)
     btn_row.addStretch()
     layout.addLayout(btn_row)

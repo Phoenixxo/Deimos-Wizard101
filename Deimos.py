@@ -2263,6 +2263,19 @@ async def main():
 									# Reuse the existing bot runner by re-enqueueing as a normal ExecuteBot command
 									recv_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ExecuteBot, bot_text))
 							asyncio.create_task(_import_searched_bot(bot_path, run_after_import))
+						case deimosgui.GUICommandType.PrepareBotPublish:
+							# Best-effort: supply the current zone and Discord username to
+							# prefill the publish form. Publishing must still work with no
+							# client hooked / Discord closed, so this never errors.
+							publish_zone = ''
+							if foreground_client:
+								try:
+									publish_zone = await foreground_client.zone_name() or ''
+								except Exception:
+									publish_zone = ''
+							# Blocking named-pipe I/O — keep it off the event loop.
+							discord_username = await asyncio.to_thread(discsdk.get_discord_username) or ''
+							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.BotPublishContext, {'zone': publish_zone, 'discord_username': discord_username}))
 						case deimosgui.GUICommandType.SetPlaystyles:
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")

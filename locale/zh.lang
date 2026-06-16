@@ -122,6 +122,24 @@ bot_search_error=无法连接脚本仓库。请检查网络后重试。
 bot_search_general=通用
 bot_search_import=载入编辑器
 bot_search_run=导入并运行
+publish_bot=发布脚本
+bot_publish_title=发布脚本
+bot_publish_intro=填写以下信息，然后发布以打开 GitHub，在那里你可以将脚本作为拉取请求提交到仓库。
+bot_publish_name=名称
+bot_publish_zone=区域
+bot_publish_author=作者
+bot_publish_format=格式
+bot_publish_clients=客户端
+bot_publish_description=描述
+bot_publish_name_hint=脚本的显示名称
+bot_publish_zone_hint=游戏区域路径，例如 WizardCity/WC_Streets/WC_OldeTown
+bot_publish_clients_hint=可选，例如 == 4（留空 = 任意客户端数量）
+bot_publish_description_hint=可选。支持 Markdown。
+bot_publish_action=发布
+bot_publish_done=已在浏览器中打开
+bot_publish_bad_clients=客户端必须是比较式，如 '== 4'、'>= 1'，或留空。
+bot_publish_opened=已在浏览器中打开 GitHub。请检查并提交文件以完成发布。
+bot_publish_opened_clipboard=脚本过大无法预填充。已复制到剪贴板——请粘贴到 GitHub 编辑器中。
 
 # 战斗
 import_playstyle=导入战斗风格

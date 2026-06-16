@@ -44,6 +44,9 @@ class GUICommandType(Enum):
     ImportSearchedBot = auto()   # GUI -> Backend: data = (bot path, run: bool)
     BotSearchResults = auto()    # Backend -> GUI: data = {'zone', 'client_count', 'bots'} or {'error': str}
 
+    PrepareBotPublish = auto()   # GUI -> Backend: request current-zone context for publishing (data: None)
+    BotPublishContext = auto()   # Backend -> GUI: data = {'zone': str} (zone may be '')
+
     SetPlaystyles = auto()
 
     SetScale = auto()
