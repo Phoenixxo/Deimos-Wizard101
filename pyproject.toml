@@ -25,6 +25,7 @@ dependencies = [
     "numpy>=2.4.6",
     "shapely>=2.1.2",
     "katsuba>=0.4.0",
+    "wiztype>=0.1.12",
 ]
 
 [tool.hatch.metadata]
@@ -32,6 +33,9 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+[tool.uv]
+override-dependencies = ["pefile>=2024.8.26"]
 
 [tool.uv.workspace]
 members = ["libs/wizwalker", "libs/wizsprinter", "libs/wizlaunch", "libs/kinif"]

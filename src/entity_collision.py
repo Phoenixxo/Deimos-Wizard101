@@ -1,53 +1,40 @@
-"""Static entity collision for collision TP.
-
-Static `collision.bcd` only covers a zone's fixed architecture (walls, terrain, baked
-props); placed objects — NPCs, teleporters, interactive props — carry their collision
-on their model and are NOT in the .bcd. Crucially, for collision TP to land correctly
-on the *first* teleport we must know those colliders' locations BEFORE teleporting, so
-reading them from live memory (render-range limited) is no good. Instead we read the
-whole zone's static placements straight from the zone files:
-
-    gamedata.bin (ZoneData.m_objectList) -> per object: templateID + location + scale
-        -> TemplateManifest (templateID -> template name)
-        -> Root.wad template (katsuba) -> NIF asset path
-        -> model WAD -> kinif geometry vertices -> 2D convex-hull footprint
-        -> rotated/scaled/translated to the object's world transform
-
-Moving/pathed entities (patrol mobs) have no player collision, so they're ignored —
-they live in spawnData.xml, not m_objectList. When a placement's model can't be
-resolved (no TypeList, blank-character placeholder, unparsable NIF) it falls back to a
-bounding circle at its location, so every static object still contributes *some*
-footprint. All of this is file/CPU work with no memory reads, so it runs entirely in a
-worker thread (`build_zone_static_shapes`) and is cached per zone.
-"""
-
 import json
 import os
 import re
-import sys
 import threading
 from pathlib import Path
 
 from loguru import logger
+from shapely.affinity import rotate, scale, translate
 from shapely.geometry import MultiPoint, Point, Polygon
-from shapely.affinity import translate, rotate, scale
-
 from wizwalker.utils import get_wiz_install
 
-# katsuba + kinif are best-effort: if either is missing we degrade to bounding-box
-# entity collision rather than breaking collision TP entirely.
+# katsuba + kinif + wiztype are best-effort: if any is missing we degrade to
+# bounding-box entity collision rather than breaking collision TP entirely.
 try:
     import kinif
+    import wiztype
     from katsuba.op import (
-        TypeList, Serializer, SerializerOptions, STATEFUL_FLAGS, LazyObject, LazyList,
+        STATEFUL_FLAGS,
+        LazyList,
+        LazyObject,
+        Serializer,
+        SerializerOptions,
+        TypeList,
     )
     from katsuba.wad import Archive
+
     _PRECISE_AVAILABLE = True
 except Exception:  # pragma: no cover - import-time capability probe
     _PRECISE_AVAILABLE = False
 
 # WADs to search for a model whose asset path has no |Source| prefix.
-_FALLBACK_WADS = ["Mob-WorldData.wad", "Mob2-WorldData.wad", "_Shared-WorldData.wad", "Root.wad"]
+_FALLBACK_WADS = [
+    "Mob-WorldData.wad",
+    "Mob2-WorldData.wad",
+    "_Shared-WorldData.wad",
+    "Root.wad",
+]
 
 # Bounding-circle radius for a static object whose model can't be resolved to a
 # footprint (e.g. the Universe teleport, which only references a blank-character
@@ -56,17 +43,40 @@ _FALLBACK_WADS = ["Mob-WorldData.wad", "Mob2-WorldData.wad", "_Shared-WorldData.
 _DEFAULT_STATIC_RADIUS = 150.0
 
 
-def _resource_path(filename: str) -> str:
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, filename)
-    return filename
-
-
 def _footprint_cache_path(revision: str) -> Path:
     """Writable, per-revision footprint cache location (alongside Deimos settings)."""
     appdata = os.environ.get("APPDATA", "")
     base = Path(appdata) / "Deimos" if appdata else Path(os.getcwd())
     return base / "footprint_cache" / (revision.replace(".", "_") + ".json")
+
+
+def _typelist_cache_path(revision: str) -> Path:
+    """Writable, per-revision katsuba TypeList location (alongside Deimos settings)."""
+    appdata = os.environ.get("APPDATA", "")
+    base = Path(appdata) / "Deimos" if appdata else Path(os.getcwd())
+    return base / "types" / (revision.replace(".", "_") + ".json")
+
+
+def _ensure_type_list(revision: str) -> Path:
+    """Return the cached TypeList for ``revision``, generating it on a cache miss."""
+    path = _typelist_cache_path(revision)
+    if path.exists():
+        return path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        f"[entity_collision] no cached type list for revision {revision}; "
+        f"dumping from the running client via wiztype (one-time, ~10-30s)"
+    )
+    tree = wiztype.get_type_tree()
+    tmp = path.with_suffix(".tmp")
+    wiztype.JsonTypeDumperV1(tree).dump(tmp, indent=None)
+    tmp.replace(path)
+    logger.info(
+        f"[entity_collision] type list cached at {path} "
+        f"({path.stat().st_size // (1024 * 1024)} MB)"
+    )
+    return path
 
 
 def _extract_nif_asset(template) -> str | None:
@@ -91,50 +101,86 @@ def _extract_nif_asset(template) -> str | None:
     return None
 
 
-class _Resolver:
-    """Process-wide, lazily-initialized model-footprint resolver.
+def _has_solid_collision(template) -> bool:
+    """Whether a template is a solid obstacle the player can't walk through."""
+    try:
+        behaviors = template["m_behaviors"]
+    except Exception:
+        return False
+    if not isinstance(behaviors, LazyList):
+        return False
+    for behavior in behaviors:
+        if not isinstance(behavior, LazyObject):
+            continue
+        try:
+            solid = behavior["m_solidCollisionFilename"]
+        except Exception:
+            continue
+        if isinstance(solid, (bytes, bytearray)):
+            solid = solid.decode("latin-1", "replace")
+        if solid:  # non-empty -> has solid collision geometry
+            try:
+                disabled = bool(behavior["m_bDisableCollision"])
+            except Exception:
+                disabled = False
+            if not disabled:
+                return True
+    return False
 
-    All public work is serialized by a lock (katsuba archives/serializers aren't
-    guaranteed thread-safe and multiple clients may teleport at once) and cached,
-    so after warm-up resolution is just dictionary lookups.
-    """
+
+class _Resolver:
+    """Process-wide, lazily-initialized model-footprint resolver."""
 
     def __init__(self):
         # Reentrant: zone_static_objects() holds the lock while calling footprint_points().
         self._lock = threading.RLock()
         self._state = None  # None=untried, True=ready, False=unavailable
-        self._serializer = None        # STATEFUL: ObjectData templates + spawnData
+        self._serializer = None  # STATEFUL: ObjectData templates + spawnData
         self._world_serializer = None  # plain flags: gamedata.bin + TemplateManifest
         self._root = None
         self._gamedata = None
-        self._template_paths: dict[str, str] = {}   # entity name -> ObjectData path
-        self._asset_cache: dict[str, str | None] = {}     # entity name -> nif asset
-        self._hull_cache: dict[str, list | None] = {}     # asset -> local hull points
+        self._template_paths: dict[str, str] = {}  # entity name -> ObjectData path
+        self._asset_cache: dict[str, str | None] = {}  # entity name -> nif asset
+        self._collidable_cache: dict[str, bool] = {}  # entity name -> is solid obstacle
+        self._hull_cache: dict[str, list | None] = {}  # asset -> local hull points
         self._wads: dict[str, object] = {}
-        self._id2name: dict[int, str] | None = None       # templateID -> template basename
-        self._zone_static_cache: dict[str, list] = {}     # zone -> [(z, footprint), ...]
+        self._id2name: dict[int, str] | None = None  # templateID -> template basename
+        self._zone_static_cache: dict[str, list] = {}  # zone -> [(z, footprint), ...]
         # Model footprints are deterministic per NIF and only change on a game update,
         # so the asset/hull caches persist to disk (keyed by revision) — parsing the
         # NIFs is the warm-up cost, and this makes it a one-time-ever cost.
         self._cache_file: Path | None = None
         self._cache_dirty = False
-        self._lang_cache: dict[tuple[str, str], dict[str, str]] = {}  # (locale, file) -> table
-        self._zone_name_cache: dict[tuple[str, str], str] = {}        # (zone, locale) -> display
+        self._lang_cache: dict[
+            tuple[str, str], dict[str, str]
+        ] = {}  # (locale, file) -> table
+        self._zone_name_cache: dict[
+            tuple[str, str], str
+        ] = {}  # (zone, locale) -> display
 
     def _initialize(self) -> bool:
         if self._state is not None:
             return self._state
+        # Serialize first-time init across threads: generating the type list (wiztype)
+        # is expensive and writes a file, so two callers must not race into it.
+        with self._lock:
+            if self._state is not None:
+                return self._state
+            self._state = self._do_initialize()
+        return self._state
+
+    def _do_initialize(self) -> bool:
         try:
             if not _PRECISE_AVAILABLE:
-                raise RuntimeError("katsuba/kinif not available")
+                raise RuntimeError("katsuba/kinif/wiztype not available")
             install = Path(get_wiz_install())
             self._gamedata = install / "Data" / "GameData"
             revision = (install / "Bin" / "revision.dat").read_text().strip()
-            types_path = _resource_path(os.path.join("types", revision.replace(".", "_") + ".json"))
-            if not os.path.exists(types_path):
-                raise FileNotFoundError(f"no TypeList for revision '{revision}' at {types_path}")
+            # The type list is generated on demand by wiztype and cached per revision,
+            # so it's no longer shipped with Deimos.
+            types_path = _ensure_type_list(revision)
 
-            type_list = TypeList.open(types_path)
+            type_list = TypeList.open(str(types_path))
             opts = SerializerOptions()
             opts.flags |= STATEFUL_FLAGS
             opts.shallow = False
@@ -155,15 +201,18 @@ class _Resolver:
             self._cache_file = _footprint_cache_path(revision)
             self._load_footprint_cache()
 
-            logger.info(f"[entity_collision] precise resolver ready (revision {revision}, "
-                        f"{len(self._template_paths)} templates, "
-                        f"{len(self._hull_cache)} cached hulls)")
-            self._state = True
+            logger.info(
+                f"[entity_collision] precise resolver ready (revision {revision}, "
+                f"{len(self._template_paths)} templates, "
+                f"{len(self._hull_cache)} cached hulls)"
+            )
+            return True
         except Exception as e:
-            logger.warning(f"[entity_collision] precise resolver unavailable ({e}); "
-                           f"entities will use bounding boxes")
-            self._state = False
-        return self._state
+            logger.warning(
+                f"[entity_collision] precise resolver unavailable ({e}); "
+                f"entities will use bounding boxes"
+            )
+            return False
 
     def _load_footprint_cache(self) -> None:
         """Seed the asset/hull caches from the on-disk footprint cache (best-effort)."""
@@ -171,6 +220,7 @@ class _Resolver:
             if self._cache_file and self._cache_file.exists():
                 data = json.loads(self._cache_file.read_text(encoding="utf-8"))
                 self._asset_cache.update(data.get("assets", {}))
+                self._collidable_cache.update(data.get("collidable", {}))
                 for asset, hull in data.get("hulls", {}).items():
                     self._hull_cache[asset] = [tuple(p) for p in hull] if hull else None
         except Exception as e:
@@ -182,7 +232,11 @@ class _Resolver:
             return
         try:
             self._cache_file.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"assets": self._asset_cache, "hulls": self._hull_cache}
+            payload = {
+                "assets": self._asset_cache,
+                "collidable": self._collidable_cache,
+                "hulls": self._hull_cache,
+            }
             tmp = self._cache_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             tmp.replace(self._cache_file)
@@ -213,8 +267,16 @@ class _Resolver:
             zone_wad = zone_name.replace("/", "-") + ".wad" if zone_name else None
             # Many placed-object models (teleporters, StateObjects) live in the
             # world-level WorldData wad, e.g. "Azteca/AZ_Z00_Zocalo" -> Azteca-WorldData.wad.
-            world_wad = (zone_name.split("/")[0] + "-WorldData.wad") if zone_name and "/" in zone_name else None
-            candidates = ([zone_wad] if zone_wad else []) + ([world_wad] if world_wad else []) + _FALLBACK_WADS
+            world_wad = (
+                (zone_name.split("/")[0] + "-WorldData.wad")
+                if zone_name and "/" in zone_name
+                else None
+            )
+            candidates = (
+                ([zone_wad] if zone_wad else [])
+                + ([world_wad] if world_wad else [])
+                + _FALLBACK_WADS
+            )
 
         basename = internal.rsplit("/", 1)[-1]
         for wad_name in candidates:
@@ -231,19 +293,34 @@ class _Resolver:
                         continue
         return None
 
+    def _resolve_template(self, name: str) -> None:
+        """Deserialize a template once, caching both its NIF asset and collidability."""
+        if name in self._asset_cache and name in self._collidable_cache:
+            return
+        asset = None
+        collidable = False
+        path = self._template_paths.get(name)
+        if path:
+            try:
+                template = self._root.deserialize(path, self._serializer)
+                asset = _extract_nif_asset(template)
+                collidable = _has_solid_collision(template)
+            except Exception:
+                pass
+        self._asset_cache[name] = asset
+        self._collidable_cache[name] = collidable
+        self._cache_dirty = True
+
     def _asset_for(self, name: str) -> str | None:
         if name not in self._asset_cache:
-            asset = None
-            path = self._template_paths.get(name)
-            if path:
-                try:
-                    template = self._root.deserialize(path, self._serializer)
-                    asset = _extract_nif_asset(template)
-                except Exception:
-                    asset = None
-            self._asset_cache[name] = asset
-            self._cache_dirty = True
+            self._resolve_template(name)
         return self._asset_cache[name]
+
+    def is_collidable(self, name: str) -> bool:
+        """Whether a placed object named ``name`` is a solid obstacle. Thread-only."""
+        if name not in self._collidable_cache:
+            self._resolve_template(name)
+        return self._collidable_cache[name]
 
     def _hull_for(self, asset: str, zone_name: str | None) -> list | None:
         if asset not in self._hull_cache:
@@ -278,7 +355,9 @@ class _Resolver:
             return
         id2name: dict[int, str] = {}
         try:
-            manifest = self._root.deserialize("TemplateManifest.xml", self._world_serializer)
+            manifest = self._root.deserialize(
+                "TemplateManifest.xml", self._world_serializer
+            )
             for entry in manifest["m_serializedTemplates"]:
                 if entry is None:
                     continue
@@ -291,8 +370,10 @@ class _Resolver:
                     base = base[:-4]
                 id2name[tid] = base
         except Exception as e:
-            logger.warning(f"[entity_collision] could not load TemplateManifest ({e}); "
-                           f"static objects will use bounding boxes")
+            logger.warning(
+                f"[entity_collision] could not load TemplateManifest ({e}); "
+                f"static objects will use bounding boxes"
+            )
         self._id2name = id2name
 
     def zone_static_objects(self, zone_name: str) -> list:
@@ -331,26 +412,42 @@ class _Resolver:
                         continue
 
                     name = self._id2name.get(tid) if self._id2name else None
+                    # Only solid obstacles block the player. Skip everything else —
+                    # decorative meshes (archways), walk-on triggers, NPCs (soft capsule),
+                    # and templates we can't resolve — so we don't shove teleports around
+                    # things you can actually walk through.
+                    if not name or not self.is_collidable(name):
+                        continue
+
                     shape = None
-                    points = self.footprint_points(name, zone_name) if name else None
+                    points = self.footprint_points(name, zone_name)
                     if points:
                         poly = Polygon(points)
                         if poly.is_valid and not poly.is_empty:
                             # model-local hull -> scale -> rotate by yaw -> world position
-                            poly = scale(poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0))
+                            poly = scale(
+                                poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0)
+                            )
                             poly = rotate(poly, ori.z, origin=(0, 0), use_radians=True)
                             shape = translate(poly, xoff=loc.x, yoff=loc.y)
                             precise += 1
                     if shape is None:
-                        shape = Point(loc.x, loc.y).buffer(_DEFAULT_STATIC_RADIUS * obj_scale)
+                        # collidable, but the model is a placeholder/unparsable NIF
+                        shape = Point(loc.x, loc.y).buffer(
+                            _DEFAULT_STATIC_RADIUS * obj_scale
+                        )
 
                     if shape is not None and not shape.is_empty:
                         placed.append((loc.z, shape))
 
-                logger.debug(f"[entity_collision] {zone_name}: {len(placed)} static object footprints "
-                             f"({precise} precise model, {len(placed) - precise} bounding box)")
+                logger.debug(
+                    f"[entity_collision] {zone_name}: {len(placed)} static object footprints "
+                    f"({precise} precise model, {len(placed) - precise} bounding box)"
+                )
             except Exception as e:
-                logger.warning(f"[entity_collision] static objects unavailable for {zone_name} ({e})")
+                logger.warning(
+                    f"[entity_collision] static objects unavailable for {zone_name} ({e})"
+                )
 
             self._save_footprint_cache()  # persist any newly-parsed model footprints
             self._zone_static_cache[zone_name] = placed
@@ -368,7 +465,9 @@ class _Resolver:
         if table is None:
             table = {}
             try:
-                raw = bytes(self._root[f"Locale/{locale}/{langfile}.lang"]).decode("utf-16-le")
+                raw = bytes(self._root[f"Locale/{locale}/{langfile}.lang"]).decode(
+                    "utf-16-le"
+                )
                 lines = raw.split("\r\n")
                 i = 1  # skip the "1:<File>" header
                 while i + 2 < len(lines):
@@ -410,7 +509,7 @@ class _Resolver:
         ``m_zoneDisplayName`` lang token resolved against the Root.wad lang files.
 
         Zone paths are hierarchical, so if the full path has no display name (e.g. a
-        sub-area that ships no gamedata of its own) we walk up to the parent zone — we're
+        sub-area that ships no gamedata of its own) we walk up to the parent zone; we're
         still physically inside it, so its name is the accurate answer:
         ``Azteca/AZ_Z00_Zocalo/SomeSubArea`` -> ``The Zocalo``.
         """
@@ -425,11 +524,15 @@ class _Resolver:
             return self._zone_name_cache[ck] or None
         name = self._resolve_one_zone(path, locale)
         if not name and "/" in path:
-            name = self._zone_display_walk(path.rsplit("/", 1)[0], locale)  # parent zone
+            name = self._zone_display_walk(
+                path.rsplit("/", 1)[0], locale
+            )  # parent zone
         self._zone_name_cache[ck] = name or ""
         return name
 
-    def world_display_name(self, world_segment: str, locale: str = "en-US") -> str | None:
+    def world_display_name(
+        self, world_segment: str, locale: str = "en-US"
+    ) -> str | None:
         """Canonical world name for a path's first segment via WorldNames.lang.
 
         ``WizardCity`` -> ``Wizard City``, ``DragonSpire`` -> ``Dragonspyre``. Returns
@@ -445,12 +548,13 @@ class _Resolver:
 _resolver = _Resolver()
 
 
-def build_zone_static_shapes(zone_name: str | None, target_z: float | None = None,
-                             z_threshold: float = 700.0) -> list[Polygon]:
+def build_zone_static_shapes(
+    zone_name: str | None, target_z: float | None = None, z_threshold: float = 700.0
+) -> list[Polygon]:
     """In a worker thread: the zone's static-object collision footprints.
 
     Reads every placed object from the zone's ``gamedata.bin`` (whole zone, from files,
-    so colliders outside render range are known *before* teleporting), resolving each to
+    so colliders outside render range are known before teleporting), resolving each to
     a precise model footprint or a bounding circle. When ``target_z`` is given, objects
     clearly on another floor (``|z - target_z|`` beyond the threshold) are dropped so
     geometry above/below the player doesn't block the solve. Results are cached per zone.

@@ -33,7 +33,8 @@ datas = [
     ('Deimos-logo.ico', '.'),
     ('Deimos-logo.png', '.'),
     ('locale', 'locale'),
-    ('types', 'types'),
+    # The katsuba TypeList is no longer shipped: it's generated on demand by wiztype
+    # from the running client and cached per-revision under %APPDATA%/Deimos/types/.
 ]
 datas += collect_data_files('wizwalker.extensions.wizsprinter')
 datas += collect_data_files('wizwalker.extensions.wizsprinter.combat_backends')
