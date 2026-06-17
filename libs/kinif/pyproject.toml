@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kinif"
+version = "0.1.0"
+description = "Minimal reader for Wizard101's Gamebryo NIF model geometry (vertex extraction)."
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+readme = "README.md"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+profile = "release"
+bindings = "pyo3"
