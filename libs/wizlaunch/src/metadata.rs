@@ -9,6 +9,10 @@ pub struct AccountMetadata {
     pub version: u32,
     pub nicknames_order: Vec<String>,
     pub gid_map: HashMap<String, u64>,
+    /// Per-account Steam-mode flag. An account *missing* from this map predates
+    /// Steam support and is considered unconfigured (see `validate_account`).
+    #[serde(default)]
+    pub steam_map: HashMap<String, bool>,
 }
 
 impl Default for AccountMetadata {
@@ -17,6 +21,7 @@ impl Default for AccountMetadata {
             version: 1,
             nicknames_order: Vec::new(),
             gid_map: HashMap::new(),
+            steam_map: HashMap::new(),
         }
     }
 }
@@ -56,11 +61,12 @@ pub fn ensure_nickname(nickname: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
-/// Remove a nickname from the order list and GID map.
+/// Remove a nickname from the order list, GID map, and Steam map.
 pub fn remove_nickname(nickname: &str) -> Result<(), VaultError> {
     let mut meta = load()?;
     meta.nicknames_order.retain(|n| n != nickname);
     meta.gid_map.remove(nickname);
+    meta.steam_map.remove(nickname);
     save(&meta)?;
     Ok(())
 }
@@ -114,4 +120,19 @@ pub fn get_nickname_by_gid(gid: u64) -> Result<Option<String>, VaultError> {
         }
     }
     Ok(None)
+}
+
+/// Set whether an account launches in Steam mode.
+pub fn set_steam(nickname: &str, steam: bool) -> Result<(), VaultError> {
+    let mut meta = load()?;
+    meta.steam_map.insert(nickname.to_string(), steam);
+    save(&meta)?;
+    Ok(())
+}
+
+/// Get an account's Steam-mode flag. `None` means it's unconfigured (an older
+/// entry saved before Steam support existed).
+pub fn get_steam(nickname: &str) -> Result<Option<bool>, VaultError> {
+    let meta = load()?;
+    Ok(meta.steam_map.get(nickname).copied())
 }

@@ -264,6 +264,19 @@ def generate_timestamp() -> str:
     return time_stamp
 
 
+def build_account_list_payload() -> list[dict]:
+    """Enrich the saved-account list with per-account validation state for the
+    launcher GUI. Each entry: {'nick', 'error' (None if valid), 'steam'}."""
+    payload = []
+    for nick in wizlaunch.list_accounts():
+        payload.append({
+            "nick": nick,
+            "error": wizlaunch.validate_account(nick),
+            "steam": wizlaunch.get_account_steam(nick),
+        })
+    return payload
+
+
 # Holds the ReleaseInfo for an update that has been found but not yet installed.
 available_release = None
 
@@ -3303,23 +3316,37 @@ async def main():
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    wizlaunch.list_accounts(),
+                                    build_account_list_payload(),
                                 )
                             )
 
                         case deimosgui.GUICommandType.SaveAccount:
-                            nickname = com.data
+                            nickname, steam = com.data
                             try:
                                 await asyncio.to_thread(
                                     wizlaunch.prompt_save_account, nickname
                                 )
+                                # Persist the per-account Steam-mode choice so the
+                                # entry is fully configured (and validates clean).
+                                wizlaunch.set_account_steam(nickname, bool(steam))
                                 logger.info(f"Account '{nickname}' saved.")
                             except RuntimeError as e:
                                 logger.info(f"Account save cancelled or failed: {e}")
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    wizlaunch.list_accounts(),
+                                    build_account_list_payload(),
+                                )
+                            )
+
+                        case deimosgui.GUICommandType.UpdateAccount:
+                            nickname, steam = com.data
+                            wizlaunch.set_account_steam(nickname, bool(steam))
+                            logger.info(f"Account '{nickname}' updated.")
+                            gui_send_queue.put(
+                                deimosgui.GUICommand(
+                                    deimosgui.GUICommandType.UpdateAccountList,
+                                    build_account_list_payload(),
                                 )
                             )
 
@@ -3329,7 +3356,7 @@ async def main():
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    wizlaunch.list_accounts(),
+                                    build_account_list_payload(),
                                 )
                             )
 

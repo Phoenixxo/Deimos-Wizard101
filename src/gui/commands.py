@@ -80,7 +80,8 @@ class GUICommandType(Enum):
 
     # Launcher
     LaunchInstance = auto()
-    SaveAccount = auto()
+    SaveAccount = auto()       # GUI -> Backend: data = (nickname, steam: bool)
+    UpdateAccount = auto()     # GUI -> Backend: data = (nickname, steam: bool); updates settings only
     DeleteAccount = auto()
     LoadAccounts = auto()
     UpdateAccountList = auto()

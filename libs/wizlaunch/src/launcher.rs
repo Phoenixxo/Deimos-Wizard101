@@ -51,7 +51,10 @@ fn normalize_path(path: &str) -> PathBuf {
 
 /// Launch the Wizard101 game process.
 /// `login_server` is "host:port" (e.g. "login.us.wizard101.com:12000").
-pub fn launch_game(game_path: &str, login_server: &str) -> Result<(), VaultError> {
+/// When `steam` is true, the client is started in Steam mode (`-ST`); callers
+/// are responsible for ensuring Steam is ready and `steam_appid.txt` is present
+/// (see [`crate::steam`]).
+pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<(), VaultError> {
     let bin_dir = normalize_path(game_path).join("Bin");
     let exe = bin_dir.join("WizardGraphicalClient.exe");
 
@@ -68,9 +71,11 @@ pub fn launch_game(game_path: &str, login_server: &str) -> Result<(), VaultError
         ))
     })?;
 
-    Command::new(&exe)
-        .arg("-ST")
-        .arg("-L")
+    let mut cmd = Command::new(&exe);
+    if steam {
+        cmd.arg("-ST");
+    }
+    cmd.arg("-L")
         .arg(host)
         .arg(port)
         .current_dir(&bin_dir)

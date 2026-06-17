@@ -24,6 +24,23 @@ def has_account(nickname: str) -> bool:
     """Check if an account exists in Windows Credential Manager."""
     ...
 
+def validate_account(nickname: str) -> str | None:
+    """Validate an account entry.
+
+    Returns a human-readable error string if the entry needs attention (e.g. an
+    older account saved before Steam support, which lacks a Steam-mode flag), or
+    None if it is fully configured.
+    """
+    ...
+
+def get_account_steam(nickname: str) -> bool | None:
+    """Get an account's Steam-mode flag, or None if it has never been set."""
+    ...
+
+def set_account_steam(nickname: str, steam: bool) -> None:
+    """Set whether an account launches in Steam mode."""
+    ...
+
 def update_player_gid(nickname: str, gid: int) -> None:
     """Update the player GID (global ID) for a nickname."""
     ...
