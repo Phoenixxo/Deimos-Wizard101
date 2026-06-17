@@ -31,7 +31,6 @@ from typing import Callable, Optional
 import requests
 from loguru import logger
 
-
 # Windows process-creation flags (see CreateProcess docs). Defined locally so
 # the module imports cleanly on non-Windows dev machines.
 _DETACHED_PROCESS = 0x00000008
@@ -43,10 +42,10 @@ _UPDATER_BINARY_NAME = "deimos-updater.exe"
 
 @dataclass
 class ReleaseInfo:
-    version: str            # version number without leading 'v', e.g. "3.14.0"
+    version: str  # version number without leading 'v', e.g. "3.14.0"
     exe_url: Optional[str]  # direct download URL for Deimos.exe
-    sha256: Optional[str]   # expected SHA256 of Deimos.exe (lowercase hex) or None
-    notes_url: str          # human-facing release page
+    sha256: Optional[str]  # expected SHA256 of Deimos.exe (lowercase hex) or None
+    notes_url: str  # human-facing release page
     prerelease: bool
 
 
@@ -67,11 +66,12 @@ def update_dir() -> Path:
 # Version comparison (semver core + pre-release ordering)
 # ---------------------------------------------------------------------------
 
+
 def _parse_version(v: str) -> tuple[list[int], list]:
     """Split a version into (release-core, pre-release-identifiers).
 
-    "3.13.0"        -> ([3, 13, 0], [])           # [] sorts *after* any pre-release
-    "3.13.0-beta.1" -> ([3, 13, 0], ['beta', 1])
+    "3.14.0"        -> ([3, 14, 0], [])           # [] sorts *after* any pre-release
+    "3.14.0-beta.1" -> ([3, 14, 0], ['beta', 1])
     """
     v = v.strip().lstrip("vV")
     core, _, pre = v.partition("-")
@@ -94,7 +94,7 @@ def _cmp_pre(a: list, b: list) -> int:
     if not a and not b:
         return 0
     if not a:
-        return 1   # release > pre-release
+        return 1  # release > pre-release
     if not b:
         return -1
     for x, y in zip(a, b):
@@ -137,6 +137,7 @@ def is_newer(remote: str, local: str) -> bool:
 # Release discovery
 # ---------------------------------------------------------------------------
 
+
 def get_latest_release(
     author: str,
     repo: str,
@@ -153,7 +154,8 @@ def get_latest_release(
         if include_prerelease:
             resp = requests.get(
                 f"https://api.github.com/repos/{author}/{repo}/releases",
-                headers=headers, timeout=timeout,
+                headers=headers,
+                timeout=timeout,
             )
             resp.raise_for_status()
             releases = [r for r in resp.json() if not r.get("draft")]
@@ -163,7 +165,8 @@ def get_latest_release(
         else:
             resp = requests.get(
                 f"https://api.github.com/repos/{author}/{repo}/releases/latest",
-                headers=headers, timeout=timeout,
+                headers=headers,
+                timeout=timeout,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -206,6 +209,7 @@ def get_latest_release(
 # ---------------------------------------------------------------------------
 # Download + verify
 # ---------------------------------------------------------------------------
+
 
 def download_update(
     url: str,
@@ -263,6 +267,7 @@ def download_update(
 # Apply
 # ---------------------------------------------------------------------------
 
+
 def _updater_source_path() -> Optional[Path]:
     """Locate the embedded helper binary inside the bundle."""
     base = getattr(sys, "_MEIPASS", None)
@@ -299,10 +304,14 @@ def apply_and_relaunch(new_exe: Path, *, relaunch: bool = True) -> bool:
 
     args = [
         str(helper),
-        "--pid", str(os.getpid()),
-        "--new", str(new_exe),
-        "--target", str(target),
-        "--log", str(update_dir() / "updater.log"),
+        "--pid",
+        str(os.getpid()),
+        "--new",
+        str(new_exe),
+        "--target",
+        str(target),
+        "--log",
+        str(update_dir() / "updater.log"),
     ]
     if relaunch:
         args.append("--relaunch")

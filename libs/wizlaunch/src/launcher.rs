@@ -69,6 +69,7 @@ pub fn launch_game(game_path: &str, login_server: &str) -> Result<(), VaultError
     })?;
 
     Command::new(&exe)
+        .arg("-ST")
         .arg("-L")
         .arg(host)
         .arg(port)

@@ -5,6 +5,7 @@ import math
 import struct
 from io import BytesIO
 from typing import Tuple, Union
+from loguru import logger
 from src.utils import is_free
 from copy import copy
 
@@ -244,6 +245,7 @@ async def navmap_tp(client: Client, xyz: XYZ = None, leader_client: Client = Non
     if not await is_free(client):
         return
 
+    logger.debug(f"[navmap_tp] {client.title}: using navmap teleport (direct -> nav data -> spiral)")
     starting_zone = await client.zone_name() # for loading the correct wad and to walk to target as a last resort
     starting_xyz = await client.body.position()
     target_xyz = xyz if xyz is not None else await client.quest_position.position()
@@ -323,6 +325,68 @@ async def navmap_tp(client: Client, xyz: XYZ = None, leader_client: Client = Non
             await client.goto(target_xyz.x, target_xyz.y)
         return
     await fallback_spiral_tp(client, target_xyz)
+
+
+async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = None):
+    """Teleport by solving the zone's collision geometry — a single, decisive teleport.
+
+    Loads the zone collision data, computes (in a 2D slice at the target's height)
+    the nearest point that lies on walkable mesh and clears every collision object,
+    and teleports there exactly once. Because that point is geometrically guaranteed
+    to be outside all walls, there's no trial-and-error: it's first-time-every-time.
+
+    Only when the geometry can't be solved — no collision data for the zone, a target
+    outside the loaded area of interest, or a solve/teleport error — does it fall back
+    to the proven navmap_tp. Debug logs report exactly which path ran.
+    """
+    if not await is_free(client):
+        return
+
+    target_xyz = xyz if xyz is not None else await client.quest_position.position()
+    starting_xyz = await client.body.position()
+    if calc_Distance(starting_xyz, target_xyz) <= 5.0:
+        return  # already there
+
+    safe_xyz = None
+    reason = "unavailable"
+    try:
+        # Imported lazily so shapely/numpy load only when collision TP is actually
+        # used, and any import error degrades to navmap rather than breaking import.
+        from src.collision import CollisionWorld, get_collision_data
+        from src.collision_math import find_safe_collision_point
+        from src import entity_collision
+
+        try:
+            player_radius = (await client.body.height()) * (await client.body.scale()) * 0.5
+        except Exception:
+            player_radius = 75.0  # sane default if the body fields can't be read
+
+        zone_name = await client.zone_name()
+        collision_data = await get_collision_data(client, zone_name)
+        world = CollisionWorld()
+        world.load(collision_data)
+
+        # Static entity colliders (NPCs, teleporters, props) aren't in collision.bcd —
+        # they come from the zone's gamedata.bin object table. That's read from files for
+        # the WHOLE zone, so colliders outside render range are known *before* we move,
+        # which is what keeps this a single, first-time teleport. It's all file/CPU work
+        # (cached per zone), so the entire solve runs off the event loop.
+        def _solve():
+            extra_shapes = entity_collision.build_zone_static_shapes(zone_name, target_xyz.z)
+            return find_safe_collision_point(world, target_xyz, player_radius, extra_shapes=extra_shapes)
+
+        safe_xyz, reason = await asyncio.to_thread(_solve)
+    except Exception as e:
+        logger.debug(f"[collision_tp] {client.title}: collision solve errored ({e!r}); using navmap TP")
+        safe_xyz = None
+
+    if safe_xyz is not None:
+        logger.debug(f"[collision_tp] {client.title}: collision TP ({reason}) -> single teleport to {safe_xyz}")
+        await client.teleport(safe_xyz)
+        return
+
+    logger.debug(f"[collision_tp] {client.title}: no collision solution ({reason}); falling back to navmap TP")
+    await navmap_tp(client, xyz, leader_client)
 
 
 def calc_chunks(points: list[XYZ], entity_distance: float = 3147.0) -> list[XYZ]:

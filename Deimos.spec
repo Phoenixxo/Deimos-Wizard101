@@ -33,6 +33,7 @@ datas = [
     ('Deimos-logo.ico', '.'),
     ('Deimos-logo.png', '.'),
     ('locale', 'locale'),
+    ('types', 'types'),
 ]
 datas += collect_data_files('wizwalker.extensions.wizsprinter')
 datas += collect_data_files('wizwalker.extensions.wizsprinter.combat_backends')

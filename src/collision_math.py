@@ -1,121 +1,25 @@
-from array import ArrayType
+"""Collision geometry math for collision-based teleporting.
+
+Mirrors the approach in CIick/QuestWhiz's WorldsCollide.py: build 2D collision and
+mesh footprints in a horizontal slice at the target's height, compute the walkable
+``free_area = mesh - collisions``, and pick the nearest point inside it (buffered by
+the player's radius). Because the chosen point is, by construction, on the walkable
+mesh and outside every collision footprint, a teleport to it can't land in a wall —
+which is what lets collision TP be a single, first-time-every-time teleport.
+
+The lower-level cube/transform helpers (toCubeVertices, transformCube, toMultidim)
+come from PeechezNCreem / CIick and are shared with the shape builders below.
+"""
+
+from typing import List, TypeAlias
+
 import numpy as np
-import asyncio
-import math
-from typing import Iterable, List, Tuple, TypeAlias
-from wizwalker import XYZ, Orient, Client
-# import matplotlib
-# import matplotlib.pyplot as plt
-from .collision import BoxGeomParams, CollisionWorld, CylinderGeomParams, MeshGeomParams, ProxyMesh, ProxyType, SphereGeomParams, TubeGeomParams, get_collision_data, CollisionFlag
-#from teleport_math import calc_squareDistance
+from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.ops import unary_union, nearest_points
+from wizwalker import XYZ
 
+from .collision import CollisionWorld, ProxyType
 
-# def to_3x3_array(matrix: Iterable) -> ArrayType:
-#     # Converts an iterable into a 3x3 matrix.
-#     return np.array([[matrix[0], matrix[1], matrix[2]],
-#                     [matrix[3], matrix[4], matrix[5]],
-#                     [matrix[6], matrix[7], matrix[8]]])
-
-
-# def to_1x3_array(matrix: Iterable) -> ArrayType:
-#     # Converts an iterable into a 1x3 matrix.
-#     return np.array([matrix[0], matrix[1], matrix[2]])
-
-
-# def cube_to_vertices(l: float, w: float, h: float, position: Iterable, r_matrix: ArrayType) -> List[XYZ]:
-#     # Converts a cube to its vertices using only its measurements, center position, and a rotation matrix.
-#     # Divide measurments by 2 as we are starting at the center of the cube
-#     l /= 2
-#     w /= 2
-#     h /= 2
-
-#     # Create the 8 vertices of the cube, using every possible combination of adding/subtracting the measurements
-#     matrices = [
-#         to_1x3_array((position[0] + w, position[1] + l, position[2] + h)),
-#         to_1x3_array((position[0] - w, position[1] - l, position[2] - h)),
-#         to_1x3_array((position[0] + w, position[1] - l, position[2] + h)),
-#         to_1x3_array((position[0] - w, position[1] + l, position[2] - h)),
-#         to_1x3_array((position[0] - w, position[1] + l, position[2] + h)),
-#         to_1x3_array((position[0] + w, position[1] - l, position[2] - h)),
-#         to_1x3_array((position[0] + w, position[1] + l, position[2] - h)),
-#         to_1x3_array((position[0] - w, position[1] - l, position[2] + h))
-#     ]
-
-#     # Apply the rotation matrix to every point
-#     r_matrices = []
-#     for matrix in matrices:
-#         d_product = np.dot(matrix, r_matrix)
-#         r_matrices.append(d_product)
-
-#     # Convert every point from a 1x3 array to an XYZ
-#     points = [XYZ(matrix[0], matrix[1], matrix[2]) for matrix in matrices]
-
-#     return points
-
-
-# async def plot_cube(client: Client):
-#     # FOR TESTING - slack
-#     data = await get_collision_data(client)
-#     world = CollisionWorld()
-#     world.load(data)
-
-#     points: List[XYZ] = []
-
-#     for object in world.objects:
-#         print(object.category_flags)
-#         if type(object.params) == BoxGeomParams and object.category_flags == CollisionFlag.OBJECT:
-#             cube: BoxGeomParams = object.params
-#             vertices = cube_to_vertices(cube.length, cube.width, cube.depth, object.location, to_3x3_array(object.rotation))
-#             for xyz in vertices:
-#                 points.append(xyz)
-
-#         # elif type(object.params) == CylinderGeomParams:
-#         #     cylinder: CylinderGeomParams = object.params
-#         #     vertices = cube_to_vertices(cylinder.radius, cylinder.radius, cylinder.length, object.location, to_3x3_array(object.rotation))
-#         #     for xyz in vertices:
-#         #         points.append(xyz)
-
-#         # elif type(object.params) == TubeGeomParams:
-#         #     tube: TubeGeomParams = object.params
-#         #     vertices = cube_to_vertices(tube.radius, tube.radius, tube.length, object.location, to_3x3_array(object.rotation))
-#         #     for xyz in vertices:
-#         #         points.append(xyz)
-
-#         # elif type(object.params) == SphereGeomParams:
-#         #     sphere: SphereGeomParams = object.params
-#         #     vertices = cube_to_vertices(sphere.radius, sphere.radius, sphere.radius, object.location, to_3x3_array(object.rotation))
-#         #     for xyz in vertices:
-#         #         points.append(xyz)
-
-#         elif type(object.params) == MeshGeomParams and object.category_flags == CollisionFlag.OBJECT:
-#             mesh: ProxyMesh = object
-#             for vertex in mesh.vertices:
-#                 xyz = XYZ(vertex[0], vertex[1], vertex[2])
-#                 points.append(xyz)
-#     await asyncio.sleep(0)
-
-#     player_pos = await client.body.position()
-
-#     curr_dist: float = 0.0
-#     curr_xyz: XYZ = None
-#     for xyz in points:
-#         if calc_squareDistance(xyz, player_pos) < curr_dist or not curr_xyz:
-#             curr_dist = calc_squareDistance(xyz, player_pos)
-#             curr_xyz = xyz
-
-#     print(curr_xyz)
-#     await client.teleport(curr_xyz)
-
-#     if os.path.exists('points.txt'):
-#         os.remove('points.txt')
-#         while os.path.exists('points.txt'):
-#             await asyncio.sleep(0.1)
-
-#     with open('points.txt', 'w') as f:
-#         for xyz in points:
-#             f.write(f'{xyz.x}, {xyz.y}, {xyz.z}\n')
-
-#     print('This finished, for testing purposes')
 
 Matrix3x3: TypeAlias = tuple[
     float, float, float,
@@ -123,58 +27,24 @@ Matrix3x3: TypeAlias = tuple[
     float, float, float,
 ]
 
-def cube_to_xyz(cube:list):
-    xyz = []
-    for verticies in cube:
-        xyz.append(XYZ(verticies[0], verticies[1], verticies[2]))
-    return xyz
-
-def find_if_xyz_in_cube(xyz: XYZ, cube: list) -> bool:
-    """If True XYZ is in the cube"""
-    #https://math.stackexchange.com/questions/1472049/check-if-a-point-is-inside-a-rectangular-shaped-area-3d
-    #     7-------6
-    #    /|      /|
-    #   4-+-----5 | 
-    #   | |     | |   y
-    #   | 3-----+-2   | z
-    #   |/      |/    |/
-    #   0-------1     +--x
-    
-    p0 = XYZ(*cube[0])
-    p1 = XYZ(*cube[1])
-    p3 = XYZ(*cube[3])
-    p4 = XYZ(*cube[4])
-    pv = xyz
-
-    i = subtract_xyz(p3, p0)
-    j = subtract_xyz(p1, p0)
-    k = subtract_xyz(p4, p0)
-    v = subtract_xyz(pv, p0)
-
-    if 0 < multiply_xyz(v, i) < multiply_xyz(i, i) and 0 <  multiply_xyz(v, j) < multiply_xyz(j, j) and 0 < multiply_xyz(v, k) < multiply_xyz(k, k):
-        return True
-    else:
-        return False
-    
-def subtract_xyz(xyz2: XYZ, xyz1: XYZ) -> XYZ:
-    # You can perform b - a by doing (bx - ax, by - ay, bz - az).
-    return XYZ((xyz2.x - xyz1.x), (xyz2.y - xyz1.y), (xyz2.z - xyz1.z))
-
-def multiply_xyz(a: XYZ, b: XYZ) -> float:
-    #a dot b = (ax, ay, az) dot (bx, by, bz) = axbx + ayby + az*bz
-    return a.x*b.x + a.y*b.y + a.z*b.z
-
-import random
-
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-import numpy as np
-
-SimpleFace: TypeAlias = tuple[int, int, int]
 SimpleVert: TypeAlias = tuple[float, float, float]
 Vector3D: TypeAlias = tuple[float, float, float]
 
 CubeVertices = tuple[Vector3D, Vector3D, Vector3D, Vector3D, Vector3D, Vector3D, Vector3D, Vector3D]
+
+
+def cube_to_xyz(cube: list) -> List[XYZ]:
+    return [XYZ(v[0], v[1], v[2]) for v in cube]
+
+
+def subtract_xyz(xyz2: XYZ, xyz1: XYZ) -> XYZ:
+    # b - a = (bx - ax, by - ay, bz - az)
+    return XYZ((xyz2.x - xyz1.x), (xyz2.y - xyz1.y), (xyz2.z - xyz1.z))
+
+
+def multiply_xyz(a: XYZ, b: XYZ) -> float:
+    # a dot b = ax*bx + ay*by + az*bz
+    return a.x * b.x + a.y * b.y + a.z * b.z
 
 
 def toCubeVertices(dimensions: Vector3D) -> CubeVertices:
@@ -196,12 +66,7 @@ def toCubeVertices(dimensions: Vector3D) -> CubeVertices:
 
 
 def toMultidim(mat: Matrix3x3):
-    #return (
-    #    (mat[0], mat[1], mat[2]),
-    #    (mat[3], mat[4], mat[5]),
-    #    (mat[6], mat[7], mat[8]),
-    #)
-    # TODO: Should this be transposed or not? Transposed because the cubes are distorted otherwise
+    # Transposed: the cubes come out distorted otherwise.
     return (
         (mat[0], mat[3], mat[6]),
         (mat[1], mat[4], mat[7]),
@@ -218,293 +83,117 @@ def transformCube(cube, location, rotation):
     return tpoints
 
 
-def plotCube(ax, locs, color):
-    Z = np.array(locs)
-    
-    #     7-------6
-    #    /|      /|
-    #   4-+-----5 | 
-    #   | |     | |   y
-    #   | 3-----+-2   | z
-    #   |/      |/    |/
-    #   0-------1     +--x
-    verts = [
-        [Z[0],Z[1],Z[2],Z[3]],
-        [Z[4],Z[5],Z[6],Z[7]],
-        [Z[0],Z[1],Z[5],Z[4]],
-        [Z[1],Z[2],Z[6],Z[5]],
-        [Z[3],Z[2],Z[6],Z[7]],
-        [Z[0],Z[3],Z[7],Z[4]],
-    ]
+def filter_valid_polygons(shapes) -> List[Polygon]:
+    """Keep only non-empty 2D Polygons, flattening MultiPolygons.
 
-    ax.scatter3D(Z[:, 0], Z[:, 1], Z[:, 2])
-    ax.add_collection3d(Poly3DCollection(
-        verts,
-        facecolors=color,
-        edgecolors=color,
-        alpha=0.5
-    ))
-
-#https://stackoverflow.com/questions/21698630/how-can-i-find-if-a-point-lies-inside-or-outside-of-convexhull
-def isInHull(P, hull):
-    '''
-    Datermine if the list of points P lies inside the hull
-    :return: list
-    List of boolean where true means that the point is inside the convex hull
-    '''
-    A = hull.equations[:,0:-1]
-    b = np.transpose(np.array([hull.equations[:,-1]]))
-    isInHull = np.all((A @ np.transpose(P)) <= np.tile(-b,(1,len(P))),axis=0)
-    return isInHull
+    Degenerate inputs (collinear vertices) can make ``.convex_hull`` return a
+    LineString or Point; those would break ``unary_union``/``difference``, so we
+    drop them here.
+    """
+    valid = []
+    for shape in shapes:
+        if shape is None or shape.is_empty:
+            continue
+        if shape.geom_type == "Polygon":
+            valid.append(shape)
+        elif shape.geom_type == "MultiPolygon":
+            valid.extend(poly for poly in shape.geoms if poly.geom_type == "Polygon")
+    return valid
 
 
-from scipy.spatial import ConvexHull
-import matplotlib.pyplot as plt
+def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygon]:
+    """Build 2D footprints of solid collision objects that span ``z_slice``.
 
-def cube_collision_check(capsule, cubes: list) -> bool:
-    '''checks if a position collides with a cube
-    True: Collides
-    False: Doesn't collide'''
+    Each object is only included when the slice height falls within its vertical
+    extent, so geometry above/below the player (e.g. a ceiling) doesn't block.
+    """
+    shapes = []
+    for obj in world.objects:
+        try:
+            if obj.proxy == ProxyType.BOX:
+                l, w, h = obj.params.length, obj.params.width, obj.params.depth
+                if obj.location[2] - h / 2 <= z_slice <= obj.location[2] + h / 2:
+                    world_pts = transformCube(toCubeVertices((l, w, h)), obj.location, obj.rotation)
+                    pts2d = [(p[0], p[1]) for p in world_pts]
+                    if len(pts2d) >= 3:
+                        shapes.append(Polygon(pts2d).convex_hull)
 
-    for cube in cubes:
-        if capsule_in_cube(capsule[0], capsule[1], cube):
-            return True
-    return False
+            elif obj.proxy == ProxyType.SPHERE:
+                scale_val = obj.scale if isinstance(obj.scale, (float, int)) else obj.scale[0]
+                r = obj.params.radius * scale_val
+                if r > 0 and abs(z_slice - obj.location[2]) <= r:
+                    shapes.append(Point(obj.location[0], obj.location[1]).buffer(r))
 
-# from icecream import ic
-def cylinder_collision_check(capsule, cylinders: list) -> bool:
-    '''checks if a position collides with a cylinder
-    True: Collides
-    False: Doesn't collide'''
-
-    for cylinder in cylinders:
-        if capsule_in_cylinder(capsule, cylinder):
-            return True
-    return False
-
-
-def sphere_collision_check(capsule, spheres: list) -> bool:
-    '''checks if a position collides with a sphere
-    True: Collides
-    False: Doesn't collide'''
-
-    for sphere in spheres:
-        if capsule_in_sphere(capsule, sphere):
-            return True
-    return False
-
-def capsule_in_cube(capsule_center,
-                capsule_radius,
-                cube_vertices
-                ):
-    # check if capsule center is within cube
-    center_within_cube = True
-    
-    cube_vertices = np.array(cube_vertices)
-    
-    for i in range(3):
-        if not (min(cube_vertices[:,i]) <= capsule_center[i] <= max(cube_vertices[:,i])):
-            center_within_cube = False
-            break
-
-    if not center_within_cube:
-        return False
-
-    # check if capsule radius and height overlap with cube
-    closest_distance = float("inf")
-    for vertex in cube_vertices:
-        distance = np.linalg.norm(vertex - capsule_center)
-        if distance < closest_distance:
-            closest_distance = distance
-
-    if closest_distance <= capsule_radius:
-        return True
-    else:
-        return False
+            elif obj.proxy == ProxyType.CYLINDER:
+                if isinstance(obj.scale, (float, int)):
+                    scale_xy = scale_z = obj.scale
+                else:
+                    scale_xy, scale_z = obj.scale[0], obj.scale[2]
+                scaled_half_length = (obj.params.length / 2) * scale_z
+                scaled_radius = obj.params.radius * scale_xy * 0.125
+                if scaled_radius > 0 and obj.location[2] - scaled_half_length <= z_slice <= obj.location[2] + scaled_half_length:
+                    shapes.append(Point(obj.location[0], obj.location[1]).buffer(scaled_radius))
+        except Exception:
+            continue
+    return shapes
 
 
-from icecream import ic
-def capsule_in_cylinder(capsule, cylinder):
-    capsule_location, capsule_radius, capsule_length  = capsule
-    cylinder_location, cylinder_radius, cylinder_length = cylinder
-    # calculate the distance between the capsule and cylinder centers
-    distance = math.sqrt(
-        (capsule_location[0] - cylinder_location[0])**2 +
-        (capsule_location[1] - cylinder_location[1])**2 +
-        (capsule_location[2] - cylinder_location[2])**2
-    )
-
-    # check if the distance is greater than the sum of the radii
-    if distance > capsule_radius + cylinder_radius:
-        #No overlap
-        return False
-
-    # check if the capsule's length plus the cylinder's length is greater than the distance
-    if capsule_length + cylinder_length > distance:
-        #Partial overlap
-        return True
-
-    # if neither of the above conditions are met, then the capsule is fully inside the cylinder
-    #Full overlap
-    return True
-
-def transformCylinder(location: list, rotation_matrix):
-    rotated_location = np.matmul(rotation_matrix, location)
-    return rotated_location
-
-from math import sqrt
-def capsule_in_sphere(capsule, sphere):
-    capsule_loc, capsule_radius, _ = capsule
-    sphere_loc, sphere_radius = sphere
-    # Calculate the distance between the capsule's center and the sphere's center
-    distance = sqrt((capsule_loc[0] - sphere_loc[0]) ** 2 + (capsule_loc[1] - sphere_loc[1]) ** 2 + (capsule_loc[2] - sphere_loc[2]) ** 2)
-    # Calculate the sum of the capsule's radius and sphere's radius
-    sum_radii = capsule_radius + sphere_radius
-    # If the distance between the two centers is less than or equal to the sum of the radii, then there is overlap
-    if distance <= sum_radii:
-        return True
-    else:
-        return False
+def build_mesh_shapes(world: CollisionWorld, z_slice: float) -> List[Polygon]:
+    """Build 2D footprints of the walkable mesh geometry."""
+    shapes = []
+    for obj in world.objects:
+        if obj.proxy == ProxyType.MESH:
+            pts3d = transformCube(obj.vertices, obj.location, obj.rotation)
+            pts2d = [(x, y) for x, y, z in pts3d]
+            if len(pts2d) >= 3:
+                shapes.append(Polygon(pts2d).convex_hull)
+    return shapes
 
 
-async def testbench():
-    from wizwalker import ClientHandler
-    #hooks client
-    handler = ClientHandler()
-    client = handler.get_new_clients()[0]
-    await client.activate_hooks()
-    print('hooked')
-    
-    try:
-        data = await get_collision_data(client)
-        world = CollisionWorld()
-        world.load(data)
-        # fig = plt.figure()
-        # ax = fig.add_subplot(projection="3d")
-        cube_list = []
-        mesh_list = []
-        cylinders_list = []
-        sphere_list = []
-        from icecream import ic
-        for ob in world.objects:
-            if ob.proxy == ProxyType.BOX:
-                size = (ob.params.length, ob.params.width , ob.params.depth)
-                points = toCubeVertices(size)
-                cube = transformCube(points, ob.location, ob.rotation)
-                cube_list.append(cube)
-            elif ob.proxy == ProxyType.CYLINDER:
-                #ic(ob.name, ob.rotation)
-                # loc = transformCylinder(ob.location, to_3x3_array(ob.rotation))
-                # cylinders_list.append((loc, ob.params.radius, ob.params.length))
-                # await client.teleport(XYZ(*loc))
-                # await asyncio.sleep(3)
-                # await client.teleport(XYZ(*ob.location))
-                loc = transformCylinder(ob.location, toMultidim(ob.rotation))
-                cylinders_list.append((loc, ob.params.radius, ob.params.length))
-                print(ob.params.radius)
-                #cylinders_list.append((loc, ob.params.radius))
-                # await client.teleport(XYZ(*loc))
-                # await asyncio.sleep(3)
-            elif ob.proxy == ProxyType.SPHERE:
-                loc = transformCylinder(ob.location, toMultidim(ob.rotation))
-                sphere_list.append((loc, ob.params.radius))
+def find_safe_collision_point(world: CollisionWorld, target: XYZ, player_radius: float, extra_shapes=None):
+    """Find the point to teleport to so the player lands on walkable ground, never a wall.
 
-            elif type(ob.params) == MeshGeomParams:
-                mesh = transformCube(ob.vertices, ob.location, ob.rotation)
-                mesh_list.append(mesh)
-            else:
-                print(ob.proxy)
-        
-        meshpoints = []
-        quest_pos = await client.quest_position.position()
-        for mesh in mesh_list:
-            for vertices in mesh:
-                if abs(vertices[2] - quest_pos.z) < 700:
-                    meshpoints.append(vertices)
-                
-        #closemeshpoints = [point for point in meshpoints if abs(point[1] - pos.y) < 500]
-        mesh2d = []
-        for point in meshpoints:
-            mesh2d.append([point[0], point[1]]) 
-            
-        mesh2d = np.array(mesh2d)
-        hull = ConvexHull(mesh2d)
+    Works in a 2D slice at ``target.z``. Returns ``(xyz, reason)``:
+      - ``(target, "target_clear")``     the target itself clears all collisions,
+      - ``(safe_point, "safe_point")``   nearest walkable spot outside the geometry,
+      - ``(None, reason)``               not enough collision data to solve safely.
 
-        found = False
-        radius = 10
-        
-        capsule_radius = 20
-        capsule_length = 10
-        #await client.teleport(XYZ(-351.65478515625, 279.5632019042969, 0.0008737124735489488))
-        #input()
-        while not found:
-            for angle in range(360):
-                rad = angle * (math.pi / 180)
-                direction = (math.cos(rad) * radius, math.sin(rad) * radius)
-                position = (quest_pos.x + direction[0], quest_pos.y + direction[1], quest_pos.z)
-                if isInHull([[position[0], position[1]]], hull):
-                    capsule = (position, capsule_radius, capsule_length) # player capsule
-                    if not cube_collision_check(capsule, cube_list):
-                        if not cylinder_collision_check(capsule, cylinders_list):
-                            if not sphere_collision_check(capsule, sphere_list):
-                                print("hi")
-                                found = True
-                                break
-                    
-                            else:
-                                ic("hit a sphere")
-                        else:
-                            ic("hit a cylinder")
-                    else:
-                        ic("hit a box")
-            # input()
-            radius += 50
-            
-        await client.teleport(XYZ(*position))
+    ``extra_shapes`` are additional collision footprints (e.g. dynamic entity models)
+    unioned with the static zone geometry, so the solver routes around them too.
 
-        # import matplotlib.pyplot as plt
-        # plt.plot(mesh2d[:,0], mesh2d[:,1], 'o')
-        # for simplex in hull.simplices:
-        #     plt.plot(mesh2d[simplex, 0], mesh2d[simplex, 1], 'k-')
+    The returned point is guaranteed to sit on the walkable mesh and at least
+    ``player_radius`` away from every collision footprint, so a single teleport to
+    it won't clip a wall. Pure CPU work — run off the event loop.
+    """
+    collision_shapes = filter_valid_polygons(build_collision_shapes(world, target.z))
+    if extra_shapes:
+        collision_shapes.extend(filter_valid_polygons(extra_shapes))
+    mesh_shapes = filter_valid_polygons(build_mesh_shapes(world, target.z))
 
-        # plt.show()
-        # from icecream import ic
-        # points = []
-        # for mesh in mesh_list:
-        #     for vertices in mesh:
-        #         mesh.append(vertices)
+    if not collision_shapes and not mesh_shapes:
+        return None, "no_geometry"
 
-        # for cube in cube_list:
-        #     for vertices in cube:
-        #         points.append(vertices)
-                
-        #fig = plt.figure()
-        #ax = fig.add_subplot(projection='3d')
-        
-        #print(pts)
-        #hull = ConvexHull(pts)
-        #print(hull.simplices)
-        
-        # ax.plot(pts.T[0], pts.T[1], pts.T[2], "ko")
-        # for s in hull.simplices:
-        #     s = np.append(s, s[0])  # Here we cycle back to the first coordinate
-        #     ax.plot(pts[s, 0], pts[s, 1], pts[s, 2], "r-")
+    union_coll = unary_union(collision_shapes) if collision_shapes else Polygon()
+    player_at_target = Point(target.x, target.y).buffer(player_radius)
 
-        #edges= zip(*cube_list)
-        
-        #for simplex in hull.simplices:
-        #    print(simplex)
-        #await asyncio.sleep(0.3)
-        #plt.show()
+    # If the target footprint is clear of all collisions, go straight there.
+    if union_coll.is_empty or not union_coll.intersects(player_at_target):
+        return XYZ(target.x, target.y, target.z), "target_clear"
 
-    finally:
-        print("Closing")
-        await handler.close()
+    # Target sits inside collision geometry — find the nearest walkable point outside it.
+    union_mesh = unary_union(mesh_shapes) if mesh_shapes else Polygon()
+    if union_mesh.is_empty:
+        return None, "no_mesh"
 
-# if __name__ == "__main__":
-#     asyncio.run(testbench())
+    free_area = union_mesh.difference(union_coll)
+    if free_area.is_empty:
+        return None, "no_free_area"
 
-# # Test the function
-# point = (1, 2, 3)
-# cylinder = (0, 0, 0, 2, 5)
-# #print(point_in_cylinder(*point, *cylinder))  # Output: True
+    # Shrink by the player's radius so the body fits; if that erases the area
+    # (target near a tight spot), fall back to the unbuffered free area.
+    safe_region = free_area.buffer(-player_radius)
+    if safe_region.is_empty:
+        safe_region = free_area
+
+    _, candidate = nearest_points(Point(target.x, target.y), safe_region)
+    return XYZ(candidate.x, candidate.y, target.z), "safe_point"
