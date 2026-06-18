@@ -175,6 +175,13 @@ def build_launcher_tab(ctx):
             warn_btn = launcher_small_icon_btn(ctx, _warning_svg, error, _edit_this)
             row_layout.addWidget(warn_btn)
 
+        def _window_config():
+            from src.gui.window_config_dialog import show_window_config_dialog
+            show_window_config_dialog(ctx, nickname)
+        proportions_btn = launcher_small_icon_btn(
+            ctx, svgs['proportions'], tl('window_config_tooltip'), _window_config)
+        row_layout.addWidget(proportions_btn)
+
         def _delete_this():
             send_queue.put(GUICommand(GUICommandType.DeleteAccount, nickname))
         trash_btn = launcher_small_icon_btn(ctx, svgs['trash'], tl('remove_account'), _delete_this)

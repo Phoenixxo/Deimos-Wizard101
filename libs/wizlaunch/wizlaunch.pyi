@@ -41,6 +41,29 @@ def set_account_steam(nickname: str, steam: bool) -> None:
     """Set whether an account launches in Steam mode."""
     ...
 
+def get_window_config(
+    nickname: str,
+) -> tuple[int, int, int, int, int, int, bool] | None:
+    """Get an account's window placement/resolution config, or None if unset.
+
+    Returns ``(x, y, w, h, res_w, res_h, locked)``: window top-left in virtual-
+    desktop screen coords, window client size, forced render resolution, and
+    whether resolution is locked to the client size (crisp 1:1).
+    """
+    ...
+
+def set_window_config(
+    nickname: str,
+    x: int, y: int, w: int, h: int,
+    res_w: int, res_h: int, locked: bool,
+) -> None:
+    """Set an account's window placement/resolution config."""
+    ...
+
+def clear_window_config(nickname: str) -> None:
+    """Clear an account's window config (revert to default behavior)."""
+    ...
+
 def update_player_gid(nickname: str, gid: int) -> None:
     """Update the player GID (global ID) for a nickname."""
     ...

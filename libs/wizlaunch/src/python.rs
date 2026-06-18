@@ -71,6 +71,42 @@ fn set_account_steam(nickname: String, steam: bool) -> PyResult<()> {
     Ok(())
 }
 
+/// Get an account's window placement / resolution config as a tuple
+/// `(x, y, w, h, res_w, res_h, locked)`, or `None` if unset.
+#[pyfunction]
+fn get_window_config(nickname: String) -> PyResult<Option<(i32, i32, u32, u32, u32, u32, bool)>> {
+    match metadata::get_window(&nickname)? {
+        Some(c) => Ok(Some((c.x, c.y, c.w, c.h, c.res_w, c.res_h, c.locked))),
+        None => Ok(None),
+    }
+}
+
+/// Set an account's window placement / resolution config.
+#[pyfunction]
+fn set_window_config(
+    nickname: String,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    res_w: u32,
+    res_h: u32,
+    locked: bool,
+) -> PyResult<()> {
+    metadata::set_window(
+        &nickname,
+        metadata::WindowConfig { x, y, w, h, res_w, res_h, locked },
+    )?;
+    Ok(())
+}
+
+/// Clear an account's window config.
+#[pyfunction]
+fn clear_window_config(nickname: String) -> PyResult<()> {
+    metadata::clear_window(&nickname)?;
+    Ok(())
+}
+
 // ── GID tracking ───────────────────────────────────────────────────
 
 #[pyfunction]
@@ -210,6 +246,9 @@ pub fn wizlaunch(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_account, m)?)?;
     m.add_function(wrap_pyfunction!(get_account_steam, m)?)?;
     m.add_function(wrap_pyfunction!(set_account_steam, m)?)?;
+    m.add_function(wrap_pyfunction!(get_window_config, m)?)?;
+    m.add_function(wrap_pyfunction!(set_window_config, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_window_config, m)?)?;
     m.add_function(wrap_pyfunction!(update_player_gid, m)?)?;
     m.add_function(wrap_pyfunction!(get_player_gid, m)?)?;
     m.add_function(wrap_pyfunction!(get_nickname_by_gid, m)?)?;

@@ -36,6 +36,7 @@ from wizwalker.utils import get_all_wizard_handles, get_foreground_window
 from src import bot_registry, discsdk, updater
 from src import gui as deimosgui
 from src.auto_pet import nomnom
+from src.client_resizing import ClientResizingManager
 from src.command_parser import execute_flythrough, parse_command
 from src.config_combat import (
     StrCombatConfigProvider,
@@ -132,6 +133,7 @@ gui_font = "Segoe UI"
 gui_font_size = 9
 use_team_up = False
 buy_potions = True
+client_resizing = True
 client_to_follow = None
 client_to_boost = None
 questing_friend_tp = False
@@ -159,6 +161,26 @@ rpc_status = _json_settings.get("rich_presence", rpc_status)
 drop_status = _json_settings.get("drop_logging", drop_status)
 anti_afk_status = _json_settings.get("use_anti_afk", anti_afk_status)
 buy_potions = _json_settings.get("buy_potions", buy_potions)
+client_resizing = _json_settings.get("client_resizing", client_resizing)
+client_resizing_manager = ClientResizingManager()
+
+
+async def _apply_account_window_config(client, handle, nick):
+    """Apply a vault account's saved window/resolution config to its fresh client."""
+    try:
+        cfg = wizlaunch.get_window_config(nick)
+    except Exception:
+        cfg = None
+    if not cfg:
+        return
+    try:
+        x, y, w, h, rw, rh, locked = cfg
+        # Route through the manager so it reuses its single per-client forcer
+        # (a second setMode hook would race the resize loop's forcer and fail).
+        await client_resizing_manager.apply_account_config(client, handle, x, y, w, h, rw, rh, locked)
+        logger.info(f"Applied window config to '{nick}': window {w}x{h}, res {rw}x{rh} @ ({x},{y}).")
+    except Exception as e:
+        logger.opt(exception=e).warning(f"Window config apply failed for '{nick}'")
 gui_on_top = _json_settings.get("on_top", gui_on_top)
 gui_langcode = _json_settings.get("locale", gui_langcode)
 gui_font = _json_settings.get("font", gui_font)
@@ -2150,6 +2172,14 @@ async def main():
                         walker.clients.remove(nc)
                     finally:
                         _hooking_in_progress.discard(handle)
+                    # Apply this account's saved window/resolution config (if any),
+                    # off the hook loop so it doesn't block client detection.
+                    if nc in walker.clients:
+                        _wc_nick = launched_account_map.get(handle)
+                        if _wc_nick:
+                            asyncio.create_task(
+                                _apply_account_window_config(nc, handle, _wc_nick)
+                            )
 
                 if hooked_any:
                     _send_hooked_clients_update()
@@ -3580,6 +3610,7 @@ async def main():
                                 automatic_team_based_combat, \
                                 discard_duplicate_cards
                             global check_for_updates, auto_install_updates
+                            global client_resizing
                             settings_dict = com.data
                             for key, value in settings_dict.items():
                                 match key:
@@ -3621,6 +3652,8 @@ async def main():
                                         check_for_updates = value
                                     case "auto_install_updates":
                                         auto_install_updates = value
+                                    case "client_resizing":
+                                        client_resizing = value
                             logger.debug(
                                 f"Settings updated: {list(settings_dict.keys())}"
                             )
@@ -3888,6 +3921,23 @@ async def main():
         # Auto potion usage on a per client basis.
         await asyncio.gather(*[logging_loop(p) for p in walker.clients])
 
+    async def client_resizing_loop():
+        # Arms freeform window resizing (sizing border + crisp backbuffer forcing +
+        # camera-aspect correction) on game clients when the "Client Resizing"
+        # setting is on; tears everything down (incl. asm hooks) when off / on exit.
+        try:
+            while True:
+                try:
+                    await client_resizing_manager.tick(walker.clients, client_resizing)
+                except Exception as e:
+                    logger.opt(exception=e).debug("client_resizing tick error")
+                await asyncio.sleep(0.3)
+        finally:
+            try:
+                await client_resizing_manager._teardown_all()
+            except Exception:
+                pass
+
     async def zone_check_loop():
         zone_blacklist = ["Raids", "Battlegrounds"]
 
@@ -4114,6 +4164,7 @@ async def main():
         all_tasks["potion_usage_loop"] = asyncio.create_task(potion_usage_loop())
         all_tasks["rpc_loop"] = asyncio.create_task(rpc_loop())
         all_tasks["drop_logging_loop"] = asyncio.create_task(drop_logging_loop())
+        all_tasks["client_resizing_loop"] = asyncio.create_task(client_resizing_loop())
         all_tasks["zone_check_loop"] = asyncio.create_task(zone_check_loop())
         all_tasks["anti_afk_questing_loop"] = asyncio.create_task(
             anti_afk_questing_loop()

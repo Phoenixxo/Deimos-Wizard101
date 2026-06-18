@@ -41,6 +41,11 @@ DEFAULT_SETTINGS = {
     "kill_minions_first": False,
     "automatic_team_based_combat": False,
     "discard_duplicate_cards": True,
+    # [client]
+    # Arms freeform window resizing on game clients: a draggable resize border plus
+    # automatic camera-aspect correction so the 3D view fills any window size
+    # undistorted. Disable to leave game windows untouched.
+    "client_resizing": True,
     # [launcher]
     "remember_chosen_clients": False,
     # [updates]
