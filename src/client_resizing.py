@@ -113,7 +113,7 @@ def set_window_placement(hwnd: int, x: int, y: int, w: int, h: int):
 
 
 # NOTE: applying a per-account window config at launch is a METHOD on
-# ClientResizingManager (apply_account_config) rather than a free function, so it
+# ClientResizingManager (apply_account_window) rather than a free function, so it
 # reuses the manager's single per-client ResolutionForcer. A second, independent
 # forcer would pattern-scan setMode *after* the manager already hooked it (its
 # entry is now a jump, not the original bytes) and fail with PatternFailed.
@@ -348,12 +348,27 @@ class ClientResizingManager:
         self._forcers: dict[int, object] = {}     # hwnd -> ResolutionForcer
         self._borders: dict[int, object] = {}      # hwnd -> WindowResizeBorder
         self._pending: dict[int, tuple] = {}       # hwnd -> (size, stable_count)
+        # Handles whose window/resolution/border config was applied at launch
+        # (before activate_hooks). The tick loop must NOT tear these down just
+        # because they aren't hooked yet (not in walker.clients); they're kept
+        # alive until the window closes (drop_keep_alive on stale cleanup / kill).
+        self._keep_alive: set[int] = set()
         # Serializes forcer installation so the tick loop and a launch-time
         # apply can't both install a forcer for the same client (double setMode
         # hook -> the second one's pattern scan fails).
         self._install_lock = asyncio.Lock()
+        # Latched on app close / pre-update relaunch so a tick that is still in
+        # flight (or fires during cancellation) can't re-arm hooks after we've torn
+        # them down — the shutdown teardown must be the last word.
+        self._shutdown = False
+
+    def drop_keep_alive(self, hwnd: int):
+        """Stop protecting a launch-managed handle (window closed / client killed)."""
+        self._keep_alive.discard(hwnd)
 
     async def tick(self, clients, enabled: bool):
+        if self._shutdown:
+            return
         if not enabled:
             if self._enabled:
                 self._enabled = False
@@ -376,8 +391,13 @@ class ClientResizingManager:
             # cameras (free / combat) reflects it within a tick, even with no resize.
             await correct_aspect(client, hwnd)
 
+        # A kept-alive window that has since closed must stop being protected.
+        for hwnd in list(self._keep_alive):
+            if not user32.IsWindow(hwnd):
+                self._keep_alive.discard(hwnd)
+
         for hwnd in set(self._forcers) | set(self._borders) | set(_armed):
-            if hwnd not in live:
+            if hwnd not in live and hwnd not in self._keep_alive:
                 await self._teardown(hwnd)
 
     async def _ensure_forcer(self, client, hwnd: int):
@@ -394,17 +414,23 @@ class ClientResizingManager:
             except Exception as e:
                 logger.opt(exception=e).warning(f"[client_resizing] resolution hook unavailable {hwnd:#x}")
 
-    async def apply_account_config(self, client, hwnd: int, x: int, y: int, w: int, h: int,
+    async def apply_account_window(self, client, hwnd: int, x: int, y: int, w: int, h: int,
                                    res_w: int, res_h: int, locked: bool,
                                    borderless: bool = False) -> bool:
-        """Apply a saved per-account window config to a freshly-launched client:
-        optionally strip decorations (borderless), force the render resolution,
-        place + size the window, correct the aspect. Reuses the manager's single
-        per-client forcer (see note above)."""
+        """Apply the WINDOW half of a saved per-account config — everything that
+        needs no in-game camera, so it can run at launch (before hooks / player
+        select): borderless frame, sizing border, crisp resolution forcing, resize
+        hit-test hook, and placement. The camera frustum is applied separately by
+        the per-tick correct_aspect once the in-game camera exists (after hooks).
+
+        Reuses the manager's single per-client forcer/border (see note above) and
+        keeps the handle alive so the tick loop won't tear those hooks down while
+        the client is launched-but-not-yet-hooked."""
         if not hwnd or not user32.IsWindow(hwnd):
             return False
         # Set the frame style first so the client-area sizing below accounts for it.
         set_borderless(hwnd, bool(borderless))
+        arm_window(hwnd)                       # sizing border so the window is resizable
         await self._ensure_forcer(client, hwnd)
         forcer = self._forcers.get(hwnd)
         if forcer is not None:
@@ -417,24 +443,31 @@ class ClientResizingManager:
                 await asyncio.sleep(0.4)        # let the engine run its apply
             except Exception as e:
                 logger.opt(exception=e).debug(f"[client_resizing] launch force failed {hwnd:#x}")
+        await self._ensure_border(client, hwnd)    # in-process drag-resize hit-test hook
         try:
             set_window_placement(hwnd, x, y, w, h)
         except Exception:
             pass
-        await correct_aspect(client, hwnd)
+        await self._update_border(hwnd)
+        self._keep_alive.add(hwnd)             # protect these hooks until the window closes
         return True
 
     async def _ensure_border(self, client, hwnd: int):
         # The in-process WndProc hit-test hook that makes the window grab-resizable.
+        # Lock-serialized (like _ensure_forcer) so a launch-time apply and the tick
+        # loop can't both install the hook for the same client.
         if WindowResizeBorder is None or hwnd in self._borders:
             return
-        try:
-            border = WindowResizeBorder(client)
-            await border.install()
-            self._borders[hwnd] = border
-            logger.debug(f"[client_resizing] resize-border hook installed {hwnd:#x}")
-        except Exception as e:
-            logger.opt(exception=e).warning(f"[client_resizing] resize-border hook unavailable {hwnd:#x}")
+        async with self._install_lock:
+            if hwnd in self._borders:          # re-check after acquiring the lock
+                return
+            try:
+                border = WindowResizeBorder(client)
+                await border.install()
+                self._borders[hwnd] = border
+                logger.debug(f"[client_resizing] resize-border hook installed {hwnd:#x}")
+            except Exception as e:
+                logger.opt(exception=e).warning(f"[client_resizing] resize-border hook unavailable {hwnd:#x}")
 
     async def _update_border(self, hwnd: int):
         # Keep the hit-test hook's window rect current (cursor is hit-tested against it).
@@ -513,3 +546,27 @@ class ClientResizingManager:
     async def _teardown_all(self):
         for hwnd in set(self._forcers) | set(self._borders) | set(_armed) | set(_borderless):
             await self._teardown(hwnd)
+
+    async def teardown_client(self, hwnd: int):
+        """Restore every hook for a SINGLE client (e.g. the GUI 'Unhook' button).
+
+        MUST run while that client is still alive: ``client.close()`` rewrites the
+        shared hook codecave, so any resolution/resize jump still patched into the
+        game's code would dangle and crash the game the next time it is hit. Also
+        stops protecting a launch-managed handle so the tick loop won't re-arm it.
+        """
+        self.drop_keep_alive(hwnd)
+        await self._teardown(hwnd)
+
+    async def shutdown(self):
+        """Tear down every hook for good (app close / pre-update relaunch).
+
+        MUST run while the game clients are still alive: the resolution-forcer and
+        resize-border asm hooks patch the game's own code and are NOT tracked by the
+        client's hook_handler, so ``client.close()`` won't restore them — only their
+        ``uninstall()`` rewrites the original bytes. Latches ``_shutdown`` first so a
+        concurrently-cancelling tick loop can't re-arm anything after this runs.
+        """
+        self._shutdown = True
+        self._enabled = False
+        await self._teardown_all()

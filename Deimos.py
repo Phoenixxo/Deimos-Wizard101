@@ -166,7 +166,12 @@ client_resizing_manager = ClientResizingManager()
 
 
 async def _apply_account_window_config(client, handle, nick):
-    """Apply a vault account's saved window/resolution config to its fresh client."""
+    """Apply a vault account's saved window/resolution/border config to its window.
+
+    Only the window half (placement, resolution, borderless, resize border) — these
+    need no in-game camera, so this runs at LAUNCH (before activate_hooks / player
+    select). The camera frustum is corrected separately by the client-resizing tick
+    loop once the client is hooked and the in-game camera exists."""
     try:
         cfg = wizlaunch.get_window_config(nick)
     except Exception:
@@ -177,7 +182,7 @@ async def _apply_account_window_config(client, handle, nick):
         x, y, w, h, rw, rh, locked, borderless = cfg
         # Route through the manager so it reuses its single per-client forcer
         # (a second setMode hook would race the resize loop's forcer and fail).
-        await client_resizing_manager.apply_account_config(
+        await client_resizing_manager.apply_account_window(
             client, handle, x, y, w, h, rw, rh, locked, borderless)
         logger.info(
             f"Applied window config to '{nick}': window {w}x{h}, res {rw}x{rh} @ ({x},{y})"
@@ -584,6 +589,16 @@ async def kill_tool(debug: bool):
 
 
 async def tool_finish():
+    # Restore the in-process resolution/resize asm hooks BEFORE closing clients.
+    # They patch the game's own code and aren't tracked by the client's hook_handler,
+    # so client.close() won't undo them — they must be uninstalled while the clients
+    # (and their hook handlers) are still alive, or the game is left running with
+    # jumps into a freed codecave. Runs on every close path (graceful + pre-update).
+    try:
+        await client_resizing_manager.shutdown()
+    except Exception as e:
+        logger.opt(exception=e).debug("client_resizing shutdown error")
+
     if not walker or len(walker.clients) == 0:
         return
 
@@ -1578,6 +1593,9 @@ async def main():
 
     # Track which window handles were launched by us, mapped to account nickname
     launched_account_map: dict[int, str] = {}
+    # Handles whose saved window/resolution/border config has been applied (at
+    # launch, before hooks) — so we apply it exactly once even across hook retries.
+    window_config_applied: set[int] = set()
     initial_setup_complete = False
     # Handles explicitly released via UnhookClient — skip in continuous detection
     released_handles: set[int] = set()
@@ -1610,6 +1628,8 @@ async def main():
         for h in stale:
             launched_account_map.pop(h)
             _hooking_in_progress.discard(h)
+            window_config_applied.discard(h)
+            client_resizing_manager.drop_keep_alive(h)
 
         hooked = []
         managed_accounts = set(launched_account_map.values())
@@ -2154,6 +2174,17 @@ async def main():
                     nc.title = f"p{num}"
                     _hooking_in_progress.add(handle)
                     _send_hooked_clients_update()
+                    # Apply the saved window/resolution/border config NOW (before
+                    # activate_hooks / player select) — it needs no in-game camera.
+                    # Once per handle; the camera frustum is corrected later by the
+                    # client-resizing tick loop when the camera exists. Off-thread so
+                    # it never blocks client detection.
+                    _wc_nick = launched_account_map.get(handle)
+                    if _wc_nick and handle not in window_config_applied:
+                        window_config_applied.add(handle)
+                        asyncio.create_task(
+                            _apply_account_window_config(nc, handle, _wc_nick)
+                        )
                     try:
                         await nc.activate_hooks()
                         await _init_client_attrs(nc)
@@ -2175,14 +2206,6 @@ async def main():
                         walker.clients.remove(nc)
                     finally:
                         _hooking_in_progress.discard(handle)
-                    # Apply this account's saved window/resolution config (if any),
-                    # off the hook loop so it doesn't block client detection.
-                    if nc in walker.clients:
-                        _wc_nick = launched_account_map.get(handle)
-                        if _wc_nick:
-                            asyncio.create_task(
-                                _apply_account_window_config(nc, handle, _wc_nick)
-                            )
 
                 if hooked_any:
                     _send_hooked_clients_update()
@@ -3458,15 +3481,29 @@ async def main():
                             handle = com.data
                             for c in walker.clients[:]:
                                 if c.window_handle == handle:
+                                    # Stop managing the handle BEFORE tearing down so
+                                    # the resizing tick loop can't re-arm hooks during
+                                    # the teardown/close awaits.
+                                    released_handles.add(handle)
+                                    if c.window_handle in walker._managed_handles:
+                                        walker._managed_handles.remove(c.window_handle)
+                                    walker.clients.remove(c)
+                                    # Restore the in-process resolution/resize asm
+                                    # hooks while the client is still alive — close()
+                                    # rewrites the hook codecave, so leaving these
+                                    # jumps patched into the game = dangling jump =
+                                    # crash. Must happen before c.close().
+                                    try:
+                                        await client_resizing_manager.teardown_client(handle)
+                                    except Exception as e:
+                                        logger.opt(exception=e).debug(
+                                            f"resize teardown failed for {handle}"
+                                        )
                                     try:
                                         c.title = "Wizard101"
                                         await c.close()
                                     except Exception:
                                         pass
-                                    if c.window_handle in walker._managed_handles:
-                                        walker._managed_handles.remove(c.window_handle)
-                                    walker.clients.remove(c)
-                                    released_handles.add(handle)
                                     logger.info(f"Unhooked client (handle {handle}).")
                                     break
                             _send_hooked_clients_update()
@@ -3534,14 +3571,23 @@ async def main():
                             # If handle belongs to a hooked client, unhook first
                             for c in walker.clients[:]:
                                 if c.window_handle == handle:
+                                    if c.window_handle in walker._managed_handles:
+                                        walker._managed_handles.remove(c.window_handle)
+                                    walker.clients.remove(c)
+                                    # Restore resolution/resize asm hooks before
+                                    # close() clears the codecave (dangling jump =
+                                    # crash, even briefly before the process dies).
+                                    try:
+                                        await client_resizing_manager.teardown_client(handle)
+                                    except Exception as e:
+                                        logger.opt(exception=e).debug(
+                                            f"resize teardown failed for {handle}"
+                                        )
                                     try:
                                         c.title = "Wizard101"
                                         await c.close()
                                     except Exception:
                                         pass
-                                    if c.window_handle in walker._managed_handles:
-                                        walker._managed_handles.remove(c.window_handle)
-                                    walker.clients.remove(c)
                                     launched_account_map.pop(handle, None)
                                     break
                             # Terminate the OS process
@@ -3558,14 +3604,23 @@ async def main():
                             # Unhook the hooked client
                             for c in walker.clients[:]:
                                 if c.window_handle == handle:
+                                    if c.window_handle in walker._managed_handles:
+                                        walker._managed_handles.remove(c.window_handle)
+                                    walker.clients.remove(c)
+                                    # Restore resolution/resize asm hooks before
+                                    # close() clears the codecave (dangling jump =
+                                    # crash, even briefly before the process dies).
+                                    try:
+                                        await client_resizing_manager.teardown_client(handle)
+                                    except Exception as e:
+                                        logger.opt(exception=e).debug(
+                                            f"resize teardown failed for {handle}"
+                                        )
                                     try:
                                         c.title = "Wizard101"
                                         await c.close()
                                     except Exception:
                                         pass
-                                    if c.window_handle in walker._managed_handles:
-                                        walker._managed_handles.remove(c.window_handle)
-                                    walker.clients.remove(c)
                                     launched_account_map.pop(handle, None)
                                     break
                             # Kill the process

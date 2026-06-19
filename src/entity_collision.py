@@ -57,18 +57,36 @@ def _typelist_cache_path(revision: str) -> Path:
     return base / "types" / (revision.replace(".", "_") + ".json")
 
 
-def _ensure_type_list(revision: str) -> Path:
-    """Return the cached TypeList for ``revision``, generating it on a cache miss."""
-    path = _typelist_cache_path(revision)
-    if path.exists():
-        return path
+def _typelist_is_loadable(path: Path) -> bool:
+    """Cheap validity probe: the cached dump exists, is non-empty, and katsuba can
+    open it. Catches a corrupt/half-written cache so we re-dump instead of choking."""
+    try:
+        return path.exists() and path.stat().st_size > 0 and bool(TypeList.open(str(path)))
+    except Exception:
+        return False
 
+
+def _dump_type_list(revision: str, path: Path) -> None:
+    """Pull a fresh type dump from the running client and write it to ``path`` (atomic).
+
+    Requires a live WizardGraphicalClient. Raises with an actionable message when
+    wiztype can't read the client's type tree — that means the client was patched
+    and wiztype's memory signature is stale, which a re-dump cannot fix.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
-        f"[entity_collision] no cached type list for revision {revision}; "
-        f"dumping from the running client via wiztype (one-time, ~10-30s)"
+        f"[entity_collision] pulling a fresh type dump for revision {revision} "
+        f"from the running client via wiztype (one-time, ~10-30s)"
     )
-    tree = wiztype.get_type_tree()
+    try:
+        tree = wiztype.get_type_tree()
+    except Exception as e:
+        raise RuntimeError(
+            f"wiztype could not read the client's type tree "
+            f"({type(e).__name__}: {e}); the client was likely patched and wiztype's "
+            f"memory signature is stale — upgrade wiztype "
+            f"(`uv lock --upgrade-package wiztype && uv sync`)"
+        ) from e
     tmp = path.with_suffix(".tmp")
     wiztype.JsonTypeDumperV1(tree).dump(tmp, indent=None)
     tmp.replace(path)
@@ -76,6 +94,20 @@ def _ensure_type_list(revision: str) -> Path:
         f"[entity_collision] type list cached at {path} "
         f"({path.stat().st_size // (1024 * 1024)} MB)"
     )
+
+
+def _ensure_type_list(revision: str, *, force: bool = False) -> Path:
+    """Return a usable cached TypeList for ``revision``.
+
+    Re-pulls from the client when the cache is missing, unreadable, or ``force``d
+    (e.g. the cached dump loaded fine but turned out to be incompatible with the
+    running client). A client patch normally bumps ``revision`` — a new cache key —
+    so the dump auto-refreshes; this also self-heals a corrupt same-revision cache.
+    """
+    path = _typelist_cache_path(revision)
+    if not force and _typelist_is_loadable(path):
+        return path
+    _dump_type_list(revision, path)
     return path
 
 
@@ -176,27 +208,24 @@ class _Resolver:
             install = Path(get_wiz_install())
             self._gamedata = install / "Data" / "GameData"
             revision = (install / "Bin" / "revision.dat").read_text().strip()
+
             # The type list is generated on demand by wiztype and cached per revision,
-            # so it's no longer shipped with Deimos.
-            types_path = _ensure_type_list(revision)
-
-            type_list = TypeList.open(str(types_path))
-            opts = SerializerOptions()
-            opts.flags |= STATEFUL_FLAGS
-            opts.shallow = False
-            opts.skip_unknown_types = True
-            self._serializer = Serializer(opts, type_list)
-
-            # gamedata.bin and TemplateManifest.xml are serialized without the stateful
-            # property-hash flags the templates use; they need their own serializer.
-            wopts = SerializerOptions()
-            wopts.shallow = False
-            wopts.skip_unknown_types = True
-            self._world_serializer = Serializer(wopts, type_list)
-
-            self._root = Archive.mmap(str(self._gamedata / "Root.wad"))
-            for fp in self._root.iter_glob("ObjectData/**/*.xml"):
-                self._template_paths[fp.rsplit("/", 1)[-1][:-4]] = fp
+            # so it's no longer shipped with Deimos. Build the resolver from it; if the
+            # cached dump loads but turns out to be incompatible with the running client,
+            # pull a fresh dump and rebuild once.
+            for force in (False, True):
+                types_path = _ensure_type_list(revision, force=force)
+                self._setup_serializers(types_path)
+                if self._probe_serializer():
+                    break
+                if force:
+                    raise RuntimeError(
+                        "type list still incompatible with the client after a fresh dump"
+                    )
+                logger.warning(
+                    "[entity_collision] cached type list is incompatible with the "
+                    "running client; pulling a fresh dump"
+                )
 
             self._cache_file = _footprint_cache_path(revision)
             self._load_footprint_cache()
@@ -212,6 +241,41 @@ class _Resolver:
                 f"[entity_collision] precise resolver unavailable ({e}); "
                 f"entities will use bounding boxes"
             )
+            return False
+
+    def _setup_serializers(self, types_path: Path) -> None:
+        """(Re)build the serializers, Root archive, and template index from a type list."""
+        type_list = TypeList.open(str(types_path))
+        opts = SerializerOptions()
+        opts.flags |= STATEFUL_FLAGS
+        opts.shallow = False
+        opts.skip_unknown_types = True
+        self._serializer = Serializer(opts, type_list)
+
+        # gamedata.bin and TemplateManifest.xml are serialized without the stateful
+        # property-hash flags the templates use; they need their own serializer.
+        wopts = SerializerOptions()
+        wopts.shallow = False
+        wopts.skip_unknown_types = True
+        self._world_serializer = Serializer(wopts, type_list)
+
+        self._root = Archive.mmap(str(self._gamedata / "Root.wad"))
+        self._template_paths.clear()
+        for fp in self._root.iter_glob("ObjectData/**/*.xml"):
+            self._template_paths[fp.rsplit("/", 1)[-1][:-4]] = fp
+        self._id2name = None  # manifest must be re-read against the new serializer
+
+    def _probe_serializer(self) -> bool:
+        """Cheaply confirm the type list matches the client by deserializing a single
+        template with the stateful serializer the resolver actually uses. A dump that
+        opened fine but doesn't match the client throws or yields None here."""
+        try:
+            path = next(iter(self._template_paths.values()))
+        except StopIteration:
+            return False
+        try:
+            return self._root.deserialize(path, self._serializer) is not None
+        except Exception:
             return False
 
     def _load_footprint_cache(self) -> None:
