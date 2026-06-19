@@ -62,6 +62,12 @@ GWL_STYLE = -16
 GWL_EXSTYLE = -20
 WS_THICKFRAME = 0x00040000
 WS_MAXIMIZEBOX = 0x00010000
+WS_CAPTION = 0x00C00000
+WS_BORDER = 0x00800000
+WS_DLGFRAME = 0x00400000
+WS_MINIMIZEBOX = 0x00020000
+# Decorations stripped for borderless mode (title bar, sizing border, frame).
+_BORDERLESS_STRIP = WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
@@ -119,10 +125,40 @@ class _ArmState:
 
 
 _armed: dict[int, _ArmState] = {}
+# hwnd -> original style, for windows currently forced borderless.
+_borderless: dict[int, int] = {}
 
 
 def is_armed(hwnd: int) -> bool:
     return hwnd in _armed
+
+
+def set_borderless(hwnd: int, on: bool) -> bool:
+    """Strip (or restore) the window's title bar and borders.
+
+    Borderless windows are NOT armed with a sizing border (see arm_window), so the
+    per-tick self-heal won't fight this; they remain grab-resizable via the
+    in-process WndProc hit-test hook if Client Resizing is active.
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return False
+    try:
+        if on:
+            style = _style(hwnd, GWL_STYLE)
+            if hwnd not in _borderless:
+                _borderless[hwnd] = style & 0xFFFFFFFF
+            user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~_BORDERLESS_STRIP)
+        else:
+            orig = _borderless.pop(hwnd, None)
+            if orig is None:
+                return False
+            user32.SetWindowLongPtrW(hwnd, GWL_STYLE, orig)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        return True
+    except Exception as e:
+        logger.opt(exception=e).warning(f"[client_resizing] set_borderless failed {hwnd:#x}")
+        return False
 
 
 def arm_window(hwnd: int) -> bool:
@@ -133,6 +169,9 @@ def arm_window(hwnd: int) -> bool:
     first time so it can be restored on disarm.
     """
     if not hwnd:
+        return False
+    if hwnd in _borderless:
+        # Borderless windows intentionally have no sizing border; don't re-add one.
         return False
     try:
         style = _style(hwnd, GWL_STYLE)
@@ -286,12 +325,16 @@ class ClientResizingManager:
                 logger.opt(exception=e).warning(f"[client_resizing] resolution hook unavailable {hwnd:#x}")
 
     async def apply_account_config(self, client, hwnd: int, x: int, y: int, w: int, h: int,
-                                   res_w: int, res_h: int, locked: bool) -> bool:
+                                   res_w: int, res_h: int, locked: bool,
+                                   borderless: bool = False) -> bool:
         """Apply a saved per-account window config to a freshly-launched client:
-        force the render resolution, place + size the window, correct the aspect.
-        Reuses the manager's single per-client forcer (see note above)."""
+        optionally strip decorations (borderless), force the render resolution,
+        place + size the window, correct the aspect. Reuses the manager's single
+        per-client forcer (see note above)."""
         if not hwnd or not user32.IsWindow(hwnd):
             return False
+        # Set the frame style first so the client-area sizing below accounts for it.
+        set_borderless(hwnd, bool(borderless))
         await self._ensure_forcer(client, hwnd)
         forcer = self._forcers.get(hwnd)
         if forcer is not None:
@@ -391,9 +434,12 @@ class ClientResizingManager:
                 except Exception:
                     pass
         disarm_window(hwnd)
+        if hwnd in _borderless:
+            set_borderless(hwnd, False)     # restore decorations
+        _borderless.pop(hwnd, None)         # guard against a leak if window is gone
         self._pending.pop(hwnd, None)
         _native_vert.pop(hwnd, None)
 
     async def _teardown_all(self):
-        for hwnd in set(self._forcers) | set(self._borders) | set(_armed):
+        for hwnd in set(self._forcers) | set(self._borders) | set(_armed) | set(_borderless):
             await self._teardown(hwnd)

@@ -72,17 +72,20 @@ fn set_account_steam(nickname: String, steam: bool) -> PyResult<()> {
 }
 
 /// Get an account's window placement / resolution config as a tuple
-/// `(x, y, w, h, res_w, res_h, locked)`, or `None` if unset.
+/// `(x, y, w, h, res_w, res_h, locked, borderless)`, or `None` if unset.
 #[pyfunction]
-fn get_window_config(nickname: String) -> PyResult<Option<(i32, i32, u32, u32, u32, u32, bool)>> {
+fn get_window_config(
+    nickname: String,
+) -> PyResult<Option<(i32, i32, u32, u32, u32, u32, bool, bool)>> {
     match metadata::get_window(&nickname)? {
-        Some(c) => Ok(Some((c.x, c.y, c.w, c.h, c.res_w, c.res_h, c.locked))),
+        Some(c) => Ok(Some((c.x, c.y, c.w, c.h, c.res_w, c.res_h, c.locked, c.borderless))),
         None => Ok(None),
     }
 }
 
 /// Set an account's window placement / resolution config.
 #[pyfunction]
+#[pyo3(signature = (nickname, x, y, w, h, res_w, res_h, locked, borderless = false))]
 fn set_window_config(
     nickname: String,
     x: i32,
@@ -92,10 +95,11 @@ fn set_window_config(
     res_w: u32,
     res_h: u32,
     locked: bool,
+    borderless: bool,
 ) -> PyResult<()> {
     metadata::set_window(
         &nickname,
-        metadata::WindowConfig { x, y, w, h, res_w, res_h, locked },
+        metadata::WindowConfig { x, y, w, h, res_w, res_h, locked, borderless },
     )?;
     Ok(())
 }

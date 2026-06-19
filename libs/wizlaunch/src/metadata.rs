@@ -18,6 +18,10 @@ pub struct WindowConfig {
     pub res_w: u32,
     pub res_h: u32,
     pub locked: bool,
+    /// Strip the window's title bar / borders (borderless mode). Defaults to
+    /// false for configs saved before this field existed.
+    #[serde(default)]
+    pub borderless: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

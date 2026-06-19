@@ -43,12 +43,13 @@ def set_account_steam(nickname: str, steam: bool) -> None:
 
 def get_window_config(
     nickname: str,
-) -> tuple[int, int, int, int, int, int, bool] | None:
+) -> tuple[int, int, int, int, int, int, bool, bool] | None:
     """Get an account's window placement/resolution config, or None if unset.
 
-    Returns ``(x, y, w, h, res_w, res_h, locked)``: window top-left in virtual-
-    desktop screen coords, window client size, forced render resolution, and
-    whether resolution is locked to the client size (crisp 1:1).
+    Returns ``(x, y, w, h, res_w, res_h, locked, borderless)``: window top-left in
+    virtual-desktop screen coords, window client size, forced render resolution,
+    whether resolution is locked to the client size (crisp 1:1), and whether the
+    window is borderless (title bar / borders stripped).
     """
     ...
 
@@ -56,6 +57,7 @@ def set_window_config(
     nickname: str,
     x: int, y: int, w: int, h: int,
     res_w: int, res_h: int, locked: bool,
+    borderless: bool = False,
 ) -> None:
     """Set an account's window placement/resolution config."""
     ...

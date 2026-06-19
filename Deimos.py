@@ -174,11 +174,14 @@ async def _apply_account_window_config(client, handle, nick):
     if not cfg:
         return
     try:
-        x, y, w, h, rw, rh, locked = cfg
+        x, y, w, h, rw, rh, locked, borderless = cfg
         # Route through the manager so it reuses its single per-client forcer
         # (a second setMode hook would race the resize loop's forcer and fail).
-        await client_resizing_manager.apply_account_config(client, handle, x, y, w, h, rw, rh, locked)
-        logger.info(f"Applied window config to '{nick}': window {w}x{h}, res {rw}x{rh} @ ({x},{y}).")
+        await client_resizing_manager.apply_account_config(
+            client, handle, x, y, w, h, rw, rh, locked, borderless)
+        logger.info(
+            f"Applied window config to '{nick}': window {w}x{h}, res {rw}x{rh} @ ({x},{y})"
+            f"{', borderless' if borderless else ''}.")
     except Exception as e:
         logger.opt(exception=e).warning(f"Window config apply failed for '{nick}'")
 gui_on_top = _json_settings.get("on_top", gui_on_top)
