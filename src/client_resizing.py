@@ -66,8 +66,11 @@ WS_CAPTION = 0x00C00000
 WS_BORDER = 0x00800000
 WS_DLGFRAME = 0x00400000
 WS_MINIMIZEBOX = 0x00020000
-# Decorations stripped for borderless mode (title bar, sizing border, frame).
-_BORDERLESS_STRIP = WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX
+# Decorations stripped for borderless mode: the title bar / caption only.
+# WS_THICKFRAME is deliberately KEPT — the OS only honours the WndProc hit-test
+# resize codes on a sizable (WS_THICKFRAME) window, so stripping it would make a
+# borderless window impossible to drag-resize. Borderless = no title bar.
+_BORDERLESS_STRIP = WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_MINIMIZEBOX
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
@@ -134,11 +137,11 @@ def is_armed(hwnd: int) -> bool:
 
 
 def set_borderless(hwnd: int, on: bool) -> bool:
-    """Strip (or restore) the window's title bar and borders.
+    """Strip (or restore) the window's title bar / caption.
 
-    Borderless windows are NOT armed with a sizing border (see arm_window), so the
-    per-tick self-heal won't fight this; they remain grab-resizable via the
-    in-process WndProc hit-test hook if Client Resizing is active.
+    Keeps WS_THICKFRAME so the window stays sizable (arm_window still runs and the
+    WndProc hit-test hook makes the client edges grabbable). Strips only the caption,
+    so a borderless window is title-bar-less but still drag-resizable.
     """
     if not hwnd or not user32.IsWindow(hwnd):
         return False
@@ -169,9 +172,6 @@ def arm_window(hwnd: int) -> bool:
     first time so it can be restored on disarm.
     """
     if not hwnd:
-        return False
-    if hwnd in _borderless:
-        # Borderless windows intentionally have no sizing border; don't re-add one.
         return False
     try:
         style = _style(hwnd, GWL_STYLE)
@@ -207,52 +207,95 @@ def disarm_window(hwnd: int):
         logger.opt(exception=e).debug(f"[client_resizing] disarm error {hwnd:#x}")
 
 
-async def _cam_view(client):
+def _sane_frustum(l: float, r: float, t: float, b: float) -> bool:
+    """Reject garbage so we never write extents to a mis-identified pointer."""
+    import math
+    if not all(math.isfinite(v) and abs(v) < 1e4 for v in (l, r, t, b)):
+        return False
+    return (r - l) > 1e-5 and (t - b) > 1e-5
+
+
+async def _add_ctrl_view(views: dict, client, ctrl):
+    """Resolve a controller's frustum, validate it, and add it to `views`."""
+    if ctrl is None:
+        return
     try:
-        cam = await client.game_client.selected_camera_controller()
-        if cam is None:
-            return None
-        gcam = await cam.gamebryo_camera()
+        gcam = await ctrl.gamebryo_camera()
         if gcam is None:
-            return None
-        return await gcam.cam_view()
+            return
+        view = await gcam.cam_view()
+        if view is None or view.base_address in views:
+            return
+        l = await view.viewport_left(); r = await view.viewport_right()
+        t = await view.viewport_top(); b = await view.viewport_bottom()
+        if _sane_frustum(l, r, t, b):
+            views[view.base_address] = view
     except Exception:
-        return None
+        return
+
+
+async def _all_cam_views(client):
+    """Every distinct camera-controller frustum (selected, free, elastic, combat).
+
+    The game keeps a separate camera controller per mode and only the *active*
+    one's frustum drives the render, so on a camera switch the new controller's
+    (uncorrected, native 16:9) frustum takes over and the 3D view distorts again.
+    The combat camera has no wizwalker getter — it sits one pointer-slot below
+    `selected` in the same contiguous block of controllers — so we read it directly
+    (anchored on the pattern-scanned `selected` offset, not a hardcoded address).
+    Deduped by frustum (CamView) address; each frustum is sanity-checked.
+    """
+    from wizwalker.memory.memory_object import Primitive
+    from wizwalker.memory.memory_objects.camera_controller import DynamicCameraController
+
+    gc = client.game_client
+    views = {}
+    # Named controllers (these calls also populate the offset cache used below).
+    for getter in (gc.selected_camera_controller, gc.free_camera_controller,
+                   gc.elastic_camera_controller):
+        try:
+            await _add_ctrl_view(views, client, await getter())
+        except Exception:
+            continue
+    # Unnamed controllers in the same block (combat/cinematic). Scan the slots just
+    # below `selected`; validation filters out non-controller (garbage) slots.
+    try:
+        sel_off = gc._offset_lookup_cache.get("selected_camera_controller")
+        if sel_off:
+            for off in range(sel_off - 0x30, sel_off, 8):
+                try:
+                    addr = await gc.read_value_from_offset(off, Primitive.int64)
+                except Exception:
+                    continue
+                if addr and addr > 0x10000:
+                    await _add_ctrl_view(views, client, DynamicCameraController(client.hook_handler, addr))
+    except Exception:
+        pass
+    return views
 
 
 NATIVE_ASPECT = 16.0 / 9.0   # the engine's design aspect (its native frustum is 16:9)
-# Per-window native vertical half-extent (the frustum's vertical FOV, which is
-# constant — zoom is camera distance, not FOV). Captured once so we can rebuild
-# both extents for any window aspect.
-_native_vert: dict[int, float] = {}
+# Native vertical half-extent (the frustum's vertical FOV, which is constant — zoom
+# is camera distance, not FOV) captured per frustum so we can rebuild both extents
+# for any window aspect. Nested: hwnd -> {cam_view_address: v_ref}. Keyed per
+# frustum because each camera controller has its own (and possibly its own FOV).
+_native_vert: dict[int, dict[int, float]] = {}
 
 
-async def correct_aspect(client, hwnd: int) -> bool:
-    """Match the camera frustum to the window aspect, writing BOTH extents.
-
-    The frustum aspect = horizontal_extent / vertical_extent must equal the window
-    W/H or the 3D view distorts. Anchored on the native vertical FOV, we expand the
-    dimension that exceeds the native 16:9 aspect: wider windows widen the
-    horizontal extent (see more horizontally), taller/narrower windows grow the
-    vertical extent (see more vertically). Both top/bottom and left/right are set.
-    """
-    size = _client_size(hwnd)
-    if not size or size[1] <= 0:
-        return False
-    aspect = size[0] / size[1]
-    view = await _cam_view(client)
-    if view is None:
-        return False
+async def _correct_view(view, aspect: float, refs: dict) -> bool:
+    """Apply the window aspect to a single frustum, anchored on its native FOV."""
     try:
-        v_ref = _native_vert.get(hwnd)
+        v_ref = refs.get(view.base_address)
         if v_ref is None:
-            # First time: capture the native vertical half-extent (FOV is constant).
+            # First time we see this frustum: capture its native vertical half-extent.
+            # The engine leaves inactive controllers at native 16:9, so first-seen is
+            # native (that is exactly why an unfixed controller looks distorted).
             top = await view.viewport_top()
             bottom = await view.viewport_bottom()
             v_ref = (top - bottom) / 2.0
             if v_ref <= 0:
                 return False
-            _native_vert[hwnd] = v_ref
+            refs[view.base_address] = v_ref
 
         if aspect >= NATIVE_ASPECT:          # wider than native -> grow horizontal
             v = v_ref
@@ -267,6 +310,30 @@ async def correct_aspect(client, hwnd: int) -> bool:
         return True
     except Exception:
         return False
+
+
+async def correct_aspect(client, hwnd: int) -> bool:
+    """Match EVERY camera controller's frustum to the window aspect (both extents).
+
+    The frustum aspect = horizontal_extent / vertical_extent must equal the window
+    W/H or the 3D view distorts. Anchored on each frustum's native vertical FOV, we
+    expand the dimension that exceeds the native 16:9 aspect: wider windows widen the
+    horizontal extent, taller/narrower windows grow the vertical extent. Applied to
+    the selected, free, and combat/elastic controllers so switching cameras keeps the
+    correction (run every tick, so a switch is reflected within a tick).
+    """
+    size = _client_size(hwnd)
+    if not size or size[1] <= 0:
+        return False
+    aspect = size[0] / size[1]
+    views = await _all_cam_views(client)
+    if not views:
+        return False
+    refs = _native_vert.setdefault(hwnd, {})
+    ok = False
+    for view in views.values():
+        ok = await _correct_view(view, aspect, refs) or ok
+    return ok
 
 
 class ClientResizingManager:
@@ -305,6 +372,9 @@ class ClientResizingManager:
             await self._ensure_border(client, hwnd)
             await self._update_border(hwnd)
             await self._handle_resize(client, hwnd)
+            # Re-assert the aspect fix on every controller each tick so switching
+            # cameras (free / combat) reflects it within a tick, even with no resize.
+            await correct_aspect(client, hwnd)
 
         for hwnd in set(self._forcers) | set(self._borders) | set(_armed):
             if hwnd not in live:

@@ -61,18 +61,26 @@ class SetModeResHook(SimpleHook):
 
 
 class VideoManagerHook(SimpleHook):
-    """Capture the video-manager `this` (rcx) at the per-frame mode checker."""
+    """Capture the video-manager `this` (rcx) at the per-frame mode checker.
 
-    # The short prologue is generic; extend the pattern to the distinctive
-    # `cmp byte [rcx+0x2229b], 0` (the pending-mode-change poll) for uniqueness.
-    # Prologue ... mov rbx,rcx ; cmp byte [rcx+0x2229b], 0
+    The function was recompiled in a client update (2026-06) — new prologue, but
+    same semantics: rcx = manager at entry, and it still polls the pending byte at
+    +0x2229b. We anchor on the full prologue (frame setup + xmm spills + stack
+    canary load) up to `mov rbx, rcx`; the rip-relative __security_cookie load's
+    displacement is build-variable, so it is wildcarded.
+    """
+
+    # mov rax,rsp ; mov [rax+10],rbx ; mov [rax+18],rsi ; push rbp/rdi/r14 ;
+    # lea rbp,[rax-0x78] ; sub rsp,0x160 ; movaps xmm6/7/8 ;
+    # mov rax,[rip+cookie(wildcard)] ; xor rax,rsp ; mov [rbp+0x20],rax ; mov rbx,rcx
     pattern = (
-        rb"\x48\x8B\xC4\x55\x57\x41\x56\x48\x8D\x68\xB8\x48\x81\xEC\x30\x01\x00\x00"
-        rb"\x48\xC7\x44\x24\x70\xFE\xFF\xFF\xFF\x48\x89\x58\x10\x48\x89\x70\x18"
-        rb"\x0F\x29\x70\xD8\x0F\x29\x78\xC8\x44\x0F\x29\x40\xB8\x48\x8B\xD9"
-        rb"\x80\xB9\x9B\x22\x02\x00\x00"
+        rb"\x48\x8B\xC4\x48\x89\x58\x10\x48\x89\x70\x18\x55\x57\x41\x56"
+        rb"\x48\x8D\x68\x88\x48\x81\xEC\x60\x01\x00\x00"
+        rb"\x0F\x29\x70\xD8\x0F\x29\x78\xC8\x44\x0F\x29\x40\xB8"
+        rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x45\x20\x48\x8B\xD9"
     )
-    instruction_length = 5  # mov rax,rsp ; push rbp ; push rdi
+    instruction_length = 7  # mov rax,rsp (3) ; mov [rax+0x10],rbx (4)
+    noops = 2               # jmp rel32 is 5 bytes; pad the 7-byte hole with 2 NOPs
     exports = [("manager_ptr", 8)]
 
     async def bytecode_generator(self, packed_exports):
@@ -80,10 +88,9 @@ class VideoManagerHook(SimpleHook):
         return (
             b"\x48\xB8" + mgr          # mov rax, manager_ptr  (our export slot)
             + b"\x48\x89\x08"          # mov [rax], rcx        (store the manager 'this')
-            # ---- original overwritten instructions ----
+            # ---- original overwritten instructions (rax recomputed by mov rax,rsp) ----
             + b"\x48\x8B\xC4"          # mov rax, rsp
-            + b"\x55"                  # push rbp
-            + b"\x57"                  # push rdi
+            + b"\x48\x89\x58\x10"      # mov [rax+0x10], rbx
         )
 
 
