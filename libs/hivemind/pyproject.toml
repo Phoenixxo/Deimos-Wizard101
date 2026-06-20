@@ -1,0 +1,10 @@
+[project]
+name = "hivemind"
+version = "0.1.0"
+description = "Bot-to-bot communication protocol over Wizard101 directed chat"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+dependencies = [
+    "wizwalker",
+]
