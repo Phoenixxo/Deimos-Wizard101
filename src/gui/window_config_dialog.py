@@ -3,8 +3,10 @@
 A popup opened from each launcher account row (the "proportions" icon). It shows a
 mock of the current multi-monitor layout (physical screen coords) with a draggable,
 resizable rectangle representing the game window, plus dimmed boxes for the OTHER
-accounts' saved windows so they can be lined up (edges snap to monitor/other-window
-edges within a small radius). A preset dropdown sets a common resolution (and the
+accounts' saved windows so they can be lined up (edges snap to monitor, taskbar, and
+other-window edges within a small radius). Each monitor's taskbar is drawn as an amber
+bar with an accent line on its inner edge — the boundary the window snaps flush against.
+A preset dropdown sets a common resolution (and the
 window size 1:1); a lock toggle links the render resolution to the window client
 size; a borderless checkbox strips the title bar/borders. Saving stores the config
 in the account's wizlaunch metadata; it is applied automatically on launch.
@@ -39,21 +41,53 @@ _MONENUMPROC = ctypes.WINFUNCTYPE(
 
 
 def enum_monitors():
-    """Return [(x, y, w, h, is_primary), ...] in physical virtual-desktop coords."""
+    """Return [(x, y, w, h, is_primary, (wx, wy, ww, wh)), ...] in physical
+    virtual-desktop coords.
+
+    The trailing tuple is the monitor's *work area* (``rcWork``) — the screen
+    minus the taskbar and any docked appbars. Windows reports this per monitor,
+    so it correctly reflects a taskbar shown on all displays or only the primary.
+    The taskbar region is the difference between the monitor and its work area
+    (see ``_taskbar_rect``).
+    """
     out = []
 
     def _cb(hmon, hdc, lprc, lparam):
         mi = _MONITORINFO()
         mi.cbSize = ctypes.sizeof(_MONITORINFO)
         _user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
-        r = mi.rcMonitor
-        out.append((r.left, r.top, r.right - r.left, r.bottom - r.top, bool(mi.dwFlags & 1)))
+        r, wk = mi.rcMonitor, mi.rcWork
+        out.append((r.left, r.top, r.right - r.left, r.bottom - r.top, bool(mi.dwFlags & 1),
+                    (wk.left, wk.top, wk.right - wk.left, wk.bottom - wk.top)))
         return 1
 
     _user32.EnumDisplayMonitors(None, None, _MONENUMPROC(_cb), 0)
     if not out:
-        out.append((0, 0, _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1), True))
+        sw, sh = _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+        out.append((0, 0, sw, sh, True, (0, 0, sw, sh)))
     return out
+
+
+def _taskbar_rect(mon):
+    """Taskbar/appbar region of a monitor = monitor area minus work area.
+
+    Returns ``(tx, ty, tw, th, edge)`` where ``edge`` is the monitor edge the
+    taskbar is docked to (``'bottom'|'top'|'left'|'right'``), or ``None`` when
+    the monitor has no taskbar (work area fills it). The reserved strip is along
+    exactly one edge; we pick whichever side the work area was inset from.
+    """
+    mx, my, mw, mh, _p, (wx, wy, ww, wh) = mon
+    mr, mb = mx + mw, my + mh
+    wr, wb = wx + ww, wy + wh
+    if wb < mb:                       # docked at the bottom (most common)
+        return (mx, wb, mw, mb - wb, 'bottom')
+    if wy > my:                       # docked at the top
+        return (mx, my, mw, wy - my, 'top')
+    if wx > mx:                       # docked at the left
+        return (mx, my, wx - mx, mh, 'left')
+    if wr < mr:                       # docked at the right
+        return (wr, my, mr - wr, mh, 'right')
+    return None
 
 
 # ---- common resolutions for the preset dropdown (grouped by aspect ratio) ----
@@ -140,11 +174,21 @@ class _MonitorCanvas(QWidget):
     def _win_canvas_rect(self):
         return self._rect_canvas(*self.win)
 
-    # --- snapping: candidate edge lines from monitors + other windows ---
+    # --- snapping: candidate edge lines from monitors, taskbars + other windows ---
     def _snap_lines(self):
         xs, ys = set(), set()
-        for (mx, my, mw, mh, _p) in self.monitors:
+        for mon in self.monitors:
+            mx, my, mw, mh = mon[0], mon[1], mon[2], mon[3]
             xs.update((mx, mx + mw)); ys.update((my, my + mh))
+            tb = _taskbar_rect(mon)
+            if tb:
+                tx, ty, tw, th, edge = tb
+                # snap to the taskbar's *inner* boundary so the window sits flush
+                # against it without overlapping the taskbar.
+                if edge == 'bottom': ys.add(ty)
+                elif edge == 'top': ys.add(ty + th)
+                elif edge == 'left': xs.add(tx + tw)
+                elif edge == 'right': xs.add(tx)
         for (ox, oy, ow, oh, _l) in self.others:
             xs.update((ox, ox + ow)); ys.update((oy, oy + oh))
         return sorted(xs), sorted(ys)
@@ -167,7 +211,8 @@ class _MonitorCanvas(QWidget):
         p.fillRect(self.rect(), QColor(0, 0, 0, 0))
         f = QFont(); f.setPointSize(8); p.setFont(f)
         # monitors (background)
-        for (mx, my, mw, mh, primary) in self.monitors:
+        for mon in self.monitors:
+            mx, my, mw, mh, primary = mon[0], mon[1], mon[2], mon[3], mon[4]
             r = self._rect_canvas(mx, my, mw, mh)
             p.setPen(QPen(QColor(255, 255, 255, 90), 1))
             p.setBrush(QBrush(QColor(255, 255, 255, 18) if primary else QColor(255, 255, 255, 10)))
@@ -175,6 +220,27 @@ class _MonitorCanvas(QWidget):
             p.setPen(QColor(255, 255, 255, 130))
             p.drawText(r.adjusted(4, 2, -4, -2), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
                        f"{mw}x{mh}" + (" ★" if primary else ""))
+            # taskbar region (amber) + an accent line on its inner edge — the
+            # boundary the window snaps to, so it sits flush against the taskbar.
+            tb = _taskbar_rect(mon)
+            if tb:
+                tx, ty, tw, th, edge = tb
+                tr = self._rect_canvas(tx, ty, tw, th)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 184, 77, 45)))
+                p.drawRect(tr)
+                p.setPen(QPen(QColor(255, 184, 77, 210), 2))
+                if edge == 'bottom':
+                    p.drawLine(tr.left(), tr.top(), tr.right(), tr.top())
+                elif edge == 'top':
+                    p.drawLine(tr.left(), tr.bottom(), tr.right(), tr.bottom())
+                elif edge == 'left':
+                    p.drawLine(tr.right(), tr.top(), tr.right(), tr.bottom())
+                elif edge == 'right':
+                    p.drawLine(tr.left(), tr.top(), tr.left(), tr.bottom())
+                if tr.width() > 46 and tr.height() > 11:
+                    p.setPen(QColor(255, 214, 150, 200))
+                    p.drawText(tr, Qt.AlignmentFlag.AlignCenter, "Taskbar")
         # other accounts' windows (dim, for alignment)
         for (ox, oy, ow, oh, label) in self.others:
             r = self._rect_canvas(ox, oy, ow, oh)

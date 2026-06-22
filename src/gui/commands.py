@@ -47,6 +47,13 @@ class GUICommandType(Enum):
     PrepareBotPublish = auto()   # GUI -> Backend: request current-zone context for publishing (data: None)
     BotPublishContext = auto()   # Backend -> GUI: data = {'zone': str} (zone may be '')
 
+    # HiveMind (bot-to-bot coordination)
+    HiveMindToggle = auto()      # GUI -> Backend: data = bool (enable/disable; just makes you discoverable)
+    HiveMindSeek = auto()        # GUI -> Backend: data = None (look for team-up = accept offers)
+    OfferBot = auto()            # GUI -> Backend: data = int (bot index in current zone list)
+    ShowBotOfferDialog = auto()  # Backend -> GUI: data = {'offer_id','sender_gid','bot_index','bot_name','zone'}
+    BotOfferResponse = auto()    # GUI -> Backend: data = (offer_id: int, accepted: bool)
+
     SetPlaystyles = auto()
 
     SetScale = auto()

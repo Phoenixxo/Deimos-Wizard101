@@ -62,12 +62,17 @@ def _is_general(bot: dict) -> bool:
     return str(bot.get('world') or bot.get('zone') or '').split('/')[0] == 'General'
 
 
-def search_compatible_bots(zone: str, client_count: int) -> list[dict]:
+def search_compatible_bots(zone: str, client_count) -> list[dict]:
     """Return bots for the given zone plus all General bots, filtered by client count.
 
     Zone bots sort before General ones and entries are deduped by path. General
     entries come from each General zone's registry.json (rich, with descriptions),
     falling back to the slim index.json entries if a per-zone fetch fails.
+
+    Pass ``client_count=None`` to skip the ``@clients`` filter entirely (used when
+    HiveMind is active, since the effective team size spans multiple instances and
+    both master and slave must enumerate the same unfiltered, identically-ordered
+    list so a bot's index matches on every client).
     """
     candidates = []
     zone_data = _get_registry_json(_zone_registry_url(zone)) if zone else None
@@ -95,7 +100,7 @@ def search_compatible_bots(zone: str, client_count: int) -> list[dict]:
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)
-        if not clients_compatible(bot.get('clients'), client_count):
+        if client_count is not None and not clients_compatible(bot.get('clients'), client_count):
             continue
         bot = dict(bot)
         bot['is_general'] = _is_general(bot)

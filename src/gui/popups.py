@@ -125,7 +125,11 @@ def show_bot_search_popup(ctx, bot_tab):
         ctx.tabs.setCurrentWidget(bot_tab)
         dialog.close()
 
-    def _add_bot_row(bot):
+    def _offer_bot(index):
+        # Master-side: broadcast this bot's zone-list index to confirmed peers.
+        ctx.send_queue.put(GUICommand(GUICommandType.OfferBot, index))
+
+    def _add_bot_row(bot, index):
         item = QListWidgetItem()
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
@@ -161,6 +165,10 @@ def show_bot_search_popup(ctx, bot_tab):
             ctx, ctx.svgs['import'], tl('bot_search_import'), lambda _=False, p=path: _import_bot(p, False)))
         row_layout.addWidget(launcher_small_icon_btn(
             ctx, ctx.svgs['play'], tl('bot_search_run'), lambda _=False, p=path: _import_bot(p, True)))
+        offer_btn = QPushButton(tl('bot_search_offer'))
+        offer_btn.setToolTip(tl('bot_search_offer_tip'))
+        offer_btn.clicked.connect(lambda _=False, i=index: _offer_bot(i))
+        row_layout.addWidget(offer_btn)
 
         item.setSizeHint(row_widget.sizeHint())
         listbox.addItem(item)
@@ -182,8 +190,8 @@ def show_bot_search_popup(ctx, bot_tab):
         status_label.setText(tl('bot_search_results_header').format(zone, count))
         listbox.setUpdatesEnabled(False)
         listbox.clear()
-        for bot in bots:
-            _add_bot_row(bot)
+        for index, bot in enumerate(bots):
+            _add_bot_row(bot, index)
         listbox.setUpdatesEnabled(True)
         listbox.show()
 
@@ -193,6 +201,59 @@ def show_bot_search_popup(ctx, bot_tab):
     close_btn.clicked.connect(dialog.close)
     layout.addWidget(close_btn)
 
+    dialog.show()
+    return dialog
+
+
+def show_bot_offer_dialog(parent, send_queue, data, tl=None):
+    """Modal: a master peer offers a bot for this zone -- accept or reject.
+
+    Replies with ``BotOfferResponse = (offer_id, accepted)``. Closing the dialog
+    without choosing counts as a reject so the backend's pending offer resolves.
+    """
+    _ = tl or (lambda k: k)
+    offer_id = data.get('offer_id')
+    from_name = data.get('from_name') or 'a nearby teammate'
+    bot_name = data.get('bot_name', '?')
+    zone = data.get('zone', '')
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(_('hivemind_offer_title'))
+    dialog.setModal(True)
+    layout = QVBoxLayout(dialog)
+
+    msg = QLabel(_('hivemind_offer_body').format(html.escape(str(from_name)), html.escape(str(bot_name)), html.escape(str(zone))))
+    msg.setTextFormat(Qt.TextFormat.RichText)
+    msg.setWordWrap(True)
+    layout.addWidget(msg)
+
+    responded = {'done': False}
+
+    def _respond(accepted):
+        if responded['done']:
+            return
+        responded['done'] = True
+        send_queue.put(GUICommand(GUICommandType.BotOfferResponse, (offer_id, accepted)))
+        dialog.close()
+
+    btn_row = QHBoxLayout()
+    btn_row.addStretch()
+    reject_btn = QPushButton(_('hivemind_offer_reject'))
+    reject_btn.clicked.connect(lambda: _respond(False))
+    accept_btn = QPushButton(_('hivemind_offer_accept'))
+    accept_btn.setDefault(True)
+    accept_btn.clicked.connect(lambda: _respond(True))
+    btn_row.addWidget(reject_btn)
+    btn_row.addWidget(accept_btn)
+    layout.addLayout(btn_row)
+
+    orig_close = dialog.closeEvent
+    def _close_event(event):
+        _respond(False)  # closing == reject
+        orig_close(event)
+    dialog.closeEvent = _close_event
+
+    dialog.adjustSize()
     dialog.show()
     return dialog
 

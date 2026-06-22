@@ -25,7 +25,7 @@ from src.gui.helpers import (
 )
 from src.gui.actions import ActionRegistry
 from src.gui.theme import compute_styles
-from src.gui.popups import show_ui_tree_popup, show_entity_list_popup, show_update_dialog
+from src.gui.popups import show_ui_tree_popup, show_entity_list_popup, show_update_dialog, show_bot_offer_dialog
 
 from src.gui.tab_launcher import build_launcher_tab
 from src.gui.tab_hotkeys import build_hotkeys_tab
@@ -657,6 +657,13 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                                     dlg.set_context(com.data or {})
                             except RuntimeError:
                                 ctx.bot_publish_dialog = None
+
+                    case GUICommandType.ShowBotOfferDialog:
+                        try:
+                            show_bot_offer_dialog(window, send_queue, com.data or {}, tl=tl)
+                        except Exception as e:
+                            from loguru import logger as _lg
+                            _lg.exception(f"[hivemind] failed to show bot offer dialog: {e}")
 
                     case GUICommandType.UpdateEntityListData:
                         popup = entity_popup_ref[0]

@@ -22,6 +22,7 @@ dependencies = [
     "wizsprinter",
     "wizlaunch",
     "kinif",
+    "hivemind",
     "numpy>=2.4.6",
     "shapely>=2.1.2",
     "katsuba>=0.4.0",
@@ -39,13 +40,14 @@ packages = ["src"]
 override-dependencies = ["pefile>=2024.8.26"]
 
 [tool.uv.workspace]
-members = ["libs/wizwalker", "libs/wizsprinter", "libs/wizlaunch", "libs/kinif"]
+members = ["libs/wizwalker", "libs/wizsprinter", "libs/wizlaunch", "libs/kinif", "libs/hivemind"]
 
 [tool.uv.sources]
 wizwalker = { workspace = true }
 wizsprinter = { workspace = true }
 wizlaunch = { workspace = true }
 kinif = { workspace = true }
+hivemind = { workspace = true }
 
 [dependency-groups]
 dev = ["pyinstaller>=6.0"]

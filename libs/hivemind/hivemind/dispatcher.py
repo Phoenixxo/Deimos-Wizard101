@@ -1,10 +1,10 @@
-from typing import Awaitable, Callable, Dict
+from typing import Awaitable, Callable, Dict, List
 
 from .message_type import MessageType
 
 
-# Handler signature: async fn(sender_gid: int) -> None
-HandlerFn = Callable[[int], Awaitable[None]]
+# Handler signature: async fn(sender_gid: int, args: List[int]) -> None
+HandlerFn = Callable[[int, List[int]], Awaitable[None]]
 
 
 class MessageDispatcher:
@@ -12,7 +12,7 @@ class MessageDispatcher:
 
     Each MessageType maps to exactly one async handler. When a
     protocol message arrives, dispatch() calls the corresponding
-    handler with the sender's GID.
+    handler with the sender's GID and the message's integer arguments.
     """
 
     def __init__(self):
@@ -23,16 +23,17 @@ class MessageDispatcher:
 
         Args:
             msg_type: The message type to handle
-            handler: Async function called with (sender_gid)
+            handler: Async function called with (sender_gid, args)
         """
         self._handlers[msg_type] = handler
 
-    async def dispatch(self, msg_type: MessageType, sender_gid: int):
+    async def dispatch(self, msg_type: MessageType, sender_gid: int, args: List[int]):
         """Dispatch a decoded message to its handler.
 
         Args:
             msg_type: The decoded message type
             sender_gid: GID of the player who sent the message
+            args: The message's decoded integer arguments
 
         Returns:
             True if a handler was found and called, False otherwise
@@ -40,5 +41,5 @@ class MessageDispatcher:
         handler = self._handlers.get(msg_type)
         if handler is None:
             return False
-        await handler(sender_gid)
+        await handler(sender_gid, args)
         return True

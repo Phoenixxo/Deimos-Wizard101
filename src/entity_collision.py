@@ -1,12 +1,15 @@
 import json
+import math
 import os
 import re
 import threading
 from pathlib import Path
+from xml.etree import ElementTree as etree
 
 from loguru import logger
 from shapely.affinity import rotate, scale, translate
 from shapely.geometry import MultiPoint, Point, Polygon
+from shapely.ops import unary_union
 from wizwalker.utils import get_wiz_install
 
 # katsuba + kinif + wiztype are best-effort: if any is missing we degrade to
@@ -41,6 +44,106 @@ _FALLBACK_WADS = [
 # placeholder NIF). Big enough to keep a teleport off the object, small enough not to
 # wall off the area around it.
 _DEFAULT_STATIC_RADIUS = 150.0
+
+# Teleporter / dock-warp pads (templates named ``<WORLD>-TELEPORT-<PLACE>``) are
+# solid in-game — landing a teleport on one rubber-bands you — but their template
+# carries an *empty* render asset and an empty ``m_solidCollisionFilename``, so
+# nothing links them to a model and the solver treats the spot as walkable. Their
+# model lives at a predictable StateObject path keyed off the world prefix, e.g.
+# ``AZ-TELEPORT-ZULTUNDOCK`` -> ``StateObjects/AZ_Teleporter/AZ_Teleporter.nif``
+# (hull radius ~230u, matching the observed bounce). We resolve that and mark the
+# object collidable. If the model can't be read we fall back to a disc this big.
+_TELEPORT_FALLBACK_RADIUS = 220.0
+
+
+def _parse_collision_xml(data: bytes) -> tuple[list | None, int, int]:
+    """Parse a KI collision file (``<world><primitive>…``, the same schema
+    ``CollisionWorld.save_xml`` emits) into a model-local 2D movement footprint.
+
+    Returns ``(points, n_total, n_click)``:
+      - ``points``  convex-hull outline ``[(x, y), …]`` of the *movement* primitives
+        (boxes/spheres/cylinders projected to the horizontal plane, each placed by its
+        own local transform), or None if there are none. Same shape ``footprint_points``
+        yields from a render NIF, so the placement pipeline is unchanged.
+      - ``n_total`` primitives seen, ``n_click`` of them interaction click-boxes.
+
+    Click-boxes (primitives whose name contains "click", e.g. ``PlayerClickBox_collision``)
+    are *interaction triggers you approach to activate* — boat/dock travel points, NPC
+    hit-boxes — not walls. They're excluded from the footprint so we don't shove a teleport
+    away from something the bot needs to be next to; the counts let the caller decide a
+    click-only object isn't a movement obstacle at all.
+    """
+    try:
+        from .collision_math import transformCube, toCubeVertices
+    except Exception:
+        return None, 0, 0
+    try:
+        root = etree.fromstring(data)
+    except Exception:
+        return None, 0, 0
+    polys = []
+    n_total = n_click = 0
+    for prim in root.findall("primitive"):
+        n_total += 1
+        if "click" in (prim.get("name") or "").lower():
+            n_click += 1
+            continue
+        ptype = (prim.get("type") or "").lower()
+        loc_el = prim.find("location")
+        lx = float(loc_el.get("x", 0)) if loc_el is not None else 0.0
+        ly = float(loc_el.get("y", 0)) if loc_el is not None else 0.0
+        lz = float(loc_el.get("z", 0)) if loc_el is not None else 0.0
+        rot_el = prim.find("rotation")
+        if rot_el is not None and rot_el.get("matrix"):
+            try:
+                rot = tuple(float(x) for x in rot_el.get("matrix").split())
+            except Exception:
+                rot = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        else:
+            rot = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        try:
+            if ptype == "box":
+                dim = prim.find("dimensions")
+                l, w, d = float(dim.get("l")), float(dim.get("w")), float(dim.get("d"))
+                world_pts = transformCube(toCubeVertices((l, w, d)), (lx, ly, lz), rot)
+                poly = Polygon([(p[0], p[1]) for p in world_pts]).convex_hull
+            elif ptype == "sphere":
+                r = float(prim.find("radius").get("value"))
+                poly = Point(lx, ly).buffer(r)
+            elif ptype in ("cylinder", "tube"):
+                el = prim.find(ptype)
+                r = float(el.get("radius"))
+                poly = Point(lx, ly).buffer(r)
+            else:
+                continue  # plane/ray/mesh: not used as a horizontal footprint here
+        except Exception:
+            continue
+        if poly is not None and not poly.is_empty:
+            polys.append(poly)
+    if not polys:
+        return None, n_total, n_click
+    hull = unary_union(polys).convex_hull
+    if hull.geom_type != "Polygon" or hull.is_empty:
+        return None, n_total, n_click
+    return list(hull.exterior.coords), n_total, n_click
+
+
+def _is_teleporter_name(name: str) -> bool:
+    """Whether a template name marks a solid teleporter/dock-warp pad."""
+    return bool(name) and "TELEPORT" in name.upper().split("-")
+
+
+def _teleporter_model_asset(name: str) -> str | None:
+    """Predictable StateObject model path for a ``<WORLD>-TELEPORT-…`` pad.
+
+    The shared per-world teleporter model: ``AZ-TELEPORT-ZULTUNDOCK`` ->
+    ``StateObjects/AZ_Teleporter/AZ_Teleporter.nif``. Returns None if ``name``
+    has no world prefix.
+    """
+    prefix = name.split("-", 1)[0] if name else ""
+    if not prefix:
+        return None
+    return f"StateObjects/{prefix}_Teleporter/{prefix}_Teleporter.nif"
 
 
 def _footprint_cache_path(revision: str) -> Path:
@@ -133,14 +236,17 @@ def _extract_nif_asset(template) -> str | None:
     return None
 
 
-def _has_solid_collision(template) -> bool:
-    """Whether a template is a solid obstacle the player can't walk through."""
+def _solid_collision_filename(template) -> str | None:
+    """The template's active ``m_solidCollisionFilename`` (a separate collision-geometry
+    file), or None. Many placed objects — boats, doors, dock pads — carry an empty render
+    asset but reference their real collision shape here (often a shared proxy like
+    ``MB_FactoryDoor_Collision.xml``), so this is the authoritative footprint source."""
     try:
         behaviors = template["m_behaviors"]
     except Exception:
-        return False
+        return None
     if not isinstance(behaviors, LazyList):
-        return False
+        return None
     for behavior in behaviors:
         if not isinstance(behavior, LazyObject):
             continue
@@ -156,8 +262,13 @@ def _has_solid_collision(template) -> bool:
             except Exception:
                 disabled = False
             if not disabled:
-                return True
-    return False
+                return solid
+    return None
+
+
+def _has_solid_collision(template) -> bool:
+    """Whether a template is a solid obstacle the player can't walk through."""
+    return _solid_collision_filename(template) is not None
 
 
 class _Resolver:
@@ -175,6 +286,8 @@ class _Resolver:
         self._asset_cache: dict[str, str | None] = {}  # entity name -> nif asset
         self._collidable_cache: dict[str, bool] = {}  # entity name -> is solid obstacle
         self._hull_cache: dict[str, list | None] = {}  # asset -> local hull points
+        self._coll_points_cache: dict[str, list | None] = {}  # entity name -> collision-file hull
+        self._coll_file_cache: dict[str, list | None] = {}  # collision filename -> hull points
         self._wads: dict[str, object] = {}
         self._id2name: dict[int, str] | None = None  # templateID -> template basename
         self._zone_static_cache: dict[str, list] = {}  # zone -> [(z, footprint), ...]
@@ -359,31 +472,45 @@ class _Resolver:
 
     def _resolve_template(self, name: str) -> None:
         """Deserialize a template once, caching both its NIF asset and collidability."""
-        if name in self._asset_cache and name in self._collidable_cache:
-            return
-        asset = None
-        collidable = False
-        path = self._template_paths.get(name)
-        if path:
-            try:
-                template = self._root.deserialize(path, self._serializer)
-                asset = _extract_nif_asset(template)
-                collidable = _has_solid_collision(template)
-            except Exception:
-                pass
-        self._asset_cache[name] = asset
-        self._collidable_cache[name] = collidable
-        self._cache_dirty = True
+        if name not in self._asset_cache or name not in self._collidable_cache:
+            asset = None
+            collidable = False
+            path = self._template_paths.get(name)
+            if path:
+                try:
+                    template = self._root.deserialize(path, self._serializer)
+                    asset = _extract_nif_asset(template)
+                    collidable = _has_solid_collision(template)
+                except Exception:
+                    pass
+            self._asset_cache[name] = asset
+            self._collidable_cache[name] = collidable
+            self._cache_dirty = True
+        # Teleporter/dock-warp pads declare no render asset and no solid-collision
+        # file, yet they physically bounce you. Point them at the shared per-world
+        # teleporter StateObject model and force collidable so the solver routes a
+        # teleport clear of the pad in one shot (the empirical retreat is the backstop
+        # if even this model is missing — then the wider default disc applies). Applied
+        # here (not just on a fresh resolve) so it also corrects entries seeded from an
+        # older on-disk footprint cache that recorded them as non-collidable.
+        if _is_teleporter_name(name):
+            if not self._collidable_cache.get(name):
+                self._collidable_cache[name] = True
+                self._cache_dirty = True
+            if not self._asset_cache.get(name):
+                self._asset_cache[name] = _teleporter_model_asset(name)
+                self._cache_dirty = True
 
     def _asset_for(self, name: str) -> str | None:
-        if name not in self._asset_cache:
-            self._resolve_template(name)
+        # Always route through _resolve_template: it skips the costly deserialize on a
+        # cache hit but still applies the teleporter fix-up, which must run even for
+        # entries seeded from an older on-disk footprint cache.
+        self._resolve_template(name)
         return self._asset_cache[name]
 
     def is_collidable(self, name: str) -> bool:
         """Whether a placed object named ``name`` is a solid obstacle. Thread-only."""
-        if name not in self._collidable_cache:
-            self._resolve_template(name)
+        self._resolve_template(name)
         return self._collidable_cache[name]
 
     def _hull_for(self, asset: str, zone_name: str | None) -> list | None:
@@ -403,15 +530,95 @@ class _Resolver:
             self._cache_dirty = True
         return self._hull_cache[asset]
 
+    def _collision_file_parsed(self, filename: str, zone_name: str | None) -> tuple:
+        """``(points, n_total, n_click)`` for a ``m_solidCollisionFilename`` file, cached."""
+        if filename not in self._coll_file_cache:
+            result = (None, 0, 0)
+            data = self._read_nif(filename, zone_name)  # pipe-path reader works for any asset
+            if data:
+                result = _parse_collision_xml(data)
+            self._coll_file_cache[filename] = result
+        return self._coll_file_cache[filename]
+
+    def _collision_info_for(self, name: str, zone_name: str | None) -> tuple:
+        """``(points, n_total, n_click)`` from the object's solid-collision file, cached
+        per entity name. Deserializes the template on demand (only reached for the
+        uncommon render-asset-less objects), so it's robust to a stale on-disk footprint
+        cache that doesn't store the collision filename."""
+        if name not in self._coll_points_cache:
+            info = (None, 0, 0)
+            path = self._template_paths.get(name)
+            if path:
+                try:
+                    template = self._root.deserialize(path, self._serializer)
+                    fn = _solid_collision_filename(template)
+                    if fn:
+                        info = self._collision_file_parsed(fn, zone_name)
+                except Exception:
+                    info = (None, 0, 0)
+            self._coll_points_cache[name] = info
+        return self._coll_points_cache[name]
+
+    def movement_collidable(self, name: str, zone_name: str | None) -> bool:
+        """Whether a placed object is a *movement* obstacle (a teleport must clear it).
+
+        Stricter than ``is_collidable``: an object whose only collision is an interaction
+        click-box (boat/dock travel points, NPC hit-boxes) is something the bot approaches
+        to activate, not a wall — so it's *not* a movement obstacle and we let teleports
+        land right next to it. Objects with a render model, a real (non-click) collision
+        primitive, or the teleporter override stay collidable."""
+        self._resolve_template(name)
+        if not self._collidable_cache.get(name):
+            return False
+        if self._asset_cache.get(name):
+            return True  # has a render/teleporter model -> real obstacle
+        _pts, n_total, n_click = self._collision_info_for(name, zone_name)
+        if n_total > 0 and n_click >= n_total:
+            return False  # click-box-only interaction trigger, not a wall
+        return True
+
     def footprint_points(self, name: str, zone_name: str | None) -> list | None:
-        """Local-space 2D hull points for an entity's model, or None. Thread-only."""
+        """Local-space 2D hull points for an entity's model, or None. Thread-only.
+
+        Prefers the render-NIF hull; when an object has no render asset (boats, dock
+        pads, doors that reference only a separate collision file) it falls back to the
+        movement geometry in its ``m_solidCollisionFilename`` — the real, often much
+        smaller collider — instead of letting the caller drop to an oversized default disc."""
         if not self._initialize():
             return None
         with self._lock:
             asset = self._asset_for(name)
-            if not asset:
-                return None
-            return self._hull_for(asset, zone_name)
+            if asset:
+                hull = self._hull_for(asset, zone_name)
+                if hull:
+                    return hull
+            return self._collision_info_for(name, zone_name)[0]
+
+    def collider_radius(self, template_id: int, zone_name: str | None) -> float | None:
+        """Horizontal collider radius of an object's model footprint, or None.
+
+        Resolves ``template_id`` -> template basename (via the manifest) -> the
+        model footprint hull (the same path used for static-object collision), then
+        returns the radius of the smallest circle enclosing that hull, measured from
+        its centroid. This is the object's true *horizontal* extent — for the
+        "Player Object" template it's the wizard's footprint radius, not a
+        vertical-height proxy. In local model units; scale by the object's scale to
+        get world units. Thread-only (acquires the resolver lock, which is reentrant).
+        """
+        if not self._initialize():
+            return None
+        with self._lock:
+            self._load_manifest()
+            name = self._id2name.get(template_id) if self._id2name else None
+        if not name:
+            return None
+        points = self.footprint_points(name, zone_name)
+        if not points:
+            return None
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        radius = max(math.hypot(p[0] - cx, p[1] - cy) for p in points)
+        return radius if radius > 0 else None
 
     def _load_manifest(self) -> None:
         """Build the templateID -> template basename map from Root.wad's manifest (once)."""
@@ -476,11 +683,12 @@ class _Resolver:
                         continue
 
                     name = self._id2name.get(tid) if self._id2name else None
-                    # Only solid obstacles block the player. Skip everything else —
-                    # decorative meshes (archways), walk-on triggers, NPCs (soft capsule),
-                    # and templates we can't resolve — so we don't shove teleports around
-                    # things you can actually walk through.
-                    if not name or not self.is_collidable(name):
+                    # Only solid *movement* obstacles block the player. Skip everything
+                    # else — decorative meshes (archways), walk-on triggers, NPCs (soft
+                    # capsule), interaction click-boxes (boat/dock travel points you must
+                    # stand next to), and templates we can't resolve — so we don't shove
+                    # teleports around things you can walk through or need to reach.
+                    if not name or not self.movement_collidable(name, zone_name):
                         continue
 
                     shape = None
@@ -496,10 +704,15 @@ class _Resolver:
                             shape = translate(poly, xoff=loc.x, yoff=loc.y)
                             precise += 1
                     if shape is None:
-                        # collidable, but the model is a placeholder/unparsable NIF
-                        shape = Point(loc.x, loc.y).buffer(
-                            _DEFAULT_STATIC_RADIUS * obj_scale
+                        # collidable, but the model is a placeholder/unparsable NIF.
+                        # Teleporter pads get a wider disc (their real footprint is
+                        # ~220u) so a missing model still keeps teleports off them.
+                        default_r = (
+                            _TELEPORT_FALLBACK_RADIUS
+                            if _is_teleporter_name(name)
+                            else _DEFAULT_STATIC_RADIUS
                         )
+                        shape = Point(loc.x, loc.y).buffer(default_r * obj_scale)
 
                     if shape is not None and not shape.is_empty:
                         placed.append((loc.z, shape))
@@ -629,6 +842,19 @@ def build_zone_static_shapes(
     if target_z is None:
         return [shape for _z, shape in placed]
     return [shape for z, shape in placed if abs(z - target_z) <= z_threshold]
+
+
+def get_object_collider_radius(template_id: int, zone_name: str | None) -> float | None:
+    """In a worker thread: the horizontal collider radius of an object's model.
+
+    Pulls the actual footprint of the object identified by ``template_id`` (e.g. the
+    player's "Player Object") and returns its bounding-circle radius in local model
+    units, or ``None`` when the model can't be resolved (caller should fall back).
+    Multiply by the object's scale for world units. Thread-safe, cached.
+    """
+    if not template_id:
+        return None
+    return _resolver.collider_radius(template_id, zone_name)
 
 
 def get_zone_display_name(zone_name: str, locale: str = "en-US") -> str | None:

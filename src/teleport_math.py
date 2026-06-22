@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 from wizwalker import XYZ, Orient, Client, Keycode
 from wizwalker.file_readers.wad import Wad
 import math
@@ -111,6 +112,68 @@ def get_neighbors(vertex: XYZ, vertices: list[XYZ], edges: list[(int, int)]):
         if edge[0] == vert_idx:
             result.append(vertices[edge[1]])
     return result
+
+
+def build_nav_adjacency(vertices: list[XYZ], edges: list[tuple[int, int]]) -> dict[int, list[int]]:
+    """Undirected adjacency list for the zone nav graph.
+
+    Nav edges are stored one-way (``get_neighbors`` only follows ``edge[0]``), but the
+    graph is physically traversable both ways, so we add both directions — otherwise
+    A* connectivity is wrong and many vertices look unreachable.
+    """
+    n = len(vertices)
+    adj: dict[int, list[int]] = {i: [] for i in range(n)}
+    for a, b in edges:
+        if 0 <= a < n and 0 <= b < n:
+            adj[a].append(b)
+            adj[b].append(a)
+    return adj
+
+
+def nearest_nav_vertex(vertices: list[XYZ], xyz: XYZ) -> int:
+    """Index of the nav vertex closest (3D) to ``xyz``, or -1 if there are none."""
+    best_i, best_d = -1, None
+    for i, v in enumerate(vertices):
+        d = calc_squareDistance(v, xyz)
+        if best_d is None or d < best_d:
+            best_d, best_i = d, i
+    return best_i
+
+
+def a_star_nav(vertices: list[XYZ], adj: dict[int, list[int]], start_i: int,
+               goal_i: int, target_xyz: XYZ) -> int:
+    """A* over the nav graph from ``start_i`` toward the target.
+
+    Returns the index of the vertex to teleport to: ``goal_i`` (the vertex nearest the
+    target) when it's reachable from the start, otherwise the *reachable* vertex closest
+    to ``target_xyz``. We only need the destination vertex — the player teleports there
+    directly rather than walking the path — so the heuristic just steers the search at
+    the target and ``best_i`` tracks the closest vertex actually reached. Edge cost and
+    heuristic are straight-line distance.
+    """
+    def h(i: int) -> float:
+        return calc_Distance(vertices[i], target_xyz)
+
+    open_heap = [(h(start_i), start_i)]
+    g = {start_i: 0.0}
+    best_i, best_h = start_i, h(start_i)
+    visited: set[int] = set()
+    while open_heap:
+        _, cur = heapq.heappop(open_heap)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if h(cur) < best_h:
+            best_h, best_i = h(cur), cur
+        if cur == goal_i:
+            return goal_i
+        gc = g[cur]
+        for nb in adj.get(cur, ()):
+            ng = gc + calc_Distance(vertices[cur], vertices[nb])
+            if nb not in g or ng < g[nb]:
+                g[nb] = ng
+                heapq.heappush(open_heap, (ng + h(nb), nb))
+    return best_i
 
 
 def calc_PointOn3DLine(xyz_1 : XYZ, xyz_2 : XYZ, additional_distance):
@@ -327,6 +390,103 @@ async def navmap_tp(client: Client, xyz: XYZ = None, leader_client: Client = Non
     await fallback_spiral_tp(client, target_xyz)
 
 
+# The player's wall-clearance radius, clamped to a small collision-capsule range.
+# The model footprint (and half-height) reflect the *visual* extent — staff, cape,
+# nameplate — which is several times the body's real collision radius. Using that
+# large value as wall clearance erodes narrow walkable corridors and throws the
+# teleport far past the target, so we clamp it to a sane capsule size.
+_PLAYER_RADIUS_MIN = 25.0
+_PLAYER_RADIUS_MAX = 55.0
+
+
+async def _resolve_player_radius(client: Client, zone_name: str) -> float:
+    """Horizontal wall-clearance radius of the player's body, in world units.
+
+    Pulls the player object's footprint radius (scaled by body scale) when it
+    resolves, else the vertical half-height proxy, then a constant — and clamps the
+    result to ``[_PLAYER_RADIUS_MIN, _PLAYER_RADIUS_MAX]`` so an over-large visual
+    footprint can't make the collision solve overshoot.
+    """
+    try:
+        scale = await client.body.scale()
+    except Exception:
+        scale = 1.0
+    radius = None
+    try:
+        from src import entity_collision
+
+        tid = await client.client_object.template_id_full()
+        r = await asyncio.to_thread(
+            entity_collision.get_object_collider_radius, tid, zone_name
+        )
+        if r and r > 0:
+            radius = r * scale
+    except Exception:
+        radius = None
+    if radius is None:
+        try:
+            radius = (await client.body.height()) * scale * 0.5
+        except Exception:
+            radius = 45.0
+    return max(_PLAYER_RADIUS_MIN, min(radius, _PLAYER_RADIUS_MAX))
+
+
+# Retreat offsets (world units) from a blocked destination back toward the approach
+# anchor, tried in order until a teleport sticks. The collision solver only knows the
+# *modeled* geometry (collision.bcd walls + gamedata.bin solid colliders); warp /
+# teleporter trigger volumes (e.g. AZ-TELEPORT-…) carry no solid-collision file yet
+# still rubber-band you, so a geometrically-clear landing can be rejected. When that
+# happens we step back along the approach line until we're clear of the object.
+_RETREAT_STEPS = (70.0, 140.0, 230.0, 350.0, 520.0)
+
+
+async def _arrived(client: Client, dest: XYZ, settle: float = 1.0, tol: float = 60.0) -> bool:
+    """True if, after letting the server settle, we actually landed near ``dest``.
+
+    Compares only the horizontal plane — a rubber-band off a collider throws you far
+    in x/y, while ``z`` always terrain-snaps and would otherwise cause false misses.
+    Unreadable position -> assume success (don't thrash on a transient read error).
+    """
+    await asyncio.sleep(settle)
+    try:
+        pos = await client.body.position()
+    except Exception:
+        return True
+    return math.hypot(pos.x - dest.x, pos.y - dest.y) <= tol
+
+
+async def teleport_collision_verified(client: Client, dest: XYZ, anchor: XYZ) -> bool:
+    """Teleport to ``dest`` and confirm the server accepted it; on a rubber-band,
+    retreat toward ``anchor`` in increasing steps until a landing sticks.
+
+    The decisive collision teleport assumes the destination clears every obstacle,
+    but unmodeled warp volumes still bounce you. We verify the landing and, if it
+    bounced, back off along the line toward ``anchor`` (the player's start) — each
+    retreat is itself verified, so one that clips a modeled wall just rolls to the
+    next. Returns True once a teleport sticks, False if every attempt bounced
+    (caller should fall back to navmap_tp).
+    """
+    if not await is_free(client):
+        return False
+    await client.teleport(dest)
+    if await _arrived(client, dest):
+        return True
+    for back in _RETREAT_STEPS:
+        point = calc_PointOn3DLine(anchor, dest, back)  # 'back' units from dest toward anchor
+        if calc_Distance(point, dest) < 1.0:
+            break  # anchor too close to retreat any further
+        if not await is_free(client):
+            return False
+        logger.debug(
+            f"[collision_tp] {client.title}: destination bounced; retreating {back:.0f}u "
+            f"toward start -> {point}"
+        )
+        await client.teleport(point)
+        if await _arrived(client, point):
+            return True
+    return False
+
+
 async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = None):
     """Teleport by solving the zone's collision geometry — a single, decisive teleport.
 
@@ -356,12 +516,9 @@ async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = 
         from src.collision_math import find_safe_collision_point
         from src import entity_collision
 
-        try:
-            player_radius = (await client.body.height()) * (await client.body.scale()) * 0.5
-        except Exception:
-            player_radius = 75.0  # sane default if the body fields can't be read
-
         zone_name = await client.zone_name()
+        player_radius = await _resolve_player_radius(client, zone_name)
+
         collision_data = await get_collision_data(client, zone_name)
         world = CollisionWorld()
         world.load(collision_data)
@@ -373,7 +530,9 @@ async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = 
         # (cached per zone), so the entire solve runs off the event loop.
         def _solve():
             extra_shapes = entity_collision.build_zone_static_shapes(zone_name, target_xyz.z)
-            return find_safe_collision_point(world, target_xyz, player_radius, extra_shapes=extra_shapes)
+            return find_safe_collision_point(
+                world, target_xyz, player_radius, extra_shapes=extra_shapes, zone_name=zone_name
+            )
 
         safe_xyz, reason = await asyncio.to_thread(_solve)
     except Exception as e:
@@ -381,12 +540,183 @@ async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = 
         safe_xyz = None
 
     if safe_xyz is not None:
-        logger.debug(f"[collision_tp] {client.title}: collision TP ({reason}) -> single teleport to {safe_xyz}")
-        await client.teleport(safe_xyz)
+        moved = ((safe_xyz.x - target_xyz.x) ** 2 + (safe_xyz.y - target_xyz.y) ** 2) ** 0.5
+        logger.debug(
+            f"[collision_tp] {client.title}: collision TP ({reason}, r={player_radius:.0f}) -> "
+            f"{safe_xyz} (moved {moved:.0f}u from target)"
+        )
+        if await teleport_collision_verified(client, safe_xyz, starting_xyz):
+            return
+        logger.debug(
+            f"[collision_tp] {client.title}: collision point bounced (unmodeled collider); "
+            f"falling back to navmap TP"
+        )
+
+    else:
+        logger.debug(f"[collision_tp] {client.title}: no collision solution ({reason}); falling back to navmap TP")
+    await navmap_tp(client, xyz, leader_client)
+
+
+async def a_star_tp(client: Client, xyz: XYZ = None, leader_client: Client = None):
+    """Pathfinding teleport: A* over the zone nav graph + collision-validated landing.
+
+    Uses A* over ``zone.nav`` to find the nav vertex nearest the target that's actually
+    *reachable* from where the player stands (connectivity, not geometric nearness — the
+    closest vertex may sit across a wall). That vertex is only an anchor: because zone.nav
+    can disagree with collision.bcd and place it inside a wall, the collision navmesh then
+    snaps it onto walkable ground and marches toward the target, and we make one teleport
+    to that validated-walkable point. So the landing is both *reachable* (A*) and *not in
+    a wall* (collision navmesh).
+
+    Falls back to ``navmap_tp`` (direct teleport -> nav heuristic -> spiral) when the zone
+    ships no nav data, the graph is empty, or no walkable point can be validated.
+    """
+    if not await is_free(client):
         return
 
-    logger.debug(f"[collision_tp] {client.title}: no collision solution ({reason}); falling back to navmap TP")
+    target_xyz = xyz if xyz is not None else await client.quest_position.position()
+    starting_xyz = await client.body.position()
+    if calc_Distance(starting_xyz, target_xyz) <= 5.0:
+        return  # already there
+
+    starting_zone = await client.zone_name()
+    try:
+        wad = await load_wad(starting_zone)
+        nav_file = await wad.get_file("zone.nav")
+        vertices, edges = parse_nav_data(nav_file)
+    except Exception:
+        logger.debug(f"[a_star_tp] {client.title}: no nav data; falling back to navmap TP")
+        await navmap_tp(client, xyz, leader_client)
+        return
+
+    if not vertices:
+        logger.debug(f"[a_star_tp] {client.title}: empty nav graph; falling back to navmap TP")
+        await navmap_tp(client, xyz, leader_client)
+        return
+
+    adj = build_nav_adjacency(vertices, edges)
+    start_i = nearest_nav_vertex(vertices, starting_xyz)
+    goal_i = nearest_nav_vertex(vertices, target_xyz)
+    end_i = a_star_nav(vertices, adj, start_i, goal_i, target_xyz)
+    end_vertex = vertices[end_i]
+    reached_goal = end_i == goal_i
+
+    # The A* vertex is only an *anchor* near the target. A* runs on zone.nav, which can
+    # disagree with collision.bcd and place that vertex inside a wall — so we never trust
+    # it directly. The collision navmesh snaps it onto walkable ground and marches toward
+    # the target, returning the furthest *validated-walkable* point; we teleport once to
+    # that. If no collision navmesh is available we can't vet the vertex, so we defer to
+    # navmap rather than risk teleporting into a wall.
+    destination = None
+    try:
+        from src.collision import CollisionWorld as _CW, get_collision_data as _gcd
+        from src.collision_math import closest_walkable_along, find_safe_collision_point
+
+        from src import entity_collision
+
+        player_radius = await _resolve_player_radius(client, starting_zone)
+        coll_data = await _gcd(client, starting_zone)
+        cworld = _CW()
+        cworld.load(coll_data)
+
+        # Static entity colliders (NPCs, props, the UniverseTeleport) live in gamedata.bin,
+        # not collision.bcd — fold them in so the march won't land us on top of one. Built
+        # in the worker thread (file/CPU work, cached per zone).
+        #
+        # The A* march guarantees a *reachable* landing but, because the nav graph is sparse
+        # and the march is a straight line, it can stop far short of the target (no vertex
+        # near a dock end, a wall splitting the line). The geometric solve returns the point
+        # *closest* to the target that's on walkable mesh and wall-clear. Both are valid
+        # first-try landings, so we take whichever is nearer the target — a_star_tp is then
+        # never worse than collision_tp at getting close, while still preferring the marched
+        # point when it's the closer one.
+        def _solve():
+            extra_shapes = entity_collision.build_zone_static_shapes(starting_zone, target_xyz.z)
+            marched = closest_walkable_along(
+                cworld, starting_zone, end_vertex, target_xyz, player_radius, extra_shapes=extra_shapes
+            )
+            nearest, _reason = find_safe_collision_point(
+                cworld, target_xyz, player_radius, extra_shapes=extra_shapes, zone_name=starting_zone
+            )
+            candidates = [c for c in (marched, nearest) if c is not None]
+            if not candidates:
+                return None
+            return min(candidates, key=lambda c: calc_squareDistance(c, target_xyz))
+
+        destination = await asyncio.to_thread(_solve)
+    except Exception as e:
+        logger.debug(f"[a_star_tp] {client.title}: walkable solve failed ({e!r})")
+
+    if destination is None:
+        logger.debug(f"[a_star_tp] {client.title}: no validated walkable point; falling back to navmap TP")
+        await navmap_tp(client, xyz, leader_client)
+        return
+
+    logger.debug(
+        f"[a_star_tp] {client.title}: A* vertex {end_i} "
+        f"({'goal' if reached_goal else 'closest reachable'}) -> single teleport to "
+        f"{destination} ({calc_Distance(destination, target_xyz):.0f}u from target)"
+    )
+
+    if await teleport_collision_verified(client, destination, starting_xyz):
+        return
+    logger.debug(
+        f"[a_star_tp] {client.title}: destination bounced (unmodeled collider); "
+        f"falling back to navmap TP"
+    )
     await navmap_tp(client, xyz, leader_client)
+
+
+async def find_walkable_magic_points(client: Client, factor: float, limit: int = 8) -> list[XYZ]:
+    """Resolve up to ``limit`` walkable magic-grid points, **ranked nearest-first** —
+    HiveMind's "teleport onto the magic grid", with fallbacks.
+
+    Solves against the same zone collision geometry as ``collision_tp`` (so each
+    grid point clears every modeled wall/static collider), restricted to magic-grid
+    intersections. Returns a ranked shortlist so the caller can teleport to the
+    closest, confirm it stuck, and drop to the next when the game rubber-bands it
+    off an *un*modeled collider (e.g. a warp/teleporter trigger volume that carries
+    no solid-collision file but still bounces you). Empty list when the geometry
+    can't be solved (no collision data, no on-grid point fits).
+    """
+    try:
+        from src.collision import CollisionWorld, get_collision_data
+        from src.collision_math import find_safe_magic_grid_points
+        from src import entity_collision
+
+        origin = await client.body.position()
+        zone_name = await client.zone_name()
+        player_radius = await _resolve_player_radius(client, zone_name)
+        collision_data = await get_collision_data(client, zone_name)
+        world = CollisionWorld()
+        world.load(collision_data)
+
+        def _solve():
+            extra_shapes = entity_collision.build_zone_static_shapes(zone_name, origin.z)
+            return find_safe_magic_grid_points(
+                world, origin, player_radius, factor,
+                extra_shapes=extra_shapes, zone_name=zone_name, limit=limit,
+            )
+
+        grid_points, reason = await asyncio.to_thread(_solve)
+        if grid_points:
+            logger.debug(
+                f"[magic_grid] {client.title}: {len(grid_points)} grid candidate(s) ({reason}); "
+                f"nearest -> {grid_points[0]}"
+            )
+            return grid_points
+        logger.debug(f"[magic_grid] {client.title}: no on-grid solution ({reason})")
+    except Exception as e:
+        logger.debug(f"[magic_grid] {client.title}: solve errored ({e!r})")
+    return []
+
+
+async def find_walkable_magic_point(client: Client, factor: float) -> XYZ | None:
+    """Nearest walkable magic-grid point, or ``None``. Thin single-point wrapper over
+    ``find_walkable_magic_points`` (prefer the plural form so an unmodeled warp volume
+    can be skipped via verify-and-retry)."""
+    points = await find_walkable_magic_points(client, factor, limit=1)
+    return points[0] if points else None
 
 
 def calc_chunks(points: list[XYZ], entity_distance: float = 3147.0) -> list[XYZ]:

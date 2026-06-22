@@ -44,6 +44,7 @@ from src.config_combat import (
     delegate_combat_configs,
 )
 from src.deimoslang import vm
+from src.hivemind_integration import manager as hivemind_manager
 from src.drop_logger import logging_loop
 from src.entity_collision import get_world_display_name, get_zone_display_name
 from src.gui import GUIKeys
@@ -56,7 +57,7 @@ from src.sprinty_client import SprintyClient
 
 # from src.combat_new import Fighter
 from src.stat_viewer import total_stats
-from src.teleport_math import calc_Distance, collision_tp, navmap_tp
+from src.teleport_math import calc_Distance, collision_tp, navmap_tp, a_star_tp
 from src.tokenizer import tokenize
 from src.utils import (  # , assign_pet_level
     auto_potions,
@@ -526,7 +527,7 @@ async def navmap_teleport(
     async def client_navmap_teleport(client: Client, xyz: XYZ = None):
         if not xyz:
             xyz = await client.quest_position.position()
-        await collision_tp(client, xyz)
+        await a_star_tp(client, xyz)
         # except:
         # 	# skips teleport if there's no navmap, this should just switch to auto adjusting teleport
         # 	logger.error(f'{client.title} encountered an error during navmap tp, most likely the navmap for the zone did not exist. Skipping teleport.')
@@ -651,6 +652,16 @@ async def main():
     background_clients = []
     await asyncio.sleep(0)
     listener.start()
+
+    # HiveMind: wire the integration to the GUI + bot runner (no-op until enabled).
+    def _hivemind_to_gui(ct_name, data):
+        gui_send_queue.put(deimosgui.GUICommand(getattr(deimosgui.GUICommandType, ct_name), data))
+
+    async def _hivemind_run_bot(text):
+        recv_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ExecuteBot, text))
+
+    hivemind_manager.configure(_hivemind_to_gui, _hivemind_run_bot, lambda: len(walker.clients))
+    vm.peer_check_hook = hivemind_manager.check_all_peers
 
     async def x_press_hotkey():
         await mass_key_press(
@@ -2039,6 +2050,7 @@ async def main():
                             _hooking_in_progress.discard(c.window_handle)
                             logger.info(f"Client '{c.title}' disconnected.")
                         _send_hooked_clients_update()
+                        await hivemind_manager.sync_clients(walker.clients)
 
                         # Record which tasks were active, then cancel them all
                         active_tasks = set()
@@ -2253,6 +2265,7 @@ async def main():
                         await _init_client_attrs(nc)
                         logger.info(f"New client '{nc.title}' hooked.")
                     _send_hooked_clients_update()
+                    await hivemind_manager.sync_clients(walker.clients)
 
                     # Check if count restored
                     if len(walker.clients) >= previous_client_count:
@@ -3231,6 +3244,15 @@ async def main():
                                 bot_task.cancel()
                                 logger.debug("Bot Killed")
                                 bot_task = None
+                        case deimosgui.GUICommandType.HiveMindToggle:
+                            await hivemind_manager.set_enabled(bool(com.data), walker.clients)
+                        case deimosgui.GUICommandType.HiveMindSeek:
+                            hivemind_manager.start_seeking()
+                        case deimosgui.GUICommandType.OfferBot:
+                            await hivemind_manager.offer_bot(int(com.data))
+                        case deimosgui.GUICommandType.BotOfferResponse:
+                            offer_id, accepted = com.data
+                            hivemind_manager.resolve_offer(offer_id, accepted)
                         case deimosgui.GUICommandType.SearchBots:
                             if not walker.clients or not foreground_client:
                                 gui_send_queue.put(
@@ -3256,11 +3278,15 @@ async def main():
                                     )
                                     return
                                 client_count = len(walker.clients)
+                                # With HiveMind active the team spans instances, so
+                                # the local count is meaningless: don't filter by it
+                                # (None) and let every client see the same full list.
+                                search_count = None if hivemind_manager.enabled else client_count
                                 try:
                                     found_bots = await asyncio.to_thread(
                                         bot_registry.search_compatible_bots,
                                         current_zone,
-                                        client_count,
+                                        search_count,
                                     )
                                 except Exception as e:
                                     logger.error(f"Bot registry search failed: {e}")

@@ -1,6 +1,6 @@
 """Flythrough, Bot, and Combat tabs — all share the editor+import/export/execute/kill pattern."""
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QFileDialog, QPushButton
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QFileDialog, QPushButton, QCheckBox, QLabel
 from PyQt6.QtCore import Qt
 
 from src.gui.commands import GUICommand, GUICommandType
@@ -110,6 +110,28 @@ def build_bot_tab(ctx):
     editor = QTextEdit()
     ctx.widget_tags['bot_creator'] = editor
     layout.addWidget(editor, 1)
+
+    # --- HiveMind row: enable + look-for-team-up + status ---
+    # No role toggle: enabling just makes you discoverable; clicking "Looking to
+    # team up" (here) or "Offer" (in the bot search popup) is what acts.
+    hive_row = QHBoxLayout()
+    enable_cb = QCheckBox(ctx.tl('hivemind_enable'))
+    enable_cb.setToolTip(ctx.tl('hivemind_enable_tip'))
+    seek_btn = QPushButton(ctx.tl('hivemind_seek'))
+    seek_btn.setToolTip(ctx.tl('hivemind_seek_tip'))
+    hive_status = QLabel("HiveMind: off")
+    ctx.widget_tags['HiveMindStatus'] = hive_status
+
+    enable_cb.toggled.connect(
+        lambda checked: ctx.send_queue.put(GUICommand(GUICommandType.HiveMindToggle, bool(checked))))
+    seek_btn.clicked.connect(
+        lambda: ctx.send_queue.put(GUICommand(GUICommandType.HiveMindSeek)))
+
+    hive_row.addWidget(enable_cb)
+    hive_row.addWidget(seek_btn)
+    hive_row.addStretch()
+    hive_row.addWidget(hive_status)
+    layout.addLayout(hive_row)
 
     btn_row = QHBoxLayout()
 
