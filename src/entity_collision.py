@@ -648,19 +648,26 @@ class _Resolver:
         """Whether a placed object is a *movement* obstacle (a teleport must clear it).
 
         Stricter than ``is_collidable``: an object whose only collision is an interaction
-        click-box (boat/dock travel points, NPC hit-boxes) is something the bot approaches
-        to activate, not a wall — so it's *not* a movement obstacle and we let teleports
-        land right next to it. Objects with a render model, a real (non-click) collision
-        primitive, or the teleporter override stay collidable."""
+        click-box (boat/dock travel points, NPC hit-boxes, the UniverseTeleport trigger) is
+        something the bot approaches to activate, not a wall — so it's *not* a movement obstacle
+        and we let teleports land/paths run right next to it.
+
+        The collision FILE is authoritative and is checked first: a click-box-only file means
+        not-a-wall even when the object also carries a render model. This matters because some
+        triggers have a placeholder render asset (the UniverseTeleport's blank-character NIF)
+        whose ~265u render hull would otherwise be used as the footprint and seal the doorway
+        around it. Only when there's no usable collision file do we fall back to "has a render/
+        teleporter model -> its hull is the obstacle". Teleporter PADS are the exception that
+        stays solid despite a click-box/empty file — they bounce a landing — via the name override."""
         self._resolve_template(name)
         if not self._collidable_cache.get(name):
             return False
-        if self._asset_cache.get(name):
-            return True  # has a render/teleporter model -> real obstacle
         _prims, n_total, n_click = self._collision_data_for(name, zone_name)
-        if n_total > 0 and n_click >= n_total:
-            return False  # click-box-only interaction trigger, not a wall
-        return True
+        if n_total > 0 and n_click >= n_total and not _is_teleporter_name(name):
+            return False  # collision file is click-box-only -> interaction trigger, not a wall
+        if self._asset_cache.get(name):
+            return True  # render/teleporter model -> its hull is the footprint
+        return n_total > 0  # real (non-click) collision primitives present
 
     def footprint_points(self, name: str, zone_name: str | None) -> list | None:
         """Local-space 2D hull points for an entity's model, or None. Thread-only.
