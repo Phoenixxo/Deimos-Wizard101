@@ -497,6 +497,46 @@ async def _walk_remaining_to_target(client: Client, target_xyz: XYZ, world, zone
         logger.debug(f"[collision_tp] {client.title}: final walk skipped ({e!r})")
 
 
+# Zones whose collision/walkability caches are built or being built, so the background
+# pre-warm and an actual teleport don't both rebuild the same zone.
+_prewarmed_zones: set = set()
+
+
+async def prewarm_zone(client: Client, zone_name: str = None) -> None:
+    """Build the zone's collision + walkability caches in the BACKGROUND so the first teleport
+    there is instant. Idempotent per zone, best-effort — call it on client hook and on zone
+    change (during the loading screen) so the work is finished before the player teleports.
+
+    The heavy one-time costs all run here off the event loop and are memoized per zone: the
+    precise resolver init (~0.8s, only on the very first call of a session), the navmesh
+    triangle index, the static-collision shapes, and the hex grid. Afterwards a teleport in the
+    zone is just cache hits plus a few node probes (~ms)."""
+    zone = None
+    try:
+        zone = zone_name or await client.zone_name()
+        if not zone or zone in _prewarmed_zones:
+            return
+        _prewarmed_zones.add(zone)
+        from src.collision import CollisionWorld, get_collision_data
+        from src.collision_math import get_walk_grid
+        from src import entity_collision
+
+        collision_data = await get_collision_data(client, zone)
+
+        def _build():
+            world = CollisionWorld()
+            world.load(collision_data)
+            extra = entity_collision.build_zone_static_shapes(zone, None)
+            get_walk_grid(world, zone, extra, 45.0)
+
+        await asyncio.to_thread(_build)
+        logger.debug(f"[prewarm] collision caches ready for '{zone}'")
+    except Exception as e:
+        if zone:
+            _prewarmed_zones.discard(zone)  # allow a later attempt to retry
+        logger.debug(f"[prewarm] skipped ({e!r})")
+
+
 async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = None):
     """Teleport by solving the zone's collision geometry — a single, decisive teleport.
 

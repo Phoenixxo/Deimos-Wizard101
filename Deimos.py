@@ -57,7 +57,7 @@ from src.sprinty_client import SprintyClient
 
 # from src.combat_new import Fighter
 from src.stat_viewer import total_stats
-from src.teleport_math import calc_Distance, collision_tp, navmap_tp
+from src.teleport_math import calc_Distance, collision_tp, navmap_tp, prewarm_zone
 from src.tokenizer import tokenize
 from src.utils import (  # , assign_pet_level
     auto_potions,
@@ -1958,12 +1958,21 @@ async def main():
         previous_client_count = None
         # Track total wizard handle count to detect when unmanaged clients appear/disappear
         last_known_handle_count = 0
+        # Zone whose collision caches we've kicked off a background pre-warm for, so the
+        # first teleport (after hooking or a zone change) isn't stuck building them.
+        last_prewarm_zone = None
 
         while True:
             if walker.clients and foreground_client:
                 try:
                     current_zone = await foreground_client.zone_name()
                     if current_zone and not await foreground_client.is_loading():
+                        if current_zone != last_prewarm_zone:
+                            # New zone (or first hook): build its collision/walkability caches
+                            # in the background now, during the loading screen / idle time, so
+                            # the first collision teleport there is instant. Fire-and-forget.
+                            last_prewarm_zone = current_zone
+                            asyncio.create_task(prewarm_zone(foreground_client, current_zone))
                         if await foreground_client.game_client.is_freecam():
                             camera = await foreground_client.game_client.free_camera_controller()
                             current_pos = await camera.position()

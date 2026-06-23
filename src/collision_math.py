@@ -232,6 +232,7 @@ def _all_collider_solids(world: CollisionWorld):
 _walkable_tris_cache: dict[str, tuple] = {}
 _bcd_walls_cache: dict[str, object] = {}
 _collider_solids_cache: dict[str, list] = {}
+_mesh_cache: dict[str, tuple] = {}  # zone -> numpy (verts2d, surface_z, bbox)
 
 
 def _zone_collider_solids(world: CollisionWorld, zone_name: str | None):
@@ -244,20 +245,90 @@ def _zone_collider_solids(world: CollisionWorld, zone_name: str | None):
     return solids
 
 
+def _walkable_mesh(world: CollisionWorld, zone_name: str | None):
+    """The walkable navmesh as plain numpy arrays for fast point queries: ``(verts, z, bbox)``
+    where ``verts`` is ``(N, 3, 2)`` triangle XY corners, ``z`` is ``(N,)`` surface heights, and
+    ``bbox`` is ``(N, 4)`` ``[minx, miny, maxx, maxy]``. Memoized per zone.
+
+    This replaces building ~thousands of individual shapely ``Polygon`` objects (the dominant
+    per-zone setup cost). The whole mesh is transformed and assembled with vectorized numpy —
+    no per-triangle Python object — and point-in-triangle tests run vectorized in
+    ``_mesh_levels_at``. (The shapely-polygon form, ``_walkable_tris``, is kept only for
+    ``zone_bcd_walls``, which needs geometric intersection/union and is hivemind-only.)"""
+    if zone_name is not None and zone_name in _mesh_cache:
+        return _mesh_cache[zone_name]
+    chunks_v, chunks_z = [], []
+    for obj in world.objects:
+        if (obj.proxy == ProxyType.MESH and CollisionFlag.WALKABLE in obj.category_flags
+                and obj.faces and obj.vertices):
+            try:
+                V = np.asarray(obj.vertices, dtype=float)               # (Vn, 3) model space
+                M = np.asarray(toMultidim(obj.rotation), dtype=float)   # (3, 3)
+                Wv = V @ M + np.asarray(obj.location, dtype=float)      # (Vn, 3) world space
+                F = np.asarray(obj.faces, dtype=np.intp)                # (Fn, 3)
+                tv = Wv[F]                                              # (Fn, 3, 3)
+            except Exception:
+                continue
+            chunks_v.append(tv[:, :, :2])                              # (Fn, 3, 2)
+            chunks_z.append(tv[:, :, 2].mean(axis=1))                  # (Fn,)
+    if not chunks_v:
+        result = (np.empty((0, 3, 2)), np.empty((0,)), np.empty((0, 4)))
+    else:
+        verts = np.concatenate(chunks_v, axis=0)
+        z = np.concatenate(chunks_z, axis=0)
+        ax, ay = verts[:, 0, 0], verts[:, 0, 1]
+        bx, by = verts[:, 1, 0], verts[:, 1, 1]
+        cx, cy = verts[:, 2, 0], verts[:, 2, 1]
+        area2 = np.abs((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))  # drop degenerate tris
+        keep = area2 > 1e-6
+        verts, z = verts[keep], z[keep]
+        bbox = np.column_stack([verts[:, :, 0].min(1), verts[:, :, 1].min(1),
+                                verts[:, :, 0].max(1), verts[:, :, 1].max(1)])
+        result = (verts, z, bbox)
+    if zone_name is not None:
+        _mesh_cache[zone_name] = result
+    return result
+
+
+def _mesh_levels_at(x: float, y: float, mesh):
+    """Sorted distinct surface heights of the walkable navmesh at ``(x, y)``, vectorized.
+
+    Bounding-box prefilter (one numpy mask over all triangles) then a barycentric/sign
+    point-in-triangle test on the survivors. For the handful of nodes a teleport probes this
+    is microseconds; even A* over hundreds of nodes stays in single-digit ms."""
+    verts, z, bbox = mesh
+    if verts.shape[0] == 0:
+        return []
+    cand = np.nonzero((bbox[:, 0] <= x) & (x <= bbox[:, 2])
+                      & (bbox[:, 1] <= y) & (y <= bbox[:, 3]))[0]
+    if cand.size == 0:
+        return []
+    tv = verts[cand]
+    ax, ay = tv[:, 0, 0], tv[:, 0, 1]
+    bx, by = tv[:, 1, 0], tv[:, 1, 1]
+    cx, cy = tv[:, 2, 0], tv[:, 2, 1]
+    d1 = (x - bx) * (ay - by) - (ax - bx) * (y - by)
+    d2 = (x - cx) * (by - cy) - (bx - cx) * (y - cy)
+    d3 = (x - ax) * (cy - ay) - (cx - ax) * (y - ay)
+    has_neg = (d1 < 0) | (d2 < 0) | (d3 < 0)
+    has_pos = (d1 > 0) | (d2 > 0) | (d3 > 0)
+    inside = ~(has_neg & has_pos)  # all same sign (boundary inclusive) -> point in triangle
+    if not inside.any():
+        return []
+    return sorted(set(np.round(z[cand][inside], 3).tolist()))
+
+
 def _ground_z_at(world: CollisionWorld, zone_name: str | None, x: float, y: float):
     """The teleport-valid ground height of the walkable navmesh at ``(x, y)``, or None.
 
     A floating-island / ramp zone can stack several walkable surfaces at one XY. We want the
     one a teleport will actually land on: the lowest surface that is NOT inside any collider's
     vertical reach (so the body isn't dropped into a wall/cylinder). Falls back to the lowest
-    surface, then None. Cheap — one STRtree query against the cached walkable faces."""
-    tree, tris, zs = _walkable_tris(world, zone_name)
-    if tree is None:
-        return None
-    pt = Point(x, y)
-    levels = sorted({zs[i] for i in tree.query(pt) if tris[i].intersects(pt)})
+    surface, then None. Cheap — vectorized point-in-triangle against the cached numpy mesh."""
+    levels = _mesh_levels_at(x, y, _walkable_mesh(world, zone_name))
     if not levels:
         return None
+    pt = Point(x, y)
     covering = [(zlo, zhi) for fp, zlo, zhi in _zone_collider_solids(world, zone_name)
                 if fp.contains(pt)]
     for z in levels:  # lowest-first: prefer the ground level under any obstacle
@@ -350,26 +421,6 @@ _HEX_DIRS = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
 _walk_grid_cache: dict[str, object] = {}
 
 
-def _node_ground_z(pt, mesh_tree, tris, tzs, bcd_buf, bcd_tree, static_prep):
-    """Teleport-valid ground height at ``pt`` (a shapely Point), or None if not walkable.
-
-    ``bcd_buf`` are bcd collider footprints ALREADY buffered by the body clearance, paired
-    with their (zmin, zmax); ``bcd_tree`` indexes them. ``static_prep`` is a prepared union
-    of static-entity footprints (already buffered). Lowest walkable level under any obstacle
-    wins."""
-    if static_prep is not None and static_prep.contains(pt):
-        return None  # on/next to a teleporter pad, boat, etc.
-    levels = sorted({tzs[i] for i in mesh_tree.query(pt) if tris[i].intersects(pt)})
-    if not levels:
-        return None
-    covering = [bcd_buf[i] for i in bcd_tree.query(pt)] if bcd_tree is not None else []
-    covering = [(zlo, zhi) for fp, zlo, zhi in covering if fp.contains(pt)]
-    for z in levels:  # lowest first: the ground under any overhead collider
-        if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
-            return z
-    return None
-
-
 def _hex_round(qf, rf):
     """Round fractional axial coords to the nearest hex (via cube rounding)."""
     xf, zf = qf, rf
@@ -406,7 +457,7 @@ class _ZoneWalkGrid:
 
     def __init__(self, world, zone_name, extra_shapes, player_radius, spacing=GRID_SPACING):
         self.spacing = spacing
-        self.mesh_tree, self.tris, self.tzs = _walkable_tris(world, zone_name)
+        self.mesh = _walkable_mesh(world, zone_name)  # numpy (verts, z, bbox)
         self.bcd_buf = [(fp.buffer(player_radius), zlo, zhi)
                         for fp, zlo, zhi in _all_collider_solids(world)]
         self.bcd_tree = STRtree([fp for fp, _, _ in self.bcd_buf]) if self.bcd_buf else None
@@ -417,7 +468,7 @@ class _ZoneWalkGrid:
 
     @property
     def has_mesh(self):
-        return self.mesh_tree is not None
+        return self.mesh[0].shape[0] > 0
 
     def to_world(self, q, r):
         return self.spacing * (q + r / 2.0), self.spacing * (_SQRT3 / 2.0) * r
@@ -427,14 +478,30 @@ class _ZoneWalkGrid:
         q = x / self.spacing - r / 2.0
         return _hex_round(q, r)
 
+    def ground_z_at(self, x, y):
+        """Teleport-valid ground height at world ``(x, y)``, or None. On walkable navmesh,
+        not inside a bcd collider's vertical band (height-aware, lowest level under any
+        overhead collider), and clear of static entity colliders."""
+        if self.static_prep is not None and self.static_prep.contains(Point(x, y)):
+            return None  # on/next to a teleporter pad, boat, etc.
+        levels = _mesh_levels_at(x, y, self.mesh)
+        if not levels:
+            return None
+        pt = Point(x, y)
+        covering = [self.bcd_buf[i] for i in self.bcd_tree.query(pt)] if self.bcd_tree is not None else []
+        covering = [(zlo, zhi) for fp, zlo, zhi in covering if fp.contains(pt)]
+        for z in levels:  # lowest first: the ground under any overhead collider
+            if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
+                return z
+        return None
+
     def node_z(self, q, r):
         """Ground z at node ``(q, r)`` if walkable, else None. Evaluated once, memoized."""
         v = self._cache.get((q, r), 0)  # 0 sentinel = unevaluated (z can be 0.0)
         if v != 0:
             return v if v is not None else None
         x, y = self.to_world(q, r)
-        z = _node_ground_z(Point(x, y), self.mesh_tree, self.tris, self.tzs,
-                           self.bcd_buf, self.bcd_tree, self.static_prep)
+        z = self.ground_z_at(x, y)
         self._cache[(q, r)] = z
         return z
 
@@ -470,11 +537,10 @@ class _ZoneWalkGrid:
         if v != 0:
             return v if v is not None else None
         x, y = self.to_world(q, r)
-        pt = Point(x, y)
-        if self.static_prep is not None and self.static_prep.contains(pt):
+        if self.static_prep is not None and self.static_prep.contains(Point(x, y)):
             z = None
         else:
-            levels = sorted({self.tzs[i] for i in self.mesh_tree.query(pt) if self.tris[i].intersects(pt)})
+            levels = _mesh_levels_at(x, y, self.mesh)
             z = levels[0] if levels else None
         self._walk_cache[(q, r)] = z
         return z
@@ -565,8 +631,7 @@ def find_walkable_teleport_point(world: CollisionWorld, zone_name: str | None, t
     if not grid.has_mesh:
         return None, "no_mesh"
 
-    tz = _node_ground_z(Point(target.x, target.y), grid.mesh_tree, grid.tris, grid.tzs,
-                        grid.bcd_buf, grid.bcd_tree, grid.static_prep)
+    tz = grid.ground_z_at(target.x, target.y)
     if tz is not None:
         return XYZ(target.x, target.y, tz), "target_clear"
 

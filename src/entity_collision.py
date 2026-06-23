@@ -7,7 +7,7 @@ from pathlib import Path
 from xml.etree import ElementTree as etree
 
 from loguru import logger
-from shapely.affinity import rotate, scale, translate
+from shapely.affinity import affine_transform, rotate, scale, translate
 from shapely.geometry import MultiPoint, Point, Polygon
 from shapely.ops import unary_union
 from wizwalker.utils import get_wiz_install
@@ -136,27 +136,32 @@ def _parse_collision_xml(data: bytes) -> tuple[list | None, int, int]:
     return list(hull.exterior.coords), n_total, n_click
 
 
-def _collision_primitives(data: bytes) -> list:
-    """Parse a collision file into ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry
-    PER primitive, NOT a single convex hull.
+def _collision_primitives(data: bytes) -> tuple:
+    """Parse a collision file ONCE into ``(prims, n_total, n_click)`` where ``prims`` is
+    ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry PER non-click primitive, NOT a
+    single convex hull.
 
     This is the authoritative collision geometry (``m_solidCollisionFilename``). Keeping each
     box/cylinder/sphere separate is the whole point: a forest's collision is 30-odd trunk
     cylinders scattered across the zone, and a barrier's is one small box — convex-hulling them
     (as the render-mesh path does) collapses them into a zone-spanning blob that walls off the
-    floor. Click-boxes (interaction triggers) are skipped. Each entry carries the primitive's
-    world-vertical extent so height-aware code can use it. Local model units."""
+    floor. Click-boxes (interaction triggers) are counted but excluded from ``prims``, so the
+    same single parse answers both "what blocks?" and "is this click-box-only?" (no second pass).
+    Each entry carries the primitive's world-vertical extent for height-aware code. Local units."""
     try:
         from .collision_math import transformCube, toCubeVertices
     except Exception:
-        return []
+        return [], 0, 0
     try:
         root = etree.fromstring(data)
     except Exception:
-        return []
+        return [], 0, 0
     out = []
+    n_total = n_click = 0
     for prim in root.findall("primitive"):
+        n_total += 1
         if "click" in (prim.get("name") or "").lower():
+            n_click += 1
             continue
         ptype = (prim.get("type") or "").lower()
         loc_el = prim.find("location")
@@ -180,13 +185,13 @@ def _collision_primitives(data: bytes) -> list:
                 zmin, zmax = lz - d / 2, lz + d / 2
             elif ptype == "sphere":
                 r = float(prim.find("radius").get("value"))
-                poly = Point(lx, ly).buffer(r)
+                poly = Point(lx, ly).buffer(r, quad_segs=4)  # 16-gon: ample for a collider
                 zmin, zmax = lz - r, lz + r
             elif ptype in ("cylinder", "tube"):
                 el = prim.find(ptype)
                 r = float(el.get("radius"))
                 hl = float(el.get("length", 0)) / 2
-                poly = Point(lx, ly).buffer(r)
+                poly = Point(lx, ly).buffer(r, quad_segs=4)
                 zmin, zmax = lz - hl, lz + hl
             else:
                 continue  # plane/ray/mesh
@@ -194,7 +199,7 @@ def _collision_primitives(data: bytes) -> list:
             continue
         if poly is not None and poly.is_valid and not poly.is_empty:
             out.append((poly, zmin, zmax))
-    return out
+    return out, n_total, n_click
 
 
 def _is_teleporter_name(name: str) -> bool:
@@ -354,10 +359,11 @@ class _Resolver:
         self._template_paths: dict[str, str] = {}  # entity name -> ObjectData path
         self._asset_cache: dict[str, str | None] = {}  # entity name -> nif asset
         self._collidable_cache: dict[str, bool] = {}  # entity name -> is solid obstacle
-        self._hull_cache: dict[str, list | None] = {}  # asset -> local hull points
-        self._coll_points_cache: dict[str, list | None] = {}  # entity name -> collision-file hull
-        self._coll_prims_cache: dict[str, list] = {}  # entity name -> per-primitive collision geometry
-        self._coll_file_cache: dict[str, list | None] = {}  # collision filename -> hull points
+        self._hull_cache: dict[str, list | None] = {}  # asset -> local render-mesh hull points
+        # Collision-file dedupe: one filename deserialize, one file read, one parse per object.
+        self._solid_fn_cache: dict[str, str | None] = {}  # entity name -> m_solidCollisionFilename
+        self._coll_bytes_cache: dict[str, bytes | None] = {}  # filename -> raw collision-file bytes
+        self._coll_data_cache: dict[str, tuple] = {}  # entity name -> (prims, n_total, n_click)
         self._wads: dict[str, object] = {}
         self._id2name: dict[int, str] | None = None  # templateID -> template basename
         self._zone_static_cache: dict[str, list] = {}  # zone -> [(z, footprint), ...]
@@ -600,55 +606,43 @@ class _Resolver:
             self._cache_dirty = True
         return self._hull_cache[asset]
 
-    def _collision_file_parsed(self, filename: str, zone_name: str | None) -> tuple:
-        """``(points, n_total, n_click)`` for a ``m_solidCollisionFilename`` file, cached."""
-        if filename not in self._coll_file_cache:
-            result = (None, 0, 0)
-            data = self._read_nif(filename, zone_name)  # pipe-path reader works for any asset
-            if data:
-                result = _parse_collision_xml(data)
-            self._coll_file_cache[filename] = result
-        return self._coll_file_cache[filename]
-
-    def _collision_info_for(self, name: str, zone_name: str | None) -> tuple:
-        """``(points, n_total, n_click)`` from the object's solid-collision file, cached
-        per entity name. Deserializes the template on demand (only reached for the
-        uncommon render-asset-less objects), so it's robust to a stale on-disk footprint
-        cache that doesn't store the collision filename."""
-        if name not in self._coll_points_cache:
-            info = (None, 0, 0)
+    def _solid_collision_filename_for(self, name: str) -> str | None:
+        """The object's ``m_solidCollisionFilename``, deserializing the template once and caching.
+        Shared by every collision-file consumer so the template isn't re-deserialized per use."""
+        if name not in self._solid_fn_cache:
+            fn = None
             path = self._template_paths.get(name)
             if path:
                 try:
                     template = self._root.deserialize(path, self._serializer)
                     fn = _solid_collision_filename(template)
-                    if fn:
-                        info = self._collision_file_parsed(fn, zone_name)
                 except Exception:
-                    info = (None, 0, 0)
-            self._coll_points_cache[name] = info
-        return self._coll_points_cache[name]
+                    fn = None
+            self._solid_fn_cache[name] = fn
+        return self._solid_fn_cache[name]
+
+    def _collision_data_for(self, name: str, zone_name: str | None) -> tuple:
+        """``(prims, n_total, n_click)`` for an object — ONE deserialize (filename), ONE file
+        read, ONE parse, cached per entity name. The single source for every collision-file
+        consumer (movement_collidable, the static-placement primitives, the footprint fallback),
+        which previously each re-deserialized + re-read + re-parsed the same file."""
+        if name not in self._coll_data_cache:
+            data_tuple = ([], 0, 0)
+            fn = self._solid_collision_filename_for(name)
+            if fn:
+                if fn not in self._coll_bytes_cache:
+                    self._coll_bytes_cache[fn] = self._read_nif(fn, zone_name)
+                raw = self._coll_bytes_cache[fn]
+                if raw:
+                    data_tuple = _collision_primitives(raw)
+            self._coll_data_cache[name] = data_tuple
+        return self._coll_data_cache[name]
 
     def collision_primitives_for(self, name: str, zone_name: str | None) -> list:
         """The object's authoritative collision geometry as ``[(local_2d_polygon, zmin, zmax), …]``
-        — one entry per primitive, kept separate (see ``_collision_primitives``). Empty if the
-        object has no collision file or it isn't parseable (MESH collision, read error), in which
-        case the caller falls back to the render-mesh hull. Cached per entity name."""
-        if name not in self._coll_prims_cache:
-            prims = []
-            path = self._template_paths.get(name)
-            if path:
-                try:
-                    template = self._root.deserialize(path, self._serializer)
-                    fn = _solid_collision_filename(template)
-                    if fn:
-                        data = self._read_nif(fn, zone_name)
-                        if data:
-                            prims = _collision_primitives(data)
-                except Exception:
-                    prims = []
-            self._coll_prims_cache[name] = prims
-        return self._coll_prims_cache[name]
+        — one entry per primitive. Empty if no collision file / unparseable (MESH, read error),
+        in which case the caller falls back to the render-mesh hull."""
+        return self._collision_data_for(name, zone_name)[0]
 
     def movement_collidable(self, name: str, zone_name: str | None) -> bool:
         """Whether a placed object is a *movement* obstacle (a teleport must clear it).
@@ -663,7 +657,7 @@ class _Resolver:
             return False
         if self._asset_cache.get(name):
             return True  # has a render/teleporter model -> real obstacle
-        _pts, n_total, n_click = self._collision_info_for(name, zone_name)
+        _prims, n_total, n_click = self._collision_data_for(name, zone_name)
         if n_total > 0 and n_click >= n_total:
             return False  # click-box-only interaction trigger, not a wall
         return True
@@ -671,10 +665,10 @@ class _Resolver:
     def footprint_points(self, name: str, zone_name: str | None) -> list | None:
         """Local-space 2D hull points for an entity's model, or None. Thread-only.
 
-        Prefers the render-NIF hull; when an object has no render asset (boats, dock
-        pads, doors that reference only a separate collision file) it falls back to the
-        movement geometry in its ``m_solidCollisionFilename`` — the real, often much
-        smaller collider — instead of letting the caller drop to an oversized default disc."""
+        Prefers the render-NIF hull; when an object has no render asset (boats, dock pads,
+        doors that reference only a separate collision file) it falls back to the convex hull of
+        that object's collision-file primitives — the real, often much smaller collider —
+        instead of an oversized default disc."""
         if not self._initialize():
             return None
         with self._lock:
@@ -683,7 +677,12 @@ class _Resolver:
                 hull = self._hull_for(asset, zone_name)
                 if hull:
                     return hull
-            return self._collision_info_for(name, zone_name)[0]
+            prims = self._collision_data_for(name, zone_name)[0]
+            if prims:
+                hull = unary_union([p for p, _, _ in prims]).convex_hull
+                if hull.geom_type == "Polygon" and not hull.is_empty:
+                    return list(hull.exterior.coords)
+            return None
 
     def collider_radius(self, template_id: int, zone_name: str | None) -> float | None:
         """Horizontal collider radius of an object's model footprint, or None.
@@ -783,11 +782,14 @@ class _Resolver:
                     if not name or not self.movement_collidable(name, zone_name):
                         continue
 
-                    def _place_local(local_poly, base_z):
-                        # local model footprint -> scale -> rotate by yaw -> world position
-                        p = scale(local_poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0))
-                        p = rotate(p, ori.z, origin=(0, 0), use_radians=True)
-                        p = translate(p, xoff=loc.x, yoff=loc.y)
+                    # Fold scale -> rotate(yaw) -> translate into ONE affine matrix
+                    # [a, b, d, e, xoff, yoff] applied per primitive (1 GEOS call instead of 3).
+                    _c, _s = math.cos(ori.z), math.sin(ori.z)
+                    _mat = (obj_scale * _c, -obj_scale * _s,
+                            obj_scale * _s, obj_scale * _c, loc.x, loc.y)
+
+                    def _place_local(local_poly, base_z, _m=_mat):
+                        p = affine_transform(local_poly, _m)
                         if p.is_valid and not p.is_empty:
                             placed.append((base_z, p))
 
