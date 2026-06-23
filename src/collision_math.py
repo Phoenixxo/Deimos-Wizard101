@@ -241,15 +241,28 @@ def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygo
     return boxes + rounds
 
 
+# bcd collision flags that do NOT obstruct player movement (mirror of entity_collision's
+# `_NON_MOVEMENT_CATEGORIES` for the baked-in zone geometry). The compiled collision.bcd carries
+# the same client-object/trigger/etc. volumes as the entity collision files — e.g. Darkmoor's
+# AscensionChapel bcd has 4 CLIENT_OBJECT boxes/cylinders — and a teleport may land where they
+# overlap. Real walls are flagged OBJECT (or unflagged); WALKABLE is the navmesh itself.
+_NON_MOVEMENT_FLAGS = (CollisionFlag.CLIENT_OBJECT | CollisionFlag.TRIGGER
+                       | CollisionFlag.HITSCAN | CollisionFlag.FOG)
+
+
 def _all_collider_solids(world: CollisionWorld):
-    """``[(footprint_polygon, z_min, z_max, is_box), ...]`` for every bcd box/cylinder/sphere,
-    with its full vertical extent and NOT z-filtered. ``is_box`` distinguishes structural BOX
-    colliders (pads/walls/buildings — always solid where the navmesh enters them) from
-    CYLINDER/SPHERE volumes (which may be coarse terrain the navmesh sits inside); see
-    ``_collider_blocks_foot``. Used by the height-aware wall builder + the teleport grid."""
+    """``[(footprint_polygon, z_min, z_max, is_box), ...]`` for every movement-blocking bcd
+    box/cylinder/sphere, with its full vertical extent and NOT z-filtered. ``is_box`` distinguishes
+    structural BOX colliders (pads/walls/buildings — always solid where the navmesh enters them)
+    from CYLINDER/SPHERE volumes (which may be coarse terrain the navmesh sits inside); see
+    ``_collider_blocks_foot``. Non-movement categories (``_NON_MOVEMENT_FLAGS``) are skipped — they
+    don't block the player. Used by the height-aware wall builder + the teleport grid."""
     solids = []
     for obj in world.objects:
         try:
+            fl = obj.category_flags
+            if (fl & _NON_MOVEMENT_FLAGS) and CollisionFlag.OBJECT not in fl:
+                continue  # client-object / trigger / hitscan / fog volume -> not a movement wall
             scale_val = obj.scale if isinstance(obj.scale, (float, int)) else obj.scale[0]
             is_box = False
             if obj.proxy == ProxyType.BOX:
