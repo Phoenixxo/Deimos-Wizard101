@@ -181,19 +181,43 @@ class ResolutionForcer:
                 pass
 
 
-# --- WM_NCHITTEST border hook (makes the game window drag-resizable in-process) ---
-# The game's WndProc returns HTCLIENT even on a WS_THICKFRAME border, so the window
-# isn't grab-resizable from out-of-process. This hooks the WndProc and, for
-# WM_NCHITTEST inside the client area near an edge, returns the matching resize
-# hit-code (HTLEFT/HTRIGHT/.../corners). It reads the window's screen rect + grab
-# margin from a control block the host updates each tick (so no GetWindowRect call
-# in the codecave). Everything else passes through unchanged.
+# --- WndProc border hook (in-process drag-resize + frameless borderless) ---
+# Hooks the game's WndProc to intercept two messages; everything else passes
+# through unchanged. It reads a control block the host updates each tick (so no
+# GetWindowRect/style queries in the codecave):
+#   CTRL -> {left, top, right, bottom, margin, frameless} as 6x int32
+#
+# * WM_NCHITTEST (0x84): the game returns HTCLIENT even on a WS_THICKFRAME border,
+#   so the window isn't grab-resizable out-of-process. For a cursor inside the
+#   window near an edge (within `margin`) we return the matching resize hit-code
+#   (HTLEFT/HTRIGHT/.../corners) so DefWindowProc enters its sizing loop.
+#
+# * WM_NCCALCSIZE (0x83): when `frameless` is set we return 0 with the proposed
+#   window rect left untouched, so the client area fills the ENTIRE window — the
+#   title bar and the WS_THICKFRAME sizing border become invisible. Combined with
+#   the hit-test above (and WS_THICKFRAME kept for SC_SIZE), this makes a window
+#   simultaneously borderless AND drag-resizable. When `frameless` is 0 the
+#   message passes through so normally-framed windows keep their frame.
 
-# Codecave assembly. CTRL -> {left,top,right,bottom,margin} as 5x int32.
+# Codecave assembly. CTRL -> {left,top,right,bottom,margin,frameless} as 6x int32.
 _NCHIT_ASM = """
     push  rbx
+    cmp   edx, 0x83
+    je    nccalc
     cmp   edx, 0x84
-    jne   done_pop
+    je    nchit
+    jmp   done_pop
+nccalc:
+    test  r8d, r8d
+    je    done_pop
+    mov   r11, 0x{ctrl:x}
+    mov   eax, [r11+20]
+    test  eax, eax
+    je    done_pop
+    xor   eax, eax
+    pop   rbx
+    ret
+nchit:
     movsx eax, r9w
     mov   r10d, r9d
     sar   r10d, 16
@@ -267,7 +291,8 @@ def _assemble(asm: str) -> bytes:
 
 
 class WndProcNCHitHook(SimpleHook):
-    """Return resize hit-codes near the window edges so the window is drag-resizable."""
+    """Resize hit-codes near the window edges + optional frameless WM_NCCALCSIZE,
+    so a window can be drag-resizable and (when frameless is set) borderless."""
 
     # sub rsp,0x38 ; mov r10,rcx ; mov rcx,[rip+disp(wildcard)] ; test rcx,rcx ; je ;
     # mov rax,[rcx] ; mov [rsp+20],r9 ; mov r9,rax
@@ -279,11 +304,11 @@ class WndProcNCHitHook(SimpleHook):
         rb"\x48\x85\xC9\x74\x1C\x48\x8B\x01\x4C\x89\x4C.\x20\x4D\x8B\xC8"
     )
     instruction_length = 7  # sub rsp,0x38 ; mov r10,rcx
-    exports = [("hit_rect", 20)]  # int32 left, top, right, bottom, margin
+    exports = [("hit_rect", 24)]  # int32 left, top, right, bottom, margin, frameless
 
     async def get_hook_address(self, size: int) -> int:
-        # The default 50 bytes isn't enough for this codecave (~210 bytes).
-        return await self.alloc(256)
+        # The default 50 bytes isn't enough: body ~244 bytes + original (7) + jmp (5).
+        return await self.alloc(320)
 
     async def get_hook_bytecode(self) -> bytes:
         # Allocate the export (sets self.hit_rect), assemble using its address, then
@@ -300,11 +325,12 @@ class WndProcNCHitHook(SimpleHook):
         return bytecode
 
     async def prehook(self):
-        # Initialise the rect to a no-edge sentinel before the jump goes live, so the
-        # first messages never hit a stale/zeroed rect (which would resize-grab).
+        # Initialise to a no-edge sentinel (and frameless=0) before the jump goes
+        # live, so the first messages never hit a stale/zeroed rect (which would
+        # resize-grab) nor a stray frameless flag (which would drop the frame).
         await self.hook_handler.write_bytes(
-            self.hit_rect, struct.pack("<iiiii", -2_000_000_000, -2_000_000_000,
-                                       2_000_000_000, 2_000_000_000, 0)
+            self.hit_rect, struct.pack("<iiiiii", -2_000_000_000, -2_000_000_000,
+                                       2_000_000_000, 2_000_000_000, 0, 0)
         )
 
     async def unhook(self):
@@ -314,8 +340,9 @@ class WndProcNCHitHook(SimpleHook):
 
 
 class WindowResizeBorder:
-    """Installs the WndProc hit-test hook and keeps the window rect updated so the
-    game window is drag-resizable. Call update_rect(screen_rect, margin) each tick."""
+    """Installs the WndProc hook and keeps the window rect + frameless flag updated
+    so the game window is drag-resizable (and borderless when frameless is set).
+    Call update_rect(screen_rect, margin, frameless) each tick."""
 
     def __init__(self, client):
         self.client = client
@@ -341,9 +368,11 @@ class WindowResizeBorder:
                 pass
             self._hook = None
 
-    async def update_rect(self, left: int, top: int, right: int, bottom: int, margin: int = 14):
+    async def update_rect(self, left: int, top: int, right: int, bottom: int,
+                          margin: int = 14, frameless: bool = False):
         if self._hook is None:
             return
         await self.hook_handler.write_bytes(
-            self._hook.hit_rect, struct.pack("<iiiii", left, top, right, bottom, margin)
+            self._hook.hit_rect,
+            struct.pack("<iiiiii", left, top, right, bottom, margin, 1 if frameless else 0)
         )

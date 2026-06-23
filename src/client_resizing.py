@@ -67,10 +67,16 @@ WS_BORDER = 0x00800000
 WS_DLGFRAME = 0x00400000
 WS_MINIMIZEBOX = 0x00020000
 # Decorations stripped for borderless mode: the title bar / caption only.
-# WS_THICKFRAME is deliberately KEPT — the OS only honours the WndProc hit-test
-# resize codes on a sizable (WS_THICKFRAME) window, so stripping it would make a
-# borderless window impossible to drag-resize. Borderless = no title bar.
+# WS_THICKFRAME is deliberately KEPT: DefWindowProc only enables resizing (SC_SIZE)
+# on a sizable window, so it is what lets the WndProc hit-test hook drag-resize the
+# window. The thick sizing border it would normally draw is made INVISIBLE by the
+# WndProc's WM_NCCALCSIZE handler (frameless flag) — so the window ends up both
+# borderless (no title bar, no visible frame) and drag-resizable. If the WndProc
+# hook is unavailable, the manager strips WS_THICKFRAME too so the window is still
+# visually borderless (just not resizable) — see _SIZING_FRAME / ClientResizingManager.
 _BORDERLESS_STRIP = WS_CAPTION | WS_BORDER | WS_DLGFRAME | WS_MINIMIZEBOX
+# The sizing-frame bits the manager removes for the unresizable fallback above.
+_SIZING_FRAME = WS_THICKFRAME | WS_MAXIMIZEBOX
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
@@ -92,24 +98,36 @@ def _style(hwnd: int, idx: int) -> int:
     return int(user32.GetWindowLongPtrW(hwnd, idx)) & 0xFFFFFFFF
 
 
-def set_client_size(hwnd: int, w: int, h: int):
-    """Resize so the window's CLIENT area is exactly w x h (keeps position)."""
+def _outer_size(hwnd: int, w: int, h: int, borderless: bool):
+    """Window (outer) size that yields a w x h CLIENT area for this window's style.
+
+    A frameless borderless window has its non-client area zeroed by the WndProc
+    WM_NCCALCSIZE handler, so client == window: use w x h directly. AdjustWindowRectEx
+    doesn't know about that override and would wrongly add the WS_THICKFRAME inset.
+    """
+    if borderless:
+        return w, h
     style = _style(hwnd, GWL_STYLE)
     ex = _style(hwnd, GWL_EXSTYLE)
     r = wintypes.RECT(0, 0, w, h)
     user32.AdjustWindowRectEx(ctypes.byref(r), style, False, ex)
-    user32.SetWindowPos(hwnd, 0, 0, 0, r.right - r.left, r.bottom - r.top,
+    return r.right - r.left, r.bottom - r.top
+
+
+def set_client_size(hwnd: int, w: int, h: int, borderless: bool = False):
+    """Resize so the window's CLIENT area is exactly w x h (keeps position)."""
+    ow, oh = _outer_size(hwnd, w, h, borderless)
+    user32.SetWindowPos(hwnd, 0, 0, 0, ow, oh,
                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
 
 
-def set_window_placement(hwnd: int, x: int, y: int, w: int, h: int):
+def set_window_placement(hwnd: int, x: int, y: int, w: int, h: int, borderless: bool = False):
     """Move the window to (x, y) and make its CLIENT area exactly w x h."""
-    style = _style(hwnd, GWL_STYLE)
-    ex = _style(hwnd, GWL_EXSTYLE)
-    r = wintypes.RECT(0, 0, w, h)
-    user32.AdjustWindowRectEx(ctypes.byref(r), style, False, ex)
-    user32.SetWindowPos(hwnd, 0, int(x), int(y), r.right - r.left, r.bottom - r.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE)
+    ow, oh = _outer_size(hwnd, w, h, borderless)
+    # SWP_FRAMECHANGED for borderless: re-trigger WM_NCCALCSIZE so the hook's frameless
+    # return (client == window) takes effect — the frame isn't dropped until a reflow.
+    flags = SWP_NOZORDER | SWP_NOACTIVATE | (SWP_FRAMECHANGED if borderless else 0)
+    user32.SetWindowPos(hwnd, 0, int(x), int(y), ow, oh, flags)
 
 
 # NOTE: applying a per-account window config at launch is a METHOD on
@@ -139,9 +157,14 @@ def is_armed(hwnd: int) -> bool:
 def set_borderless(hwnd: int, on: bool) -> bool:
     """Strip (or restore) the window's title bar / caption.
 
-    Keeps WS_THICKFRAME so the window stays sizable (arm_window still runs and the
-    WndProc hit-test hook makes the client edges grabbable). Strips only the caption,
-    so a borderless window is title-bar-less but still drag-resizable.
+    Self-healing and idempotent: safe to call every tick. When `on`, it re-strips
+    the caption only if it has reappeared (e.g. the client restyles its window on a
+    state transition / device init), so a borderless window stays caption-less
+    without flickering on every call. The original style is remembered the first
+    time so it can be restored when `on` is False.
+
+    WS_THICKFRAME is left untouched here (kept for drag-resize); the manager arms it
+    and the WndProc WM_NCCALCSIZE handler hides the frame — see _BORDERLESS_STRIP.
     """
     if not hwnd or not user32.IsWindow(hwnd):
         return False
@@ -150,7 +173,10 @@ def set_borderless(hwnd: int, on: bool) -> bool:
             style = _style(hwnd, GWL_STYLE)
             if hwnd not in _borderless:
                 _borderless[hwnd] = style & 0xFFFFFFFF
-            user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~_BORDERLESS_STRIP)
+            desired = style & ~_BORDERLESS_STRIP
+            if desired == style:
+                return True            # already frameless — no SetWindowPos (no flicker)
+            user32.SetWindowLongPtrW(hwnd, GWL_STYLE, desired)
         else:
             orig = _borderless.pop(hwnd, None)
             if orig is None:
@@ -205,6 +231,46 @@ def disarm_window(hwnd: int):
                                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
     except Exception as e:
         logger.opt(exception=e).debug(f"[client_resizing] disarm error {hwnd:#x}")
+
+
+def strip_sizing_frame(hwnd: int):
+    """Remove the WS_THICKFRAME sizing border (and its maximize box).
+
+    Fallback for borderless windows when the WndProc WM_NCCALCSIZE hook (which would
+    otherwise hide the frame while keeping it resizable) is unavailable — without the
+    frame hidden, the only way to stay visually borderless is to drop the frame, at
+    the cost of drag-resize. Idempotent; no SetWindowPos unless something changes.
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    style = _style(hwnd, GWL_STYLE)
+    if not (style & _SIZING_FRAME):
+        return
+    try:
+        user32.SetWindowLongPtrW(hwnd, GWL_STYLE, style & ~_SIZING_FRAME)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    except Exception as e:
+        logger.opt(exception=e).debug(f"[client_resizing] strip_sizing_frame error {hwnd:#x}")
+
+
+def reflow_frame_if_framed(hwnd: int):
+    """If a borderless window still shows a frame (client != window), trigger one
+    SWP_FRAMECHANGED so the WndProc WM_NCCALCSIZE hook drops it.
+
+    Needed because the frame isn't recomputed until a frame-changed reflow, and the
+    hook's frameless flag may go live (hook install / client restyle) after the last
+    one. Fires only while a frame is present, so it stops once frameless (no flicker).
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    cs = _client_size(hwnd)
+    r = wintypes.RECT()
+    if not cs or not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return
+    if cs != (r.right - r.left, r.bottom - r.top):     # frame still present
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
 
 
 def _sane_frustum(l: float, r: float, t: float, b: float) -> bool:
@@ -382,10 +448,20 @@ class ClientResizingManager:
             if not hwnd or not user32.IsWindow(hwnd):
                 continue
             live.add(hwnd)
-            arm_window(hwnd)
             await self._ensure_forcer(client, hwnd)
             await self._ensure_border(client, hwnd)
-            await self._update_border(hwnd)
+            if hwnd in _borderless:
+                set_borderless(hwnd, True)     # self-heal: re-strip caption if the client restyled
+                if self._borders.get(hwnd) is not None:
+                    arm_window(hwnd)           # WS_THICKFRAME; the NCCALCSIZE hook hides the frame
+                    await self._update_border(hwnd)   # push the frameless flag before the reflow
+                    reflow_frame_if_framed(hwnd)      # drop the (now-hidden) frame if still shown
+                else:
+                    strip_sizing_frame(hwnd)   # no hook to hide a frame -> stay frameless (unresizable)
+                    await self._update_border(hwnd)
+            else:
+                arm_window(hwnd)
+                await self._update_border(hwnd)
             await self._handle_resize(client, hwnd)
             # Re-assert the aspect fix on every controller each tick so switching
             # cameras (free / combat) reflects it within a tick, even with no resize.
@@ -428,9 +504,9 @@ class ClientResizingManager:
         the client is launched-but-not-yet-hooked."""
         if not hwnd or not user32.IsWindow(hwnd):
             return False
-        # Set the frame style first so the client-area sizing below accounts for it.
-        set_borderless(hwnd, bool(borderless))
-        arm_window(hwnd)                       # sizing border so the window is resizable
+        borderless = bool(borderless)
+        # Strip the caption first so the client-area sizing below accounts for it.
+        set_borderless(hwnd, borderless)
         await self._ensure_forcer(client, hwnd)
         forcer = self._forcers.get(hwnd)
         if forcer is not None:
@@ -443,12 +519,19 @@ class ClientResizingManager:
                 await asyncio.sleep(0.4)        # let the engine run its apply
             except Exception as e:
                 logger.opt(exception=e).debug(f"[client_resizing] launch force failed {hwnd:#x}")
-        await self._ensure_border(client, hwnd)    # in-process drag-resize hit-test hook
+        await self._ensure_border(client, hwnd)    # in-process WndProc hook (resize + frameless)
+        # Sizing border so the window is drag-resizable. A borderless window keeps it
+        # only when the WndProc hook is present to hide the frame (WM_NCCALCSIZE);
+        # otherwise drop it so the window is at least visually borderless.
+        if not borderless or self._borders.get(hwnd) is not None:
+            arm_window(hwnd)
+        elif borderless:
+            strip_sizing_frame(hwnd)
+        await self._update_border(hwnd)            # push rect + frameless flag before placing
         try:
-            set_window_placement(hwnd, x, y, w, h)
+            set_window_placement(hwnd, x, y, w, h, borderless=borderless)
         except Exception:
             pass
-        await self._update_border(hwnd)
         self._keep_alive.add(hwnd)             # protect these hooks until the window closes
         return True
 
@@ -477,7 +560,8 @@ class ClientResizingManager:
         r = wintypes.RECT()
         if user32.GetWindowRect(hwnd, ctypes.byref(r)):
             try:
-                await border.update_rect(r.left, r.top, r.right, r.bottom, RESIZE_MARGIN)
+                await border.update_rect(r.left, r.top, r.right, r.bottom, RESIZE_MARGIN,
+                                         frameless=hwnd in _borderless)
             except Exception:
                 pass
 
@@ -514,7 +598,7 @@ class ClientResizingManager:
             # the dragged size so window-client == backbuffer (crisp + clicks correct).
             await asyncio.sleep(0.25)
             try:
-                set_client_size(hwnd, w, h)
+                set_client_size(hwnd, w, h, borderless=hwnd in _borderless)
             except Exception:
                 pass
             await correct_aspect(client, hwnd)

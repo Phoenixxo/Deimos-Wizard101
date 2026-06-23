@@ -128,6 +128,55 @@ def filter_valid_polygons(shapes) -> List[Polygon]:
 Z_BAND_UP = 50.0
 Z_BAND_DOWN = 8.0
 
+# When a collider's base is at or *below* the feet, the feet are inside the volume. That
+# alone can't mean "blocked": every solid in collision.bcd is flagged identically
+# (`CT_Object`), and coarse *terrain* volumes — e.g. GH HFjord's rocky floor or Ravenwood's
+# ground, modelled as r~500 OBJECT cylinders the walkable navmesh sits *inside* — carry the
+# same flag as real walls. Blocking on flag/size is impossible; the only separator is how far
+# the solid rises ABOVE the feet, i.e. whether the player's body capsule fits. This is a
+# physical height check, but the player ("PlayerObject", tid 1) has NO collision file, so the
+# capsule height isn't readable from game data — it's a calibrated constant bounded by in-game
+# behaviour:
+#   walkable (terrain you stand inside): GH dock +22/+34u, Ravenwood ground +55u
+#   blocks (real wall/chamber/trunk):    WC Drains chamber +94u, Celestia +288u, Bartleby +250u,
+#                                        Drains building box +730u
+# The navmesh only ever sits inside a collider for these big terrain/building volumes (a normal
+# wall has navmesh *beside* it, caught by the horizontal footprint), so the gap between terrain
+# (<=55u) and structures (>=94u) is wide and stable. 75u sits between: it frees GH + Ravenwood
+# while every genuine wall still blocks (Celestia 208u/z=-350, GH 87u, AZ 223u unchanged; Drains
+# lands 340u out, still well outside its building box — vs the old, more conservative 510u).
+#
+# BUT rise alone can't separate every case: Khrysalis KR_Z00_Hub's flat UniverseTeleport pad is a
+# BOX rising only +52u above the floor (navmesh at the box's base) that genuinely bounces, while
+# Ravenwood's walkable terrain CYLINDER rises +55u — nearly identical rise, opposite verdict. The
+# tie-breaker is the proxy shape: across every zone examined the must-NOT-block volumes are
+# CYLINDERS/SPHERES (coarse terrain the navmesh threads through) and BOXES are always structural
+# (pads/walls/buildings). So a BOX the navmesh is *embedded* in walls off at a much smaller rise
+# (`Z_BOX_TOL`) — only a box the navmesh sits on *top* of, rise ~0, is walkable.
+Z_EMBED_TOL = 75.0   # cylinder/sphere: terrain rises <=55u, structures >=94u
+Z_BOX_TOL = 20.0     # box: structural even when shallow (Khrysalis pad +52u); only rise~0 (a
+                     # platform the navmesh sits on top of) is walkable
+
+
+def _collider_blocks_foot(z: float, zlo: float, zhi: float, is_box: bool = False) -> bool:
+    """Whether a bcd collider with vertical extent ``[zlo, zhi]`` walls off a foot level ``z``.
+
+    Two regimes:
+    - base *above* the feet (overhead): blocks only when it hangs within ``Z_BAND_UP`` of the
+      feet — a ceiling too low to stand under — and is ignored once it clears the head
+      (domes/arches/upper floors, bases 75-270u up).
+    - base *at or below* the feet (embedded): blocks when the solid rises far enough above the
+      feet that the body can't fit. The threshold is shape-dependent — ``Z_BOX_TOL`` for a
+      structural BOX (a low flat pad still bounces), ``Z_EMBED_TOL`` for a CYLINDER/SPHERE
+      (a coarse terrain volume the surface merely sits inside pokes up less and stays
+      walkable). A collider whose top is below the feet is ground underfoot and never blocks.
+    """
+    if z > zhi + Z_BAND_DOWN:
+        return False                    # collider top below the feet -> underfoot, ignore
+    if zlo <= z:
+        return (zhi - z) >= (Z_BOX_TOL if is_box else Z_EMBED_TOL)  # embedded
+    return (zlo - z) <= Z_BAND_UP        # overhead: a low base within reach blocks
+
 
 def _z_overlaps(obj_zmin: float, obj_zmax: float, band_lo: float, band_hi: float) -> bool:
     """Whether an object's vertical extent overlaps the foot-level slack band."""
@@ -193,18 +242,22 @@ def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygo
 
 
 def _all_collider_solids(world: CollisionWorld):
-    """``[(footprint_polygon, z_min, z_max), ...]`` for every bcd box/cylinder/sphere,
-    with its full vertical extent and NOT z-filtered. Used by the height-aware wall
-    builder, which decides per-spot whether a collider actually reaches the floor there."""
+    """``[(footprint_polygon, z_min, z_max, is_box), ...]`` for every bcd box/cylinder/sphere,
+    with its full vertical extent and NOT z-filtered. ``is_box`` distinguishes structural BOX
+    colliders (pads/walls/buildings — always solid where the navmesh enters them) from
+    CYLINDER/SPHERE volumes (which may be coarse terrain the navmesh sits inside); see
+    ``_collider_blocks_foot``. Used by the height-aware wall builder + the teleport grid."""
     solids = []
     for obj in world.objects:
         try:
             scale_val = obj.scale if isinstance(obj.scale, (float, int)) else obj.scale[0]
+            is_box = False
             if obj.proxy == ProxyType.BOX:
                 l, w, h = obj.params.length, obj.params.width, obj.params.depth
                 pts = transformCube(toCubeVertices((l, w, h)), obj.location, obj.rotation)
                 poly = Polygon([(p[0], p[1]) for p in pts]).convex_hull
                 zlo, zhi = obj.location[2] - h / 2, obj.location[2] + h / 2
+                is_box = True
             elif obj.proxy == ProxyType.SPHERE:
                 r = obj.params.radius * scale_val
                 if r <= 0:
@@ -221,7 +274,7 @@ def _all_collider_solids(world: CollisionWorld):
             else:
                 continue
             if poly.is_valid and not poly.is_empty:
-                solids.append((poly, zlo, zhi))
+                solids.append((poly, zlo, zhi, is_box))
         except Exception:
             continue
     return solids
@@ -329,10 +382,10 @@ def _ground_z_at(world: CollisionWorld, zone_name: str | None, x: float, y: floa
     if not levels:
         return None
     pt = Point(x, y)
-    covering = [(zlo, zhi) for fp, zlo, zhi in _zone_collider_solids(world, zone_name)
+    covering = [(zlo, zhi, box) for fp, zlo, zhi, box in _zone_collider_solids(world, zone_name)
                 if fp.contains(pt)]
     for z in levels:  # lowest-first: prefer the ground level under any obstacle
-        if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
+        if not any(_collider_blocks_foot(z, zlo, zhi, box) for zlo, zhi, box in covering):
             return z
     return levels[0]
 
@@ -382,7 +435,7 @@ def zone_bcd_walls(world: CollisionWorld, zone_name: str | None):
     walls = Polygon()
     if tree is not None:
         blocked = []
-        for fp, zlo, zhi in _all_collider_solids(world):
+        for fp, zlo, zhi, _is_box in _all_collider_solids(world):
             band_lo, band_hi = zlo - Z_BAND_UP, zhi + Z_BAND_DOWN
             matching = [
                 tris[i] for i in tree.query(fp)
@@ -458,9 +511,9 @@ class _ZoneWalkGrid:
     def __init__(self, world, zone_name, extra_shapes, player_radius, spacing=GRID_SPACING):
         self.spacing = spacing
         self.mesh = _walkable_mesh(world, zone_name)  # numpy (verts, z, bbox)
-        self.bcd_buf = [(fp.buffer(player_radius), zlo, zhi)
-                        for fp, zlo, zhi in _all_collider_solids(world)]
-        self.bcd_tree = STRtree([fp for fp, _, _ in self.bcd_buf]) if self.bcd_buf else None
+        self.bcd_buf = [(fp.buffer(player_radius), zlo, zhi, box)
+                        for fp, zlo, zhi, box in _all_collider_solids(world)]
+        self.bcd_tree = STRtree([fp for fp, _, _, _ in self.bcd_buf]) if self.bcd_buf else None
         ev = filter_valid_polygons(extra_shapes) if extra_shapes else []
         self.static_prep = prep(unary_union(ev).buffer(player_radius)) if ev else None
         self._cache: dict = {}       # (q, r) -> teleport-valid ground_z or None
@@ -489,9 +542,9 @@ class _ZoneWalkGrid:
             return None
         pt = Point(x, y)
         covering = [self.bcd_buf[i] for i in self.bcd_tree.query(pt)] if self.bcd_tree is not None else []
-        covering = [(zlo, zhi) for fp, zlo, zhi in covering if fp.contains(pt)]
+        covering = [(zlo, zhi, box) for fp, zlo, zhi, box in covering if fp.contains(pt)]
         for z in levels:  # lowest first: the ground under any overhead collider
-            if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
+            if not any(_collider_blocks_foot(z, zlo, zhi, box) for zlo, zhi, box in covering):
                 return z
         return None
 
