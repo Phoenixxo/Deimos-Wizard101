@@ -136,18 +136,30 @@ def _parse_collision_xml(data: bytes) -> tuple[list | None, int, int]:
     return list(hull.exterior.coords), n_total, n_click
 
 
+# Collision-file primitive categories that do NOT obstruct player *movement* (a teleport may
+# land where they overlap). The game flags solid, player-blocking geometry as ``CT_Object`` or
+# ``CT_None`` (the default for walls/props — barriers, trees, boats, teleporter pads all use it).
+# ``CT_ClientObject`` is client-side-only collision — e.g. the ``BigGenericBlocker`` volumes
+# (1360x2117x500 boxes) that blanket Arcanum interiors over walkable floor; the player walks
+# straight through them. Trigger/hitscan/fog are non-physical. Excluding these is the category
+# generalisation of the click-box name test (an interaction click-box is just a named trigger).
+_NON_MOVEMENT_CATEGORIES = {"CT_ClientObject", "CT_Trigger", "CT_Hitscan", "CT_Fog"}
+
+
 def _collision_primitives(data: bytes) -> tuple:
-    """Parse a collision file ONCE into ``(prims, n_total, n_click)`` where ``prims`` is
-    ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry PER non-click primitive, NOT a
-    single convex hull.
+    """Parse a collision file ONCE into ``(prims, n_total, n_nonblock)`` where ``prims`` is
+    ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry PER movement-blocking primitive, NOT
+    a single convex hull.
 
     This is the authoritative collision geometry (``m_solidCollisionFilename``). Keeping each
     box/cylinder/sphere separate is the whole point: a forest's collision is 30-odd trunk
     cylinders scattered across the zone, and a barrier's is one small box — convex-hulling them
     (as the render-mesh path does) collapses them into a zone-spanning blob that walls off the
-    floor. Click-boxes (interaction triggers) are counted but excluded from ``prims``, so the
-    same single parse answers both "what blocks?" and "is this click-box-only?" (no second pass).
-    Each entry carries the primitive's world-vertical extent for height-aware code. Local units."""
+    floor. Non-movement primitives — interaction click-boxes AND ``_NON_MOVEMENT_CATEGORIES``
+    (e.g. ``CT_ClientObject`` blockers) — are counted in ``n_nonblock`` but excluded from
+    ``prims``, so one parse answers both "what blocks?" and "is this purely non-blocking?" (an
+    object whose every primitive is non-blocking isn't a movement obstacle). Each entry carries
+    the primitive's world-vertical extent for height-aware code. Local units."""
     try:
         from .collision_math import transformCube, toCubeVertices
     except Exception:
@@ -157,11 +169,12 @@ def _collision_primitives(data: bytes) -> tuple:
     except Exception:
         return [], 0, 0
     out = []
-    n_total = n_click = 0
+    n_total = n_nonblock = 0
     for prim in root.findall("primitive"):
         n_total += 1
-        if "click" in (prim.get("name") or "").lower():
-            n_click += 1
+        if ("click" in (prim.get("name") or "").lower()
+                or (prim.get("category") or "") in _NON_MOVEMENT_CATEGORIES):
+            n_nonblock += 1
             continue
         ptype = (prim.get("type") or "").lower()
         loc_el = prim.find("location")
@@ -199,7 +212,7 @@ def _collision_primitives(data: bytes) -> tuple:
             continue
         if poly is not None and poly.is_valid and not poly.is_empty:
             out.append((poly, zmin, zmax))
-    return out, n_total, n_click
+    return out, n_total, n_nonblock
 
 
 def _is_teleporter_name(name: str) -> bool:
@@ -648,26 +661,20 @@ class _Resolver:
         """Whether a placed object is a *movement* obstacle (a teleport must clear it).
 
         Stricter than ``is_collidable``: an object whose only collision is an interaction
-        click-box (boat/dock travel points, NPC hit-boxes, the UniverseTeleport trigger) is
-        something the bot approaches to activate, not a wall — so it's *not* a movement obstacle
-        and we let teleports land/paths run right next to it.
-
-        The collision FILE is authoritative and is checked first: a click-box-only file means
-        not-a-wall even when the object also carries a render model. This matters because some
-        triggers have a placeholder render asset (the UniverseTeleport's blank-character NIF)
-        whose ~265u render hull would otherwise be used as the footprint and seal the doorway
-        around it. Only when there's no usable collision file do we fall back to "has a render/
-        teleporter model -> its hull is the obstacle". Teleporter PADS are the exception that
-        stays solid despite a click-box/empty file — they bounce a landing — via the name override."""
+        click-box (boat/dock travel points, NPC hit-boxes) or a non-movement category
+        (``CT_ClientObject`` blockers) is something the bot walks through or approaches to
+        activate, not a wall — so it's *not* a movement obstacle and we let teleports land
+        where it overlaps. Objects with a render model, a real movement-blocking collision
+        primitive, or the teleporter override stay collidable."""
         self._resolve_template(name)
         if not self._collidable_cache.get(name):
             return False
-        _prims, n_total, n_click = self._collision_data_for(name, zone_name)
-        if n_total > 0 and n_click >= n_total and not _is_teleporter_name(name):
-            return False  # collision file is click-box-only -> interaction trigger, not a wall
         if self._asset_cache.get(name):
-            return True  # render/teleporter model -> its hull is the footprint
-        return n_total > 0  # real (non-click) collision primitives present
+            return True  # has a render/teleporter model -> real obstacle
+        _prims, n_total, n_nonblock = self._collision_data_for(name, zone_name)
+        if n_total > 0 and n_nonblock >= n_total:
+            return False  # every primitive is non-blocking (click-box / client-object), not a wall
+        return True
 
     def footprint_points(self, name: str, zone_name: str | None) -> list | None:
         """Local-space 2D hull points for an entity's model, or None. Thread-only.
