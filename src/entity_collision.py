@@ -147,7 +147,7 @@ _NON_MOVEMENT_CATEGORIES = {"CT_ClientObject", "CT_Trigger", "CT_Hitscan", "CT_F
 
 
 def _collision_primitives(data: bytes) -> tuple:
-    """Parse a collision file ONCE into ``(prims, n_total, n_nonblock)`` where ``prims`` is
+    """Parse a collision file ONCE into ``(prims, n_total, n_nonblock, n_category)`` where ``prims`` is
     ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry PER movement-blocking primitive, NOT
     a single convex hull.
 
@@ -163,18 +163,21 @@ def _collision_primitives(data: bytes) -> tuple:
     try:
         from .collision_math import transformCube, toCubeVertices
     except Exception:
-        return [], 0, 0
+        return [], 0, 0, 0
     try:
         root = etree.fromstring(data)
     except Exception:
-        return [], 0, 0
+        return [], 0, 0, 0
     out = []
-    n_total = n_nonblock = 0
+    n_total = n_nonblock = n_category = 0
     for prim in root.findall("primitive"):
         n_total += 1
-        if ("click" in (prim.get("name") or "").lower()
-                or (prim.get("category") or "") in _NON_MOVEMENT_CATEGORIES):
+        is_click = "click" in (prim.get("name") or "").lower()
+        is_noncat = (prim.get("category") or "") in _NON_MOVEMENT_CATEGORIES
+        if is_click or is_noncat:
             n_nonblock += 1
+            if is_noncat:
+                n_category += 1  # CT_ClientObject etc.: authoritatively non-player-movement
             continue
         ptype = (prim.get("type") or "").lower()
         loc_el = prim.find("location")
@@ -212,7 +215,7 @@ def _collision_primitives(data: bytes) -> tuple:
             continue
         if poly is not None and poly.is_valid and not poly.is_empty:
             out.append((poly, zmin, zmax))
-    return out, n_total, n_nonblock
+    return out, n_total, n_nonblock, n_category
 
 
 def _is_teleporter_name(name: str) -> bool:
@@ -376,7 +379,7 @@ class _Resolver:
         # Collision-file dedupe: one filename deserialize, one file read, one parse per object.
         self._solid_fn_cache: dict[str, str | None] = {}  # entity name -> m_solidCollisionFilename
         self._coll_bytes_cache: dict[str, bytes | None] = {}  # filename -> raw collision-file bytes
-        self._coll_data_cache: dict[str, tuple] = {}  # entity name -> (prims, n_total, n_click)
+        self._coll_data_cache: dict[str, tuple] = {}  # entity name -> (prims, n_total, n_nonblock, n_category)
         self._wads: dict[str, object] = {}
         self._id2name: dict[int, str] | None = None  # templateID -> template basename
         self._zone_static_cache: dict[str, list] = {}  # zone -> [(z, footprint), ...]
@@ -635,12 +638,14 @@ class _Resolver:
         return self._solid_fn_cache[name]
 
     def _collision_data_for(self, name: str, zone_name: str | None) -> tuple:
-        """``(prims, n_total, n_click)`` for an object — ONE deserialize (filename), ONE file
-        read, ONE parse, cached per entity name. The single source for every collision-file
+        """``(prims, n_total, n_nonblock, n_category)`` for an object — ONE deserialize (filename),
+        ONE file read, ONE parse, cached per entity name. The single source for every collision-file
         consumer (movement_collidable, the static-placement primitives, the footprint fallback),
-        which previously each re-deserialized + re-read + re-parsed the same file."""
+        which previously each re-deserialized + re-read + re-parsed the same file. ``n_nonblock`` =
+        primitives excluded from ``prims`` (click-box or non-movement category); ``n_category`` =
+        the subset excluded for a non-movement CATEGORY (``CT_ClientObject`` etc.)."""
         if name not in self._coll_data_cache:
-            data_tuple = ([], 0, 0)
+            data_tuple = ([], 0, 0, 0)
             fn = self._solid_collision_filename_for(name)
             if fn:
                 if fn not in self._coll_bytes_cache:
@@ -664,16 +669,26 @@ class _Resolver:
         click-box (boat/dock travel points, NPC hit-boxes) or a non-movement category
         (``CT_ClientObject`` blockers) is something the bot walks through or approaches to
         activate, not a wall — so it's *not* a movement obstacle and we let teleports land
-        where it overlaps. Objects with a render model, a real movement-blocking collision
-        primitive, or the teleporter override stay collidable."""
+        where it overlaps.
+
+        A non-movement CATEGORY (``CT_ClientObject`` etc.) is authoritative: an object whose every
+        primitive is one of those does NOT obstruct movement even with a render model — it's the
+        engine declaring "not player collision". This matters for sprawling blockers like
+        ``DM_HowlingLands_Blocker`` (one ``CT_ClientObject`` box + a zone-spanning NIF; trusting the
+        render model there blankets the whole zone with that NIF's convex hull). A click-box, by
+        contrast, is an interaction trigger that may sit on a genuinely physical object (a
+        teleporter pad), so a click-box-only object with a render model still counts — that render
+        model / the teleporter override is what blocks it."""
         self._resolve_template(name)
         if not self._collidable_cache.get(name):
             return False
+        _prims, n_total, n_nonblock, n_category = self._collision_data_for(name, zone_name)
+        if n_total > 0 and n_category >= n_total:
+            return False  # every primitive is a non-movement category -> never a wall
         if self._asset_cache.get(name):
-            return True  # has a render/teleporter model -> real obstacle
-        _prims, n_total, n_nonblock = self._collision_data_for(name, zone_name)
+            return True  # render/teleporter model -> solid (pads, physical click-box objects)
         if n_total > 0 and n_nonblock >= n_total:
-            return False  # every primitive is non-blocking (click-box / client-object), not a wall
+            return False  # click-box-only interaction trigger with no render model
         return True
 
     def footprint_points(self, name: str, zone_name: str | None) -> list | None:
