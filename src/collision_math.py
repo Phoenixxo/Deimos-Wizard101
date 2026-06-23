@@ -14,6 +14,7 @@ The lower-level cube/transform helpers (toCubeVertices, transformCube, toMultidi
 come from PeechezNCreem / CIick and are shared with the shape builders below.
 """
 
+import heapq
 import math
 from typing import List, TypeAlias
 
@@ -133,17 +134,25 @@ def _z_overlaps(obj_zmin: float, obj_zmax: float, band_lo: float, band_hi: float
     return obj_zmin <= band_hi and obj_zmax >= band_lo
 
 
-def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygon]:
-    """Build 2D footprints of solid collision objects at the player's foot level.
+def build_collision_shapes_typed(world: CollisionWorld, z_slice: float):
+    """``(box_polys, round_polys)`` of solid collision objects at the player's foot level.
 
     An object is included when its vertical extent overlaps the slack band
     ``[z_slice - Z_BAND_DOWN, z_slice + Z_BAND_UP]``, so a ground wall (even one whose
     modeled base floats slightly above the feet) blocks while overhead geometry the
     player walks under does not.
+
+    The two lists are kept separate because they mean different things in KI's collision
+    authoring and are treated differently when carving walkable space (see ``_compose_walls``):
+      - **boxes** are specific wall segments — a real wall you can't pass;
+      - **rounds** (cylinders/spheres) are usually the *coarse bounding volume* of a whole
+        structure (Celestia's Floating Land chamber is a single r~834 cylinder whose interior
+        is walkable floor with a doorway; WC zones bound buildings the same way). Treating
+        those as solid discs wipes out the walkable floor inside them.
     """
     band_lo = z_slice - Z_BAND_DOWN
     band_hi = z_slice + Z_BAND_UP
-    shapes = []
+    boxes, rounds = [], []
     for obj in world.objects:
         try:
             scale_val = obj.scale if isinstance(obj.scale, (float, int)) else obj.scale[0]
@@ -155,12 +164,12 @@ def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygo
                     world_pts = transformCube(toCubeVertices((l, w, h)), obj.location, obj.rotation)
                     pts2d = [(p[0], p[1]) for p in world_pts]
                     if len(pts2d) >= 3:
-                        shapes.append(Polygon(pts2d).convex_hull)
+                        boxes.append(Polygon(pts2d).convex_hull)
 
             elif obj.proxy == ProxyType.SPHERE:
                 r = obj.params.radius * scale_val
                 if r > 0 and _z_overlaps(obj.location[2] - r, obj.location[2] + r, band_lo, band_hi):
-                    shapes.append(Point(obj.location[0], obj.location[1]).buffer(r))
+                    rounds.append(Point(obj.location[0], obj.location[1]).buffer(r))
 
             elif obj.proxy == ProxyType.CYLINDER:
                 # Collision cylinders store a true world-space radius (median ~500 in
@@ -169,10 +178,402 @@ def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygo
                 r = obj.params.radius * scale_val
                 half_len = (obj.params.length / 2) * scale_val
                 if r > 0 and _z_overlaps(obj.location[2] - half_len, obj.location[2] + half_len, band_lo, band_hi):
-                    shapes.append(Point(obj.location[0], obj.location[1]).buffer(r))
+                    rounds.append(Point(obj.location[0], obj.location[1]).buffer(r))
         except Exception:
             continue
-    return shapes
+    return boxes, rounds
+
+
+def build_collision_shapes(world: CollisionWorld, z_slice: float) -> List[Polygon]:
+    """All solid-collision footprints (boxes + round volumes) at the foot level.
+    Thin wrapper over ``build_collision_shapes_typed`` for callers that don't need the
+    box/round split."""
+    boxes, rounds = build_collision_shapes_typed(world, z_slice)
+    return boxes + rounds
+
+
+def _all_collider_solids(world: CollisionWorld):
+    """``[(footprint_polygon, z_min, z_max), ...]`` for every bcd box/cylinder/sphere,
+    with its full vertical extent and NOT z-filtered. Used by the height-aware wall
+    builder, which decides per-spot whether a collider actually reaches the floor there."""
+    solids = []
+    for obj in world.objects:
+        try:
+            scale_val = obj.scale if isinstance(obj.scale, (float, int)) else obj.scale[0]
+            if obj.proxy == ProxyType.BOX:
+                l, w, h = obj.params.length, obj.params.width, obj.params.depth
+                pts = transformCube(toCubeVertices((l, w, h)), obj.location, obj.rotation)
+                poly = Polygon([(p[0], p[1]) for p in pts]).convex_hull
+                zlo, zhi = obj.location[2] - h / 2, obj.location[2] + h / 2
+            elif obj.proxy == ProxyType.SPHERE:
+                r = obj.params.radius * scale_val
+                if r <= 0:
+                    continue
+                poly = Point(obj.location[0], obj.location[1]).buffer(r)
+                zlo, zhi = obj.location[2] - r, obj.location[2] + r
+            elif obj.proxy == ProxyType.CYLINDER:
+                r = obj.params.radius * scale_val
+                hl = (obj.params.length / 2) * scale_val
+                if r <= 0:
+                    continue
+                poly = Point(obj.location[0], obj.location[1]).buffer(r)
+                zlo, zhi = obj.location[2] - hl, obj.location[2] + hl
+            else:
+                continue
+            if poly.is_valid and not poly.is_empty:
+                solids.append((poly, zlo, zhi))
+        except Exception:
+            continue
+    return solids
+
+
+# Per-zone walkable triangles with their surface z, and the height-aware bcd-wall region.
+# Both are zone-static (independent of the teleport target), so they're memoized per zone.
+_walkable_tris_cache: dict[str, tuple] = {}
+_bcd_walls_cache: dict[str, object] = {}
+_collider_solids_cache: dict[str, list] = {}
+
+
+def _zone_collider_solids(world: CollisionWorld, zone_name: str | None):
+    """``_all_collider_solids`` memoized per zone."""
+    if zone_name is not None and zone_name in _collider_solids_cache:
+        return _collider_solids_cache[zone_name]
+    solids = _all_collider_solids(world)
+    if zone_name is not None:
+        _collider_solids_cache[zone_name] = solids
+    return solids
+
+
+def _ground_z_at(world: CollisionWorld, zone_name: str | None, x: float, y: float):
+    """The teleport-valid ground height of the walkable navmesh at ``(x, y)``, or None.
+
+    A floating-island / ramp zone can stack several walkable surfaces at one XY. We want the
+    one a teleport will actually land on: the lowest surface that is NOT inside any collider's
+    vertical reach (so the body isn't dropped into a wall/cylinder). Falls back to the lowest
+    surface, then None. Cheap — one STRtree query against the cached walkable faces."""
+    tree, tris, zs = _walkable_tris(world, zone_name)
+    if tree is None:
+        return None
+    pt = Point(x, y)
+    levels = sorted({zs[i] for i in tree.query(pt) if tris[i].intersects(pt)})
+    if not levels:
+        return None
+    covering = [(zlo, zhi) for fp, zlo, zhi in _zone_collider_solids(world, zone_name)
+                if fp.contains(pt)]
+    for z in levels:  # lowest-first: prefer the ground level under any obstacle
+        if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
+            return z
+    return levels[0]
+
+
+def _walkable_tris(world: CollisionWorld, zone_name: str | None):
+    """``(STRtree, [triangle], [surface_z])`` over the walkable navmesh faces."""
+    if zone_name is not None and zone_name in _walkable_tris_cache:
+        return _walkable_tris_cache[zone_name]
+    tris, zs = [], []
+    for obj in world.objects:
+        if obj.proxy == ProxyType.MESH and CollisionFlag.WALKABLE in obj.category_flags:
+            pts = transformCube(obj.vertices, obj.location, obj.rotation)
+            for a, b, c in obj.faces:
+                try:
+                    tri = Polygon([
+                        (pts[a][0], pts[a][1]), (pts[b][0], pts[b][1]), (pts[c][0], pts[c][1]),
+                    ])
+                    if tri.is_valid and tri.area > 0:
+                        tris.append(tri)
+                        zs.append((pts[a][2] + pts[b][2] + pts[c][2]) / 3.0)
+                except Exception:
+                    continue
+    tree = STRtree(tris) if tris else None
+    result = (tree, tris, zs)
+    if zone_name is not None:
+        _walkable_tris_cache[zone_name] = result
+    return result
+
+
+def zone_bcd_walls(world: CollisionWorld, zone_name: str | None):
+    """Height-aware bcd collision walls, memoized per zone.
+
+    A collider only walls off a spot where the *walkable surface there* is actually within
+    the collider's vertical extent — you can't be blocked by collision that's entirely above
+    or below your feet at that XY. So instead of slicing every collider at one global z (which
+    makes a tall cylinder a flat disc that wrongly blocks a ramp passing under it), each
+    collider footprint is intersected with only the walkable triangles whose surface z falls in
+    its band ``[z_min - Z_BAND_UP, z_max + Z_BAND_DOWN]``. This is what lets a teleport land on
+    the low/outer part of Celestia's ramp (which dips below the chamber cylinder's base) while
+    still avoiding the inner ramp that genuinely rises into it, and it subsumes the old
+    sub-floor ``Z_BAND_DOWN`` special-case (a cylinder whose top is below the floor matches no
+    triangles). Zone-static, so cached. Pure CPU; first call ~0.4–2.5s, then free.
+    """
+    if zone_name is not None and zone_name in _bcd_walls_cache:
+        return _bcd_walls_cache[zone_name]
+    tree, tris, zs = _walkable_tris(world, zone_name)
+    walls = Polygon()
+    if tree is not None:
+        blocked = []
+        for fp, zlo, zhi in _all_collider_solids(world):
+            band_lo, band_hi = zlo - Z_BAND_UP, zhi + Z_BAND_DOWN
+            matching = [
+                tris[i] for i in tree.query(fp)
+                if band_lo <= zs[i] <= band_hi and tris[i].intersects(fp)
+            ]
+            if matching:
+                region = fp.intersection(unary_union(matching))
+                if not region.is_empty:
+                    blocked.append(region)
+        if blocked:
+            walls = unary_union(blocked)
+    if zone_name is not None:
+        _bcd_walls_cache[zone_name] = walls
+    return walls
+
+
+# ---------------------------------------------------------------------------
+# Lazy hexagonal walkability grid. A node is teleport-valid when it sits on walkable
+# navmesh, that ground surface is NOT inside any bcd collider's vertical reach
+# (height-aware — you can walk a ramp *under* a tall cylinder), and it clears every static
+# entity collider (teleporter pads, boats). Hex layout gives 6 equidistant neighbours (the
+# right substrate for A* nav). Crucially we DON'T rasterize the whole zone: a teleport only
+# needs the nearest walkable node to the target, so we evaluate nodes on demand in expanding
+# rings and memoize each verdict. The same lazy node cache backs A* nav. First teleport pays
+# only the per-zone index build (navmesh/collider STRtrees) + a few dozen node probes, not a
+# full-zone sweep.
+# ---------------------------------------------------------------------------
+
+GRID_SPACING = 100.0  # hex node centre-to-centre distance, world units
+
+_SQRT3 = math.sqrt(3.0)
+# Axial hex directions (q, r). Six equidistant neighbours.
+_HEX_DIRS = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
+
+# zone -> _ZoneWalkGrid
+_walk_grid_cache: dict[str, object] = {}
+
+
+def _node_ground_z(pt, mesh_tree, tris, tzs, bcd_buf, bcd_tree, static_prep):
+    """Teleport-valid ground height at ``pt`` (a shapely Point), or None if not walkable.
+
+    ``bcd_buf`` are bcd collider footprints ALREADY buffered by the body clearance, paired
+    with their (zmin, zmax); ``bcd_tree`` indexes them. ``static_prep`` is a prepared union
+    of static-entity footprints (already buffered). Lowest walkable level under any obstacle
+    wins."""
+    if static_prep is not None and static_prep.contains(pt):
+        return None  # on/next to a teleporter pad, boat, etc.
+    levels = sorted({tzs[i] for i in mesh_tree.query(pt) if tris[i].intersects(pt)})
+    if not levels:
+        return None
+    covering = [bcd_buf[i] for i in bcd_tree.query(pt)] if bcd_tree is not None else []
+    covering = [(zlo, zhi) for fp, zlo, zhi in covering if fp.contains(pt)]
+    for z in levels:  # lowest first: the ground under any overhead collider
+        if not any(zlo - Z_BAND_UP <= z <= zhi + Z_BAND_DOWN for zlo, zhi in covering):
+            return z
+    return None
+
+
+def _hex_round(qf, rf):
+    """Round fractional axial coords to the nearest hex (via cube rounding)."""
+    xf, zf = qf, rf
+    yf = -xf - zf
+    rx, ry, rz = round(xf), round(yf), round(zf)
+    dx, dy, dz = abs(rx - xf), abs(ry - yf), abs(rz - zf)
+    if dx > dy and dx > dz:
+        rx = -ry - rz
+    elif dy > dz:
+        ry = -rx - rz
+    else:
+        rz = -rx - ry
+    return int(rx), int(rz)
+
+
+def _hex_ring(q0, r0, k):
+    """Yield the axial coords of the ring at hex-distance ``k`` around ``(q0, r0)``."""
+    if k == 0:
+        yield (q0, r0)
+        return
+    q = q0 + _HEX_DIRS[4][0] * k
+    r = r0 + _HEX_DIRS[4][1] * k
+    for i in range(6):
+        for _ in range(k):
+            yield (q, r)
+            q += _HEX_DIRS[i][0]
+            r += _HEX_DIRS[i][1]
+
+
+class _ZoneWalkGrid:
+    """Lazy, cached hex walkability grid for one zone. Pointy-top axial layout with
+    centre spacing ``GRID_SPACING``. ``node_z`` evaluates+memoizes a node; ``neighbours``
+    and ``node_z`` are everything A* nav needs."""
+
+    def __init__(self, world, zone_name, extra_shapes, player_radius, spacing=GRID_SPACING):
+        self.spacing = spacing
+        self.mesh_tree, self.tris, self.tzs = _walkable_tris(world, zone_name)
+        self.bcd_buf = [(fp.buffer(player_radius), zlo, zhi)
+                        for fp, zlo, zhi in _all_collider_solids(world)]
+        self.bcd_tree = STRtree([fp for fp, _, _ in self.bcd_buf]) if self.bcd_buf else None
+        ev = filter_valid_polygons(extra_shapes) if extra_shapes else []
+        self.static_prep = prep(unary_union(ev).buffer(player_radius)) if ev else None
+        self._cache: dict = {}       # (q, r) -> teleport-valid ground_z or None
+        self._walk_cache: dict = {}  # (q, r) -> walk-valid ground_z or None
+
+    @property
+    def has_mesh(self):
+        return self.mesh_tree is not None
+
+    def to_world(self, q, r):
+        return self.spacing * (q + r / 2.0), self.spacing * (_SQRT3 / 2.0) * r
+
+    def to_hex(self, x, y):
+        r = (2.0 * y) / (self.spacing * _SQRT3)
+        q = x / self.spacing - r / 2.0
+        return _hex_round(q, r)
+
+    def node_z(self, q, r):
+        """Ground z at node ``(q, r)`` if walkable, else None. Evaluated once, memoized."""
+        v = self._cache.get((q, r), 0)  # 0 sentinel = unevaluated (z can be 0.0)
+        if v != 0:
+            return v if v is not None else None
+        x, y = self.to_world(q, r)
+        z = _node_ground_z(Point(x, y), self.mesh_tree, self.tris, self.tzs,
+                           self.bcd_buf, self.bcd_tree, self.static_prep)
+        self._cache[(q, r)] = z
+        return z
+
+    def neighbours(self, q, r):
+        return [(q + dq, r + dr) for dq, dr in _HEX_DIRS]
+
+    def closest_walkable(self, target, max_rings=300):
+        """Nearest walkable node to ``target`` as ``(x, y, z)``, by expanding-ring search
+        (evaluate on demand, stop once no farther ring could beat the best). None if the
+        whole searched area is blocked."""
+        q0, r0 = self.to_hex(target.x, target.y)
+        best, best_d = None, None
+        for k in range(max_rings + 1):
+            if best_d is not None and (k - 1) * self.spacing > best_d:
+                break  # every node in this ring is farther than what we already have
+            for (q, r) in _hex_ring(q0, r0, k):
+                z = self.node_z(q, r)
+                if z is not None:
+                    x, y = self.to_world(q, r)
+                    d = math.hypot(x - target.x, y - target.y)
+                    if best_d is None or d < best_d:
+                        best, best_d = (x, y, z), d
+        return best
+
+    # --- walking (more permissive than teleport-valid) + A* nav ---
+
+    def walk_z(self, q, r):
+        """Ground z at ``(q, r)`` if you can WALK there, else None. More permissive than
+        ``node_z``: on raw navmesh and clear of static entity colliders (teleporter pads/
+        boats), but it does NOT exclude bcd-collider interiors — a chamber cylinder's ramp
+        is walkable even though a teleport landing inside it bounces. Memoized."""
+        v = self._walk_cache.get((q, r), 0)
+        if v != 0:
+            return v if v is not None else None
+        x, y = self.to_world(q, r)
+        pt = Point(x, y)
+        if self.static_prep is not None and self.static_prep.contains(pt):
+            z = None
+        else:
+            levels = sorted({self.tzs[i] for i in self.mesh_tree.query(pt) if self.tris[i].intersects(pt)})
+            z = levels[0] if levels else None
+        self._walk_cache[(q, r)] = z
+        return z
+
+    def _nearest_walk_node(self, q0, r0, max_rings=40):
+        for k in range(max_rings + 1):
+            for (q, r) in _hex_ring(q0, r0, k):
+                if self.walk_z(q, r) is not None:
+                    return (q, r)
+        return None
+
+    def find_walk_path(self, start_xyz, goal_xyz, max_nodes=20000):
+        """A* over WALK-valid hex nodes from ``start`` to ``goal``. Returns ``[(x, y, z), …]``
+        waypoints (start node first, goal node last), or None if unreachable on foot.
+        Endpoints are snapped to the nearest walk-valid node. Evaluated lazily — only the
+        nodes A* touches are probed (and memoized for the zone)."""
+        sq = self.to_hex(start_xyz.x, start_xyz.y)
+        if self.walk_z(*sq) is None:
+            sq = self._nearest_walk_node(*sq)
+        gq = self.to_hex(goal_xyz.x, goal_xyz.y)
+        if self.walk_z(*gq) is None:
+            gq = self._nearest_walk_node(*gq)
+        if sq is None or gq is None:
+            return None
+        if sq == gq:
+            x, y = self.to_world(*sq)
+            return [(x, y, self.walk_z(*sq))]
+        gxw, gyw = self.to_world(*gq)
+
+        def _h(node):
+            x, y = self.to_world(*node)
+            return math.hypot(x - gxw, y - gyw)
+
+        open_heap = [(_h(sq), 0.0, sq)]
+        came = {sq: None}
+        gscore = {sq: 0.0}
+        seen = set()
+        n_expanded = 0
+        while open_heap and n_expanded < max_nodes:
+            _, gc, cur = heapq.heappop(open_heap)
+            if cur in seen:
+                continue
+            seen.add(cur)
+            n_expanded += 1
+            if cur == gq:
+                path = []
+                node = cur
+                while node is not None:
+                    x, y = self.to_world(*node)
+                    path.append((x, y, self.walk_z(*node)))
+                    node = came[node]
+                path.reverse()
+                return path
+            for nb in self.neighbours(*cur):
+                if nb in seen or self.walk_z(*nb) is None:
+                    continue
+                ng = gc + self.spacing
+                if nb not in gscore or ng < gscore[nb]:
+                    gscore[nb] = ng
+                    came[nb] = cur
+                    heapq.heappush(open_heap, (ng + _h(nb), ng, nb))
+        return None
+
+
+def get_walk_grid(world: CollisionWorld, zone_name: str | None, extra_shapes=None,
+                  player_radius: float = 45.0) -> "_ZoneWalkGrid":
+    """The zone's lazy hex walkability grid, memoized. Pass ``extra_shapes`` = the zone's full
+    static footprints (``build_zone_static_shapes(zone, None)``)."""
+    g = _walk_grid_cache.get(zone_name) if zone_name is not None else None
+    if g is None:
+        g = _ZoneWalkGrid(world, zone_name, extra_shapes, player_radius)
+        if zone_name is not None:
+            _walk_grid_cache[zone_name] = g
+    return g
+
+
+def find_walkable_teleport_point(world: CollisionWorld, zone_name: str | None, target: XYZ,
+                                 extra_shapes=None, player_radius: float = 45.0,
+                                 spacing: float = GRID_SPACING):
+    """Closest teleport-valid point to ``target``: the target itself when it's walkable (at its
+    true ground height), else the nearest walkable hex node found by lazy expanding-ring search.
+    Returns ``(XYZ, reason)`` or ``(None, reason)``.
+
+    The exact target is tested first so a clear target lands precisely on it; a *blocked* target
+    falls to the hex grid, where the post-teleport walk closes the remaining gap. Only the nodes
+    near the target are evaluated (and cached for the zone) — no full-zone sweep."""
+    grid = get_walk_grid(world, zone_name, extra_shapes, player_radius)
+    if not grid.has_mesh:
+        return None, "no_mesh"
+
+    tz = _node_ground_z(Point(target.x, target.y), grid.mesh_tree, grid.tris, grid.tzs,
+                        grid.bcd_buf, grid.bcd_tree, grid.static_prep)
+    if tz is not None:
+        return XYZ(target.x, target.y, tz), "target_clear"
+
+    best = grid.closest_walkable(target)
+    if best is None:
+        return None, "no_walkable"
+    return XYZ(best[0], best[1], best[2]), "grid_node"
 
 
 # Unioned walkable navmesh per zone. Building it from the raw triangles (~15k in a
@@ -228,140 +629,64 @@ def _walkable_union(world: CollisionWorld, zone_name: str | None):
     return union
 
 
-def _walkable_minus_walls(union_mesh, union_coll, player_radius: float):
-    """Navmesh with walls (dilated by the player's clearance) carved out.
+def _walkable_minus_walls(union_mesh, walls, player_radius: float):
+    """Navmesh with ``walls`` (dilated by the player's clearance) carved out.
 
     Dilating the *walls* and subtracting them — rather than eroding the whole free
     area — keeps the navmesh's own outer edges intact (you can still stand at the
-    lip of a platform) while guaranteeing the body clears every wall. If full
-    clearance leaves nothing reachable (a genuinely tight spot), the clearance is
-    relaxed step-wise rather than failing outright: a snug landing beats none.
+    lip of a platform) while guaranteeing the body clears every wall. ``walls`` is the
+    height-aware bcd wall region (``zone_bcd_walls``) unioned with the static entity
+    colliders. If full clearance leaves nothing reachable, the clearance is relaxed
+    step-wise rather than failing outright: a snug landing beats none.
     """
-    if union_coll.is_empty:
+    if walls.is_empty:
         return union_mesh
     for clearance in (player_radius, player_radius * 0.5, 0.0):
-        carved = union_coll.buffer(clearance) if clearance > 0 else union_coll
+        carved = walls.buffer(clearance) if clearance > 0 else walls
         region = union_mesh.difference(carved)
         if not region.is_empty:
             return region
     return None
 
 
-# Per-zone spatial index of walkable triangles (with their surface z), for sampling
-# the ground height at an arbitrary (x, y) during the teleport-march.
-_navmesh_index_cache: dict[str, tuple] = {}
+def straight_path_walkable(world, zone_name, start_xyz, target_xyz,
+                           static_shapes=None, player_radius: float = 0.0, step: float = 50.0):
+    """Whether the straight XY segment ``start -> target`` stays on walkable ground —
+    i.e. whether ``client.goto`` (a dumb straight-line walk) can cover it.
 
-
-def _navmesh_index(world: CollisionWorld, zone_name: str | None):
-    """``(STRtree, [triangle], [centroid_z])`` over the walkable faces, memoized per zone."""
-    if zone_name is not None and zone_name in _navmesh_index_cache:
-        return _navmesh_index_cache[zone_name]
-    tris, zs = [], []
-    for obj in world.objects:
-        if obj.proxy == ProxyType.MESH and CollisionFlag.WALKABLE in obj.category_flags:
-            pts3d = transformCube(obj.vertices, obj.location, obj.rotation)
-            for a, b, c in obj.faces:
-                try:
-                    tri = Polygon([
-                        (pts3d[a][0], pts3d[a][1]),
-                        (pts3d[b][0], pts3d[b][1]),
-                        (pts3d[c][0], pts3d[c][1]),
-                    ])
-                    if tri.is_valid and tri.area > 0:
-                        tris.append(tri)
-                        zs.append((pts3d[a][2] + pts3d[b][2] + pts3d[c][2]) / 3.0)
-                except Exception:
-                    continue
-    tree = STRtree(tris) if tris else None
-    result = (tree, tris, zs)
-    if zone_name is not None:
-        _navmesh_index_cache[zone_name] = result
-    return result
-
-
-def closest_walkable_along(world: CollisionWorld, zone_name: str | None, start_xyz: XYZ,
-                           target_xyz: XYZ, player_radius: float, extra_shapes=None,
-                           step: float = 60.0, max_steps: int = 80):
-    """Furthest *validated-walkable* point from ``start_xyz`` toward ``target_xyz``.
-
-    The walkable region is the navmesh minus walls (collisions dilated by
-    ``player_radius``). ``extra_shapes`` are additional collider footprints — the zone's
-    static entity objects (NPCs, props, teleporters from gamedata.bin) — unioned with the
-    collision.bcd geometry, so the march routes around them too (e.g. it won't land you
-    on top of the UniverseTeleport). ``start_xyz`` comes from an A* anchor on ``zone.nav``,
-    which can disagree with ``collision.bcd`` and sit inside a wall — so we first **snap**
-    it onto the walkable region, then march the straight XY line toward the target in
-    ``step`` increments, keeping each point that stays walkable and stopping at the first
-    blocked step. Surface z is sampled from the navmesh triangle nearest the running height
-    (so a ground march doesn't snap onto an overhead level).
-
-    Always returns a point that is on the walkable region (at minimum the snapped start),
-    so the caller can teleport to it without landing in a wall. Returns ``None`` only when
-    there's no navmesh/walkable area at all (caller should defer to navmap). Pure CPU.
+    Uses the *raw* walkable navmesh (NOT minus ``collision.bcd`` walls): walking is
+    navmesh-validated and passes straight through teleport-blocking-but-walkable volumes
+    like the WC Drains chamber cylinders, so those must not count against the walk. Static
+    *entity* colliders (``static_shapes`` — teleporter pads, boats), however, DO block: we
+    must never walk onto a pad we deliberately teleported clear of (it would bounce/warp),
+    so they're subtracted (buffered by ``player_radius``). Returns True only if every
+    sampled point, endpoint included, is on that region. Pure CPU — run off the loop.
     """
-    tree, tris, zs = _navmesh_index(world, zone_name)
-    if tree is None:
-        return None
     mesh = _walkable_union(world, zone_name)
     if mesh.is_empty:
-        return None
-    coll_shapes = filter_valid_polygons(build_collision_shapes(world, start_xyz.z))
-    if extra_shapes:
-        coll_shapes.extend(filter_valid_polygons(extra_shapes))
-    union_coll = unary_union(coll_shapes) if coll_shapes else None
-    if union_coll is not None and not union_coll.is_empty:
-        walkable_region = mesh.difference(union_coll.buffer(player_radius))
-    else:
-        walkable_region = mesh
-    if walkable_region.is_empty:
-        return None
-    in_walkable = prep(walkable_region)
-
-    def surface_z(x: float, y: float, ref_z: float):
-        pt = Point(x, y)
-        best_z, best_dz = None, None
-        for i in tree.query(pt):
-            tri = tris[i]
-            if tri.contains(pt) or tri.touches(pt):
-                dz = abs(zs[i] - ref_z)
-                if best_dz is None or dz < best_dz:
-                    best_dz, best_z = dz, zs[i]
-        return best_z
-
-    # Snap the (possibly-in-a-wall) A* anchor onto walkable ground before marching.
-    start_pt = Point(start_xyz.x, start_xyz.y)
-    if not in_walkable.contains(start_pt):
-        _, start_pt = nearest_points(start_pt, walkable_region)
-
-    ref_z = surface_z(start_pt.x, start_pt.y, start_xyz.z)
-    if ref_z is None:
-        ref_z = start_xyz.z
-    best = XYZ(start_pt.x, start_pt.y, ref_z)
-
-    dx, dy = target_xyz.x - start_pt.x, target_xyz.y - start_pt.y
+        return False
+    region = mesh
+    if static_shapes:
+        sv = filter_valid_polygons(static_shapes)
+        if sv:
+            blockers = unary_union(sv)
+            if player_radius > 0:
+                blockers = blockers.buffer(player_radius)
+            region = mesh.difference(blockers)
+    if region.is_empty:
+        return False
+    in_region = prep(region)
+    dx, dy = target_xyz.x - start_xyz.x, target_xyz.y - start_xyz.y
     total = math.hypot(dx, dy)
     if total < 1e-6:
-        return best
+        return True
     ux, uy = dx / total, dy / total
-    d = step
-    steps = 0
-    while d < total and steps < max_steps:
-        x, y = start_pt.x + ux * d, start_pt.y + uy * d
-        if not in_walkable.contains(Point(x, y)):
-            break
-        z = surface_z(x, y, ref_z)
-        if z is None:
-            break
-        best = XYZ(x, y, z)
-        ref_z = z
+    d = 0.0
+    while d <= total:
+        if not in_region.contains(Point(start_xyz.x + ux * d, start_xyz.y + uy * d)):
+            return False
         d += step
-        steps += 1
-    # If the target itself is walkable, finish exactly on it.
-    if in_walkable.contains(Point(target_xyz.x, target_xyz.y)):
-        z = surface_z(target_xyz.x, target_xyz.y, ref_z)
-        if z is not None:
-            best = XYZ(target_xyz.x, target_xyz.y, z)
-    return best
+    return in_region.contains(Point(target_xyz.x, target_xyz.y))
 
 
 def find_safe_collision_point(world: CollisionWorld, target: XYZ, player_radius: float,
@@ -383,12 +708,13 @@ def find_safe_collision_point(world: CollisionWorld, target: XYZ, player_radius:
     if union_mesh.is_empty:
         return None, "no_mesh"
 
-    collision_shapes = filter_valid_polygons(build_collision_shapes(world, target.z))
-    if extra_shapes:
-        collision_shapes.extend(filter_valid_polygons(extra_shapes))
-    union_coll = unary_union(collision_shapes) if collision_shapes else Polygon()
+    bcd_walls = zone_bcd_walls(world, zone_name)
+    extra_valid = filter_valid_polygons(extra_shapes) if extra_shapes else []
+    extra_coll = unary_union(extra_valid) if extra_valid else Polygon()
+    walls = unary_union([w for w in (bcd_walls, extra_coll) if not w.is_empty]) if (
+        not bcd_walls.is_empty or not extra_coll.is_empty) else Polygon()
 
-    walkable = _walkable_minus_walls(union_mesh, union_coll, player_radius)
+    walkable = _walkable_minus_walls(union_mesh, walls, player_radius)
     if walkable is None or walkable.is_empty:
         return None, "no_walkable"
 
@@ -397,7 +723,13 @@ def find_safe_collision_point(world: CollisionWorld, target: XYZ, player_radius:
         return XYZ(target.x, target.y, target.z), "target_clear"
 
     _, candidate = nearest_points(tp, walkable)
-    return XYZ(candidate.x, candidate.y, target.z), "safe_point"
+    # The relocated landing can be at a very different height than the target — e.g. on the
+    # lower part of a ramp that passes *under* a chamber cylinder. Teleporting there at the
+    # target's z would put us back inside that cylinder (bounce), so use the actual ground
+    # height at the landing (the teleport-valid level below the obstacle), falling back to
+    # target.z only if the navmesh can't be sampled.
+    gz = _ground_z_at(world, zone_name, candidate.x, candidate.y)
+    return XYZ(candidate.x, candidate.y, gz if gz is not None else target.z), "safe_point"
 
 
 def find_safe_magic_grid_points(
@@ -431,12 +763,13 @@ def find_safe_magic_grid_points(
     if union_mesh.is_empty:
         return [], "no_mesh"
 
-    collision_shapes = filter_valid_polygons(build_collision_shapes(world, target.z))
-    if extra_shapes:
-        collision_shapes.extend(filter_valid_polygons(extra_shapes))
-    union_coll = unary_union(collision_shapes) if collision_shapes else Polygon()
+    bcd_walls = zone_bcd_walls(world, zone_name)
+    extra_valid = filter_valid_polygons(extra_shapes) if extra_shapes else []
+    extra_coll = unary_union(extra_valid) if extra_valid else Polygon()
+    walls = unary_union([w for w in (bcd_walls, extra_coll) if not w.is_empty]) if (
+        not bcd_walls.is_empty or not extra_coll.is_empty) else Polygon()
 
-    safe_region = _walkable_minus_walls(union_mesh, union_coll, player_radius)
+    safe_region = _walkable_minus_walls(union_mesh, walls, player_radius)
     if safe_region is None or safe_region.is_empty:
         return [], "no_walkable"
 

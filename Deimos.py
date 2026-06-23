@@ -57,7 +57,7 @@ from src.sprinty_client import SprintyClient
 
 # from src.combat_new import Fighter
 from src.stat_viewer import total_stats
-from src.teleport_math import calc_Distance, collision_tp, navmap_tp, a_star_tp
+from src.teleport_math import calc_Distance, collision_tp, navmap_tp
 from src.tokenizer import tokenize
 from src.utils import (  # , assign_pet_level
     auto_potions,
@@ -522,15 +522,14 @@ async def navmap_teleport(
     debug: bool = False,
     xyz: XYZ = None,
 ):
-    # teleports foreground client or all clients using the navmap.
-    # nested function that allows for the gathering of the teleports for each client
+    # Teleports the foreground client (or all clients) using ONLY the zone's collision
+    # geometry — the walkable collision mesh + every collideable object — never the
+    # (inaccurate) zone.nav navigation graph. collision_tp lands at the nearest
+    # collision-valid point and walks any remaining gap to a walk-reachable target.
     async def client_navmap_teleport(client: Client, xyz: XYZ = None):
         if not xyz:
             xyz = await client.quest_position.position()
-        await a_star_tp(client, xyz)
-        # except:
-        # 	# skips teleport if there's no navmap, this should just switch to auto adjusting teleport
-        # 	logger.error(f'{client.title} encountered an error during navmap tp, most likely the navmap for the zone did not exist. Skipping teleport.')
+        await collision_tp(client, xyz)
 
     if debug:
         if mass_teleport:

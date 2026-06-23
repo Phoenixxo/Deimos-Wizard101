@@ -45,6 +45,14 @@ _FALLBACK_WADS = [
 # wall off the area around it.
 _DEFAULT_STATIC_RADIUS = 150.0
 
+# A placed object whose footprint spans more than this (world units, widest side) is a
+# zone-scale environment mesh — a barrier shell, the foliage/tree layer, a skybox — placed
+# at the origin as one sprawling model. Its convex hull is the whole zone, so treating it as
+# a solid collider walls off the entire floor (Khrysalis KR_Z00_Hub: KR_Z00_Barrier r~11025,
+# the dead/live tree meshes r~6600–7700). These aren't discrete obstacles and the walkable
+# navmesh already bounds movement, so they're dropped from the static-collider set.
+_MAX_STATIC_SPAN = 4000.0
+
 # Teleporter / dock-warp pads (templates named ``<WORLD>-TELEPORT-<PLACE>``) are
 # solid in-game — landing a teleport on one rubber-bands you — but their template
 # carries an *empty* render asset and an empty ``m_solidCollisionFilename``, so
@@ -126,6 +134,67 @@ def _parse_collision_xml(data: bytes) -> tuple[list | None, int, int]:
     if hull.geom_type != "Polygon" or hull.is_empty:
         return None, n_total, n_click
     return list(hull.exterior.coords), n_total, n_click
+
+
+def _collision_primitives(data: bytes) -> list:
+    """Parse a collision file into ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry
+    PER primitive, NOT a single convex hull.
+
+    This is the authoritative collision geometry (``m_solidCollisionFilename``). Keeping each
+    box/cylinder/sphere separate is the whole point: a forest's collision is 30-odd trunk
+    cylinders scattered across the zone, and a barrier's is one small box — convex-hulling them
+    (as the render-mesh path does) collapses them into a zone-spanning blob that walls off the
+    floor. Click-boxes (interaction triggers) are skipped. Each entry carries the primitive's
+    world-vertical extent so height-aware code can use it. Local model units."""
+    try:
+        from .collision_math import transformCube, toCubeVertices
+    except Exception:
+        return []
+    try:
+        root = etree.fromstring(data)
+    except Exception:
+        return []
+    out = []
+    for prim in root.findall("primitive"):
+        if "click" in (prim.get("name") or "").lower():
+            continue
+        ptype = (prim.get("type") or "").lower()
+        loc_el = prim.find("location")
+        lx = float(loc_el.get("x", 0)) if loc_el is not None else 0.0
+        ly = float(loc_el.get("y", 0)) if loc_el is not None else 0.0
+        lz = float(loc_el.get("z", 0)) if loc_el is not None else 0.0
+        rot_el = prim.find("rotation")
+        if rot_el is not None and rot_el.get("matrix"):
+            try:
+                rot = tuple(float(x) for x in rot_el.get("matrix").split())
+            except Exception:
+                rot = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        else:
+            rot = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        try:
+            if ptype == "box":
+                dim = prim.find("dimensions")
+                l, w, d = float(dim.get("l")), float(dim.get("w")), float(dim.get("d"))
+                world_pts = transformCube(toCubeVertices((l, w, d)), (lx, ly, lz), rot)
+                poly = Polygon([(p[0], p[1]) for p in world_pts]).convex_hull
+                zmin, zmax = lz - d / 2, lz + d / 2
+            elif ptype == "sphere":
+                r = float(prim.find("radius").get("value"))
+                poly = Point(lx, ly).buffer(r)
+                zmin, zmax = lz - r, lz + r
+            elif ptype in ("cylinder", "tube"):
+                el = prim.find(ptype)
+                r = float(el.get("radius"))
+                hl = float(el.get("length", 0)) / 2
+                poly = Point(lx, ly).buffer(r)
+                zmin, zmax = lz - hl, lz + hl
+            else:
+                continue  # plane/ray/mesh
+        except Exception:
+            continue
+        if poly is not None and poly.is_valid and not poly.is_empty:
+            out.append((poly, zmin, zmax))
+    return out
 
 
 def _is_teleporter_name(name: str) -> bool:
@@ -287,6 +356,7 @@ class _Resolver:
         self._collidable_cache: dict[str, bool] = {}  # entity name -> is solid obstacle
         self._hull_cache: dict[str, list | None] = {}  # asset -> local hull points
         self._coll_points_cache: dict[str, list | None] = {}  # entity name -> collision-file hull
+        self._coll_prims_cache: dict[str, list] = {}  # entity name -> per-primitive collision geometry
         self._coll_file_cache: dict[str, list | None] = {}  # collision filename -> hull points
         self._wads: dict[str, object] = {}
         self._id2name: dict[int, str] | None = None  # templateID -> template basename
@@ -559,6 +629,27 @@ class _Resolver:
             self._coll_points_cache[name] = info
         return self._coll_points_cache[name]
 
+    def collision_primitives_for(self, name: str, zone_name: str | None) -> list:
+        """The object's authoritative collision geometry as ``[(local_2d_polygon, zmin, zmax), …]``
+        — one entry per primitive, kept separate (see ``_collision_primitives``). Empty if the
+        object has no collision file or it isn't parseable (MESH collision, read error), in which
+        case the caller falls back to the render-mesh hull. Cached per entity name."""
+        if name not in self._coll_prims_cache:
+            prims = []
+            path = self._template_paths.get(name)
+            if path:
+                try:
+                    template = self._root.deserialize(path, self._serializer)
+                    fn = _solid_collision_filename(template)
+                    if fn:
+                        data = self._read_nif(fn, zone_name)
+                        if data:
+                            prims = _collision_primitives(data)
+                except Exception:
+                    prims = []
+            self._coll_prims_cache[name] = prims
+        return self._coll_prims_cache[name]
+
     def movement_collidable(self, name: str, zone_name: str | None) -> bool:
         """Whether a placed object is a *movement* obstacle (a teleport must clear it).
 
@@ -663,6 +754,7 @@ class _Resolver:
 
             placed: list = []
             precise = 0
+            oversized = 0
             try:
                 self._load_manifest()
                 archive = self._open_wad(zone_name.replace("/", "-") + ".wad")
@@ -691,22 +783,36 @@ class _Resolver:
                     if not name or not self.movement_collidable(name, zone_name):
                         continue
 
+                    def _place_local(local_poly, base_z):
+                        # local model footprint -> scale -> rotate by yaw -> world position
+                        p = scale(local_poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0))
+                        p = rotate(p, ori.z, origin=(0, 0), use_radians=True)
+                        p = translate(p, xoff=loc.x, yoff=loc.y)
+                        if p.is_valid and not p.is_empty:
+                            placed.append((base_z, p))
+
+                    # PRIMARY: the object's authoritative collision geometry — one shape per
+                    # primitive, so a forest stays 30 scattered trunk-discs and a barrier stays
+                    # one small box, instead of a single zone-spanning convex hull.
+                    prims = self.collision_primitives_for(name, zone_name)
+                    if prims:
+                        for local_poly, zmin, zmax in prims:
+                            _place_local(local_poly, loc.z + (zmin + zmax) / 2 * obj_scale)
+                        precise += 1
+                        continue
+
+                    # FALLBACK: no parseable collision file (MESH collision / read error). Use
+                    # the render-mesh hull, then a default disc. The render hull can be a bogus
+                    # zone-spanning blob for sprawling models, so the size cap still guards it here.
                     shape = None
                     points = self.footprint_points(name, zone_name)
                     if points:
                         poly = Polygon(points)
                         if poly.is_valid and not poly.is_empty:
-                            # model-local hull -> scale -> rotate by yaw -> world position
-                            poly = scale(
-                                poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0)
-                            )
+                            poly = scale(poly, xfact=obj_scale, yfact=obj_scale, origin=(0, 0))
                             poly = rotate(poly, ori.z, origin=(0, 0), use_radians=True)
                             shape = translate(poly, xoff=loc.x, yoff=loc.y)
-                            precise += 1
                     if shape is None:
-                        # collidable, but the model is a placeholder/unparsable NIF.
-                        # Teleporter pads get a wider disc (their real footprint is
-                        # ~220u) so a missing model still keeps teleports off them.
                         default_r = (
                             _TELEPORT_FALLBACK_RADIUS
                             if _is_teleporter_name(name)
@@ -715,11 +821,16 @@ class _Resolver:
                         shape = Point(loc.x, loc.y).buffer(default_r * obj_scale)
 
                     if shape is not None and not shape.is_empty:
+                        sminx, sminy, smaxx, smaxy = shape.bounds
+                        if max(smaxx - sminx, smaxy - sminy) > _MAX_STATIC_SPAN:
+                            oversized += 1
+                            continue
                         placed.append((loc.z, shape))
 
                 logger.debug(
-                    f"[entity_collision] {zone_name}: {len(placed)} static object footprints "
-                    f"({precise} precise model, {len(placed) - precise} bounding box)"
+                    f"[entity_collision] {zone_name}: {len(placed)} static collision shapes "
+                    f"from {precise} objects' collision files (+fallbacks), "
+                    f"{oversized} oversized hull fallbacks dropped"
                 )
             except Exception as e:
                 logger.warning(
