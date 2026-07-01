@@ -320,7 +320,7 @@ def _walkable_mesh(world: CollisionWorld, zone_name: str | None):
     per-zone setup cost). The whole mesh is transformed and assembled with vectorized numpy —
     no per-triangle Python object — and point-in-triangle tests run vectorized in
     ``_mesh_levels_at``. (The shapely-polygon form, ``_walkable_tris``, is kept only for
-    ``zone_bcd_walls``, which needs geometric intersection/union and is hivemind-only.)"""
+    ``zone_bcd_walls``, which needs geometric intersection/union.)"""
     if zone_name is not None and zone_name in _mesh_cache:
         return _mesh_cache[zone_name]
     chunks_v, chunks_z = [], []
@@ -861,91 +861,3 @@ def find_safe_collision_point(world: CollisionWorld, target: XYZ, player_radius:
     # target.z only if the navmesh can't be sampled.
     gz = _ground_z_at(world, zone_name, candidate.x, candidate.y)
     return XYZ(candidate.x, candidate.y, gz if gz is not None else target.z), "safe_point"
-
-
-def find_safe_magic_grid_points(
-    world: CollisionWorld,
-    target: XYZ,
-    player_radius: float,
-    factor: float,
-    extra_shapes=None,
-    zone_name: str | None = None,
-    limit: int = 8,
-):
-    """Up to ``limit`` **magic-grid** points that are walkable and clear of
-    collisions, **ranked nearest-to-``target`` first**.
-
-    Same geometry as ``find_safe_magic_grid_point`` (the single-point version is
-    just ``[0]`` of this), but returns a ranked shortlist so the caller can fall
-    through to the next candidate when a teleport is rubber-banded back. That
-    happens for colliders the file model can't see — notably warp/teleporter
-    trigger volumes (e.g. ``AZ-TELEPORT-…``), which carry no
-    ``m_solidCollisionFilename`` yet still bounce you — so geometric clearance
-    alone can't guarantee a landing; the caller verifies empirically and retries.
-
-    Returns ``(xyz_list, reason)``:
-      - ``(grid_xyz_list, "magic_grid")``  ranked on-grid points inside the
-        walkable region (buffered by ``player_radius``); may be length 1,
-      - ``([], reason)``                    no geometry / no on-grid point fits.
-
-    Pure CPU work (shapely) — run off the event loop.
-    """
-    union_mesh = _walkable_union(world, zone_name)
-    if union_mesh.is_empty:
-        return [], "no_mesh"
-
-    bcd_walls = zone_bcd_walls(world, zone_name)
-    extra_valid = filter_valid_polygons(extra_shapes) if extra_shapes else []
-    extra_coll = unary_union(extra_valid) if extra_valid else Polygon()
-    walls = unary_union([w for w in (bcd_walls, extra_coll) if not w.is_empty]) if (
-        not bcd_walls.is_empty or not extra_coll.is_empty) else Polygon()
-
-    safe_region = _walkable_minus_walls(union_mesh, walls, player_radius)
-    if safe_region is None or safe_region.is_empty:
-        return [], "no_walkable"
-
-    # Enumerate grid intersections within the region's bounds, keep those inside
-    # the walkable region, and sort by distance to the target. Bounds are
-    # (minx, miny, maxx, maxy) in the horizontal plane (shapely y == world y here).
-    minx, miny, maxx, maxy = safe_region.bounds
-    ix0, ix1 = math.ceil(minx / factor), math.floor(maxx / factor)
-    iy0, iy1 = math.ceil(miny / factor), math.floor(maxy / factor)
-
-    candidates = []
-    for ix in range(ix0, ix1 + 1):
-        px = ix * factor
-        for iy in range(iy0, iy1 + 1):
-            py = iy * factor
-            if safe_region.contains(Point(px, py)):
-                dist_sq = (px - target.x) ** 2 + (py - target.y) ** 2
-                candidates.append((dist_sq, px, py))
-
-    if not candidates:
-        return [], "no_grid_point"
-    candidates.sort(key=lambda c: c[0])
-    points = [XYZ(px, py, target.z) for _d, px, py in candidates[:limit]]
-    return points, "magic_grid"
-
-
-def find_safe_magic_grid_point(
-    world: CollisionWorld,
-    target: XYZ,
-    player_radius: float,
-    factor: float,
-    extra_shapes=None,
-    zone_name: str | None = None,
-):
-    """Nearest **magic-grid** point that is walkable and clear of collisions.
-
-    Thin wrapper over ``find_safe_magic_grid_points`` returning only the single
-    closest point as ``(xyz, reason)`` (or ``(None, reason)``). Prefer the plural
-    form when you can verify-and-retry, so an unmodeled warp volume doesn't strand
-    you. Pure CPU work (shapely) — run off the event loop.
-    """
-    points, reason = find_safe_magic_grid_points(
-        world, target, player_radius, factor,
-        extra_shapes=extra_shapes, zone_name=zone_name, limit=1,
-    )
-    if not points:
-        return None, reason
-    return points[0], reason

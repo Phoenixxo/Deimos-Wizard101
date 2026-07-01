@@ -69,10 +69,8 @@ def search_compatible_bots(zone: str, client_count) -> list[dict]:
     entries come from each General zone's registry.json (rich, with descriptions),
     falling back to the slim index.json entries if a per-zone fetch fails.
 
-    Pass ``client_count=None`` to skip the ``@clients`` filter entirely (used when
-    HiveMind is active, since the effective team size spans multiple instances and
-    both master and slave must enumerate the same unfiltered, identically-ordered
-    list so a bot's index matches on every client).
+    Pass ``client_count=None`` to skip the ``@clients`` filter entirely and return
+    every compatible bot regardless of team size.
     """
     candidates = []
     zone_data = _get_registry_json(_zone_registry_url(zone)) if zone else None

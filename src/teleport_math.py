@@ -614,58 +614,6 @@ async def collision_tp(client: Client, xyz: XYZ = None, leader_client: Client = 
 
 
 
-async def find_walkable_magic_points(client: Client, factor: float, limit: int = 8) -> list[XYZ]:
-    """Resolve up to ``limit`` walkable magic-grid points, **ranked nearest-first** —
-    HiveMind's "teleport onto the magic grid", with fallbacks.
-
-    Solves against the same zone collision geometry as ``collision_tp`` (so each
-    grid point clears every modeled wall/static collider), restricted to magic-grid
-    intersections. Returns a ranked shortlist so the caller can teleport to the
-    closest, confirm it stuck, and drop to the next when the game rubber-bands it
-    off an *un*modeled collider (e.g. a warp/teleporter trigger volume that carries
-    no solid-collision file but still bounces you). Empty list when the geometry
-    can't be solved (no collision data, no on-grid point fits).
-    """
-    try:
-        from src.collision import CollisionWorld, get_collision_data
-        from src.collision_math import find_safe_magic_grid_points
-        from src import entity_collision
-
-        origin = await client.body.position()
-        zone_name = await client.zone_name()
-        player_radius = await _resolve_player_radius(client, zone_name)
-        collision_data = await get_collision_data(client, zone_name)
-        world = CollisionWorld()
-        world.load(collision_data)
-
-        def _solve():
-            extra_shapes = entity_collision.build_zone_static_shapes(zone_name, origin.z)
-            return find_safe_magic_grid_points(
-                world, origin, player_radius, factor,
-                extra_shapes=extra_shapes, zone_name=zone_name, limit=limit,
-            )
-
-        grid_points, reason = await asyncio.to_thread(_solve)
-        if grid_points:
-            logger.debug(
-                f"[magic_grid] {client.title}: {len(grid_points)} grid candidate(s) ({reason}); "
-                f"nearest -> {grid_points[0]}"
-            )
-            return grid_points
-        logger.debug(f"[magic_grid] {client.title}: no on-grid solution ({reason})")
-    except Exception as e:
-        logger.debug(f"[magic_grid] {client.title}: solve errored ({e!r})")
-    return []
-
-
-async def find_walkable_magic_point(client: Client, factor: float) -> XYZ | None:
-    """Nearest walkable magic-grid point, or ``None``. Thin single-point wrapper over
-    ``find_walkable_magic_points`` (prefer the plural form so an unmodeled warp volume
-    can be skipped via verify-and-retry)."""
-    points = await find_walkable_magic_points(client, factor, limit=1)
-    return points[0] if points else None
-
-
 def calc_chunks(points: list[XYZ], entity_distance: float = 3147.0) -> list[XYZ]:
     # Returns a list of center points of "chunks" of the map, as defined by the input points.
     min_pos = XYZ(0, 0, 0)

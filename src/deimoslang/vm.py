@@ -67,12 +67,6 @@ class UntilInfo:
         self.stack_size = stack_size
 
 
-# Optional async hook invoked once per VM step (set by Deimos to HiveMind's
-# liveness check). Left None when HiveMind isn't wired in, so the VM has no
-# dependency on it. The callee is responsible for being cheap/throttled.
-peer_check_hook = None
-
-
 class VM:
     def __init__(self, clients: list[Client]):
         self._clients = upgrade_clients(clients) # guarantee it's usable
@@ -1620,11 +1614,6 @@ class VM:
         if not self.running:
             return
         await asyncio.sleep(0)
-        if peer_check_hook is not None:
-            try:
-                await peer_check_hook()
-            except Exception:
-                pass  # HiveMind liveness must never break bot execution
         self.current_task = self._scheduler.get_current_task()
         await self._process_untils() # must run before the next instruction is fetched
         if not self.current_task.running:
