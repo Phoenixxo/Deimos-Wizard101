@@ -28,6 +28,7 @@ sigil=传送阵
 questing=自动任务
 auto_pet=自动宠物
 auto_potion=自动药水
+no_drops=禁用掉落
 
 # 快捷键
 hotkeys_label=快捷键

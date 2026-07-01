@@ -28,6 +28,7 @@ sigil=Sigil
 questing=Questing
 auto_pet=Auto Pet
 auto_potion=Auto Potion
+no_drops=No Drops
 
 # Hotkeys
 hotkeys_label=Hotkeys

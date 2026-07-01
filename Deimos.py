@@ -256,6 +256,7 @@ hotkey_status = False
 questing_status = False
 auto_pet_status = False
 auto_potion_status = False
+drops_disabled_status = False
 side_quest_status = False
 tool_status = True
 original_client_locations = dict()
@@ -1018,6 +1019,40 @@ async def main():
                     deimosgui.GUICommand(
                         deimosgui.GUICommandType.UpdateWindow,
                         ("Auto PotionStatus", "Disabled"),
+                    )
+                )
+
+    async def toggle_drops_hotkey():
+        global drops_disabled_status
+        global gui_send_queue
+
+        if not freecam_status:
+            drops_disabled_status ^= True
+
+            if drops_disabled_status:
+                logger.debug("Drops hotkey pressed, disabling drops.")
+                for client in walker.clients:
+                    try:
+                        await client.disable_drops()
+                    except Exception as e:
+                        logger.debug(f"Failed to disable drops: {e}")
+                gui_send_queue.put(
+                    deimosgui.GUICommand(
+                        deimosgui.GUICommandType.UpdateWindow,
+                        ("No DropsStatus", "Enabled"),
+                    )
+                )
+            else:
+                logger.debug("Drops hotkey pressed, enabling drops.")
+                for client in walker.clients:
+                    try:
+                        await client.enable_drops()
+                    except Exception as e:
+                        logger.debug(f"Failed to enable drops: {e}")
+                gui_send_queue.put(
+                    deimosgui.GUICommand(
+                        deimosgui.GUICommandType.UpdateWindow,
+                        ("No DropsStatus", "Disabled"),
                     )
                 )
 
@@ -2359,6 +2394,8 @@ async def main():
                                     await toggle_auto_pet_hotkey()
                                 case GUIKeys.toggle_auto_potion:
                                     await toggle_auto_potion_hotkey()
+                                case GUIKeys.toggle_drops:
+                                    await toggle_drops_hotkey()
                                 case GUIKeys.toggle_freecam:
                                     await toggle_freecam_hotkey()
                                 # case 'Side Quests':

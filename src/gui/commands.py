@@ -118,6 +118,7 @@ class GUIKeys:
     toggle_questing = "toggle_questing"
     toggle_auto_pet = "toggleautopet"
     toggle_auto_potion = "toggleautopotion"
+    toggle_drops = "toggledrops"
     toggle_freecam = "togglefreecam"
     toggle_camera_collision = "togglecameracollision"
     toggle_show_expanded_logs = "toggleshowexpandedlogs"

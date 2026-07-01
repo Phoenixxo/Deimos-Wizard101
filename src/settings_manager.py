@@ -101,6 +101,7 @@ DEFAULT_HOTKEYS = {
     "kill_tool": {"key": "F9", "modifiers": []},
     "toggle_auto_pet": None,
     "toggle_auto_potion": None,
+    "toggle_drops": None,
 }
 
 # Maps ini key names -> action_id
