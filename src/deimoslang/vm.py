@@ -223,7 +223,10 @@ class VM:
     async def _fetch_tracked_quest_text(self, client: SprintyClient) -> str:
         quest = await self._fetch_tracked_quest(client)
         name_key = await quest.name_lang_key()
-        name: str = await client.cache_handler.get_langcode_name(name_key)
+        if name_key == "Quest Finder":
+            name = name_key
+        else:
+            name: str = await client.cache_handler.get_langcode_name(name_key)
         return name.lower().strip()
 
     async def _fetch_quests(self, client: SprintyClient) -> list[tuple[int, QuestData]]:
