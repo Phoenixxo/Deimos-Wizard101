@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 ## [Discord](https://discord.gg/59UrPJwYDm)
 
 # Tutorial
