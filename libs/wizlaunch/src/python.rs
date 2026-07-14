@@ -193,30 +193,89 @@ fn launch_instances(
             steam::ensure_steam_appid(&game_path)?;
         }
 
-        let mut results = HashMap::new();
         let mut known: std::collections::HashSet<isize> =
             launcher::get_wizard_handles().into_iter().collect();
 
+        // Launch simultaneously: spawn EVERY client up front — regardless of Steam
+        // mode — so they all load in parallel (the slow part). Each account's Steam
+        // flag only affects the `-ST` spawn argument, which is known per-account, so
+        // there's no reason to serialize the modes. We record each spawned PID and,
+        // once its window appears, pair it back to the exact account by that PID (the
+        // client doesn't re-exec, so the window's owning process is the one we
+        // spawned). That keeps account↔window pairing exact even when a batch mixes
+        // Steam and non-Steam accounts.
+        //
+        // (The previous version processed one Steam-mode group at a time, fully
+        // launching + logging in group A before spawning group B — which serialized
+        // any mixed batch into back-to-back launches.)
+        let mut pid_to_nick: HashMap<u32, String> = HashMap::new();
+        let mut spawn_order: Vec<String> = Vec::with_capacity(nicknames.len());
         for (nickname, &steam) in nicknames.iter().zip(steam_flags.iter()) {
-            launcher::launch_game(&game_path, &login_server, steam)?;
-
-            match launcher::wait_for_new_handle(&known, timeout_secs) {
-                Ok(handle) => {
-                    known.insert(handle);
-
-                    launcher::enable_window(handle, false);
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-
-                    let (username, password) = credential_store::read_credential(nickname)?;
-                    login::login_to_instance(handle, &username, &password)?;
-
-                    launcher::enable_window(handle, true);
-                    results.insert(nickname.clone(), handle);
+            match launcher::launch_game(&game_path, &login_server, steam) {
+                Ok(pid) => {
+                    pid_to_nick.insert(pid, nickname.clone());
+                    spawn_order.push(nickname.clone());
                 }
-                Err(e) => {
-                    eprintln!("Failed to launch '{nickname}': {e}");
+                Err(e) => eprintln!("Failed to spawn client '{nickname}': {e}"),
+            }
+        }
+        let want = spawn_order.len();
+
+        // Collect the new windows as clients finish loading (in parallel), pairing
+        // each to its account by the spawning PID.
+        let mut handle_for_nick: HashMap<String, isize> = HashMap::new();
+        let mut leftover_handles: Vec<isize> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while handle_for_nick.len() < want && std::time::Instant::now() < deadline {
+            for h in launcher::get_wizard_handles() {
+                if !known.insert(h) {
+                    continue; // already seen (pre-existing or handled)
+                }
+                let pid = launcher::get_window_pid(h);
+                match pid_to_nick.remove(&pid) {
+                    Some(nick) => {
+                        handle_for_nick.insert(nick, h);
+                    }
+                    None => leftover_handles.push(h),
                 }
             }
+            if handle_for_nick.len() < want {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+
+        // Fallback: if any window couldn't be matched by PID (unexpected — e.g. the
+        // client re-execed), pair leftover windows to still-unmatched accounts in
+        // spawn order so a launched client is never silently dropped.
+        if handle_for_nick.len() < want && !leftover_handles.is_empty() {
+            let mut leftovers = leftover_handles.into_iter();
+            for nick in &spawn_order {
+                if handle_for_nick.contains_key(nick) {
+                    continue;
+                }
+                match leftovers.next() {
+                    Some(h) => {
+                        handle_for_nick.insert(nick.clone(), h);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // Freeze input on every window, let them finish initializing (they've been
+        // loading in parallel), then log each in. Login is a memory write (no window
+        // focus), so any-order logins are safe.
+        for &handle in handle_for_nick.values() {
+            launcher::enable_window(handle, false);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let mut results = HashMap::new();
+        for (nickname, handle) in handle_for_nick {
+            let (username, password) = credential_store::read_credential(&nickname)?;
+            login::login_to_instance(handle, &username, &password)?;
+            launcher::enable_window(handle, true);
+            results.insert(nickname, handle);
         }
 
         Ok::<HashMap<String, isize>, VaultError>(results)
@@ -241,7 +300,7 @@ fn get_wizard_handles() -> PyResult<Vec<isize>> {
 
 #[pymodule]
 pub fn wizlaunch(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.2.0")?;
+    m.add("__version__", "0.3.1")?;  // 0.3.1: spawn all clients up front (mixed Steam modes no longer serialize); pair windows to accounts by PID
     m.add_function(wrap_pyfunction!(prompt_save_account, m)?)?;
     m.add_function(wrap_pyfunction!(delete_account, m)?)?;
     m.add_function(wrap_pyfunction!(list_accounts, m)?)?;

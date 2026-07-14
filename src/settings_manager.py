@@ -48,6 +48,9 @@ DEFAULT_SETTINGS = {
     "client_resizing": True,
     # [launcher]
     "remember_chosen_clients": False,
+    # Verify/patch game files (via the bundled wizpatch binary) before launching.
+    # Opt-in: adds a CRC check + downloads over the network to each launch.
+    "verify_patch_files": False,
     # [updates]
     "check_for_updates": True,
     "auto_install_updates": False,

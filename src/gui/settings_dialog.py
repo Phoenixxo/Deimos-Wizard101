@@ -355,6 +355,7 @@ def show_settings_dialog(ctx):
     launcher_form.setSpacing(4)
 
     _add_checkbox(launcher_form, 'remember_chosen_clients', 'setting_remember_chosen_clients')
+    _add_checkbox(launcher_form, 'verify_patch_files', 'setting_verify_patch_files')
 
     layout.addWidget(launcher_group)
 

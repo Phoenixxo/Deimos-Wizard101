@@ -297,18 +297,26 @@ def build_launcher_tab(ctx):
 
         return row
 
-    def _build_hooking_client_widget(handle: int, nick: str = None):
+    def _build_hooking_client_widget(handle: int, nick: str = None, status_text: str = None):
         row = QWidget(hooked_clients_list)
         row.setStyleSheet("background: transparent;")
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(2, 0, 2, 0)
         row_layout.setSpacing(4)
 
+        _dim = "color: rgba(255,255,255,120);" if ctx.theme in ('black', 'dark') else "color: rgba(0,0,0,120);"
         display = nick if nick else f"Wizard101 ({handle})"
         lbl = QLabel(display)
         lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        lbl.setStyleSheet("color: rgba(255,255,255,120);" if ctx.theme in ('black', 'dark') else "color: rgba(0,0,0,120);")
+        lbl.setStyleSheet(_dim)
         row_layout.addWidget(lbl, 1)
+
+        # Stage text (Verifying / Patching / Launching / Hooking) next to the spinner.
+        # A little right padding gives the spinner some breathing room from the text.
+        if status_text:
+            status_lbl = QLabel(status_text)
+            status_lbl.setStyleSheet(_dim + " padding-right: 4px;")
+            row_layout.addWidget(status_lbl)
 
         row_layout.addWidget(spinning_loader_widget(ctx))
 
@@ -328,7 +336,7 @@ def build_launcher_tab(ctx):
             h = info['handle']
             if h in hooking_backend:
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                row_widget = _build_hooking_client_widget(h, info.get('account_nick'))
+                row_widget = _build_hooking_client_widget(h, info.get('account_nick'), tl('status_hooking'))
             else:
                 item.setData(Qt.ItemDataRole.UserRole, h)
                 row_widget = _build_hooked_client_widget(info)
@@ -340,9 +348,22 @@ def build_launcher_tab(ctx):
                 item = QListWidgetItem()
                 item.setSizeHint(QSize(0, 28))
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                row_widget = _build_hooking_client_widget(h)
+                row_widget = _build_hooking_client_widget(h, None, tl('status_hooking'))
                 hooked_clients_list.addItem(item)
                 hooked_clients_list.setItemWidget(item, row_widget)
+
+        # Pre-spawn placeholders: accounts mid launch (verifying/patching/launching),
+        # keyed by nickname since no window handle exists yet. They hand off to the
+        # handle-keyed "hooking" spinner above once the client's window appears.
+        for entry in _last_hooked_data.get('launching', []):
+            nick = entry.get('nick')
+            status = entry.get('status', 'launching')
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 28))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            row_widget = _build_hooking_client_widget(None, nick, tl(f'status_{status}'))
+            hooked_clients_list.addItem(item)
+            hooked_clients_list.setItemWidget(item, row_widget)
 
         remaining = [h for h in unmanaged if h not in _hooking_handles]
 

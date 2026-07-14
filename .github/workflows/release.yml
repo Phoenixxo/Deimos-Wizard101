@@ -103,6 +103,12 @@ jobs:
         cargo build --release --manifest-path libs/updater/Cargo.toml
         ls -la libs/updater/target/release/deimos-updater.exe
 
+    - name: Build wizpatch patcher (Rust)
+      shell: bash
+      run: |
+        cargo build --release --manifest-path libs/wizpatch/Cargo.toml
+        ls -la libs/wizpatch/target/release/wizpatch.exe
+
     - name: Build with PyInstaller
       run: |
         uv run --group dev pyinstaller --noconfirm --clean Deimos.spec

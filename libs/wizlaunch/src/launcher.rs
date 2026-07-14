@@ -54,7 +54,11 @@ fn normalize_path(path: &str) -> PathBuf {
 /// When `steam` is true, the client is started in Steam mode (`-ST`); callers
 /// are responsible for ensuring Steam is ready and `steam_appid.txt` is present
 /// (see [`crate::steam`]).
-pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<(), VaultError> {
+///
+/// Returns the spawned process ID. The client doesn't re-exec, so this PID owns
+/// the resulting game window — callers can match a new window back to the exact
+/// spawn via [`get_window_pid`].
+pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<u32, VaultError> {
     let bin_dir = normalize_path(game_path).join("Bin");
     let exe = bin_dir.join("WizardGraphicalClient.exe");
 
@@ -75,14 +79,15 @@ pub fn launch_game(game_path: &str, login_server: &str, steam: bool) -> Result<(
     if steam {
         cmd.arg("-ST");
     }
-    cmd.arg("-L")
+    let child = cmd
+        .arg("-L")
         .arg(host)
         .arg(port)
         .current_dir(&bin_dir)
         .spawn()
         .map_err(|e| VaultError::LaunchFailed(e.to_string()))?;
 
-    Ok(())
+    Ok(child.id())
 }
 
 /// Wait for a new Wizard101 window to appear that wasn't in `before_handles`.
@@ -106,6 +111,15 @@ pub fn wait_for_new_handle(
     Err(VaultError::LaunchTimeout(
         "No new wizard window detected".to_string(),
     ))
+}
+
+/// Get the process ID that owns a window handle (0 if the handle is invalid).
+pub fn get_window_pid(hwnd: isize) -> u32 {
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd_from_isize(hwnd), Some(&mut pid));
+    }
+    pid
 }
 
 /// Disable or enable a window (prevents user input during login).

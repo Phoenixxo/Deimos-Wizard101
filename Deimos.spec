@@ -14,8 +14,16 @@ try:
          os.path.join("libs", "updater", "Cargo.toml")],
         check=False,
     )
+    # The wizpatch game-file patcher (bundled and invoked as a subprocess for
+    # the optional "verify/patch before launch" feature). Its default features
+    # include the `cli` bin target.
+    subprocess.run(
+        ["cargo", "build", "--release", "--manifest-path",
+         os.path.join("libs", "wizpatch", "Cargo.toml")],
+        check=False,
+    )
 except FileNotFoundError:
-    print("WARNING: cargo not found; skipping update-helper build.")
+    print("WARNING: cargo not found; skipping update-helper / wizpatch build.")
 
 # wizsprinter installs into the wizwalker.extensions namespace at runtime via a
 # sys.path scan in wizwalker/extensions/__init__.py. PyInstaller's static
@@ -60,6 +68,15 @@ if os.path.exists(_updater_exe):
     datas += [(_updater_exe, '.')]
 else:
     print(f"WARNING: {_updater_exe} not found; self-updater will be unavailable in this build.")
+
+# Embed the wizpatch game-file patcher (built from libs/wizpatch). If it's
+# missing, the bundle still works — the "verify/patch before launch" option
+# simply no-ops with a warning.
+_wizpatch_exe = os.path.join('libs', 'wizpatch', 'target', 'release', 'wizpatch.exe')
+if os.path.exists(_wizpatch_exe):
+    datas += [(_wizpatch_exe, '.')]
+else:
+    print(f"WARNING: {_wizpatch_exe} not found; game-file patching will be unavailable in this build.")
 
 
 a = Analysis(

@@ -33,7 +33,7 @@ from wizwalker.memory.memory_objects.camera_controller import (
 from wizwalker.memory.memory_objects.window import Window
 from wizwalker.utils import get_all_wizard_handles, get_foreground_window
 
-from src import bot_registry, discsdk, updater
+from src import bot_registry, discsdk, updater, wizpatch_runner
 from src import gui as deimosgui
 from src.auto_pet import nomnom
 from src.client_resizing import ClientResizingManager
@@ -646,6 +646,9 @@ async def main():
     global tool_status
     global original_client_locations
     global listener
+    logger.info(
+        f"Deimos v{tool_version} | wizlaunch v{getattr(wizlaunch, '__version__', '?')}"
+    )
     listener = HotkeyListener()
     foreground_client: Client = None
     background_clients = []
@@ -1635,6 +1638,10 @@ async def main():
     released_handles: set[int] = set()
     # Handles currently mid-hook (activate_hooks in progress)
     _hooking_in_progress: set[int] = set()
+    # Nickname -> pre-spawn launch stage ("verifying"/"patching"/"launching") for the
+    # client-manager placeholder rows shown before a window handle exists. Owned by the
+    # main loop; auto-cleared once the account's client hooks (its walker.Client appears).
+    launching_status: dict[str, str] = {}
 
     def _mask_uid(uid) -> str:
         s = str(uid)
@@ -1660,7 +1667,11 @@ async def main():
         all_handles = set(get_all_wizard_handles())
         stale = [h for h in launched_account_map if h not in all_handles]
         for h in stale:
-            launched_account_map.pop(h)
+            nick = launched_account_map.pop(h)
+            # A launched client whose window vanished before it hooked: clear its
+            # pre-spawn placeholder so it doesn't spin forever.
+            if nick:
+                launching_status.pop(nick, None)
             _hooking_in_progress.discard(h)
             window_config_applied.discard(h)
             client_resizing_manager.drop_keep_alive(h)
@@ -1682,11 +1693,18 @@ async def main():
         # Unmanaged = running wizard handles not currently managed
         managed = set(walker._managed_handles)
         unmanaged = sorted(all_handles - managed)
+        # Drop launch placeholders whose account is now hooked (its window exists and
+        # renders as a real/hooking row), so the pre-spawn row hands off seamlessly.
+        hooked_nicks = {info["account_nick"] for info in hooked if info["account_nick"]}
+        for n in list(launching_status):
+            if n in hooked_nicks:
+                launching_status.pop(n, None)
         return {
             "hooked": hooked,
             "unmanaged": unmanaged,
             "managed_accounts": sorted(managed_accounts),
             "hooking": sorted(_hooking_in_progress),
+            "launching": [{"nick": n, "status": s} for n, s in launching_status.items()],
         }
 
     def _send_hooked_clients_update():
@@ -3487,12 +3505,60 @@ async def main():
                                 logger.info(
                                     f"Launching {len(nicknames)} instance(s)..."
                                 )
+                            verify = bool(settings.get_setting("verify_patch_files"))
+                            # Show a client-manager placeholder per launching account
+                            # immediately, so the user sees a spinner the moment they click.
+                            if nicknames:
+                                for n in nicknames:
+                                    launching_status[n] = "verifying" if verify else "launching"
+                                _send_hooked_clients_update()
                             # Clear any released handles so newly launched clients get auto-hooked
                             released_handles.clear()
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.ClearLaunchCheckboxes
                                 )
+                            )
+                            # Optionally verify/patch game files before spawning the client.
+                            # Opt-in ("verify_patch_files"); a failure only warns — we still launch.
+                            if nicknames and verify:
+                                loop = asyncio.get_running_loop()
+                                # The patcher runs on a worker thread and only flips this slot
+                                # (atomic). The main loop polls it and pushes status updates from
+                                # here, where touching walker/GUI state is safe.
+                                phase = {"stage": "verifying"}
+                                fut = loop.run_in_executor(
+                                    None,
+                                    lambda: wizpatch_runner.patch_game_files(
+                                        game_path,
+                                        status_cb=lambda s: phase.__setitem__("stage", s),
+                                    ),
+                                )
+                                last_stage = "verifying"
+                                while not fut.done():
+                                    if phase["stage"] != last_stage:
+                                        last_stage = phase["stage"]
+                                        for n in nicknames:
+                                            if n in launching_status:
+                                                launching_status[n] = last_stage
+                                        _send_hooked_clients_update()
+                                    await asyncio.sleep(0.1)
+                                if not await fut:
+                                    logger.warning(
+                                        "[wizpatch] game-file verification failed or unavailable; "
+                                        "launching with existing files."
+                                    )
+                            # Spawn+login stage.
+                            if nicknames:
+                                for n in nicknames:
+                                    if n in launching_status:
+                                        launching_status[n] = "launching"
+                                _send_hooked_clients_update()
+                            results = {}
+                            _t_launch = time.time()
+                            logger.info(
+                                f"launch_instances (wizlaunch v{getattr(wizlaunch, '__version__', '?')}): "
+                                f"{len(nicknames)} client(s)..."
                             )
                             try:
                                 results = await asyncio.to_thread(
@@ -3501,8 +3567,23 @@ async def main():
                                 for nickname, handle in results.items():
                                     launched_account_map[handle] = nickname
                                     logger.info(f"Launched and logged in '{nickname}'.")
+                                logger.info(
+                                    f"launch_instances returned {len(results)}/{len(nicknames)} "
+                                    f"in {time.time() - _t_launch:.1f}s"
+                                )
                             except Exception as e:
                                 logger.error(f"Error launching instances: {e}")
+                            finally:
+                                # Launched accounts keep their "launching" placeholder until
+                                # their client hooks (auto-cleared in _build_hooked_clients_info).
+                                # Drop placeholders for any that never got a handle so they don't
+                                # linger as a stuck spinner.
+                                launched = set(results)
+                                for n in nicknames:
+                                    if n not in launched:
+                                        launching_status.pop(n, None)
+                                if nicknames:
+                                    _send_hooked_clients_update()
 
                         case deimosgui.GUICommandType.ReorderAccounts:
                             wizlaunch.reorder_accounts(com.data)
