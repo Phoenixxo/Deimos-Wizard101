@@ -2040,6 +2040,7 @@ async def main():
         global auto_pet_task
         global highlight_task
         global entity_stream_task
+        global client_resizing  # assigned in the settings-update handler below; read at line ~2299
         enemy_stats = []
         current_pos = None
         current_rotation = None
@@ -3826,7 +3827,6 @@ async def main():
                                 automatic_team_based_combat, \
                                 discard_duplicate_cards
                             global check_for_updates, auto_install_updates
-                            global client_resizing
                             settings_dict = com.data
                             for key, value in settings_dict.items():
                                 match key:
