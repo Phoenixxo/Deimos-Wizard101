@@ -1638,6 +1638,11 @@ async def main():
     released_handles: set[int] = set()
     # Handles currently mid-hook (activate_hooks in progress)
     _hooking_in_progress: set[int] = set()
+    # Handle -> the in-flight task waiting for that client's hooks to come ready.
+    # Each vault-launched client hooks in its OWN task so one still sitting at
+    # character select (player_struct not written yet) can't block the detection
+    # loop or the other clients' hooking. Cancelled if its window closes first.
+    _hooking_tasks: dict[int, "asyncio.Task"] = {}
     # Nickname -> pre-spawn launch stage ("verifying"/"patching"/"launching") for the
     # client-manager placeholder rows shown before a window handle exists. Owned by the
     # main loop; auto-cleared once the account's client hooks (its walker.Client appears).
@@ -1673,6 +1678,11 @@ async def main():
             if nick:
                 launching_status.pop(nick, None)
             _hooking_in_progress.discard(h)
+            # Window closed before its wizard was selected: cancel the pending
+            # hook-wait task so it doesn't spin reading a dead process forever.
+            _pending_hook = _hooking_tasks.pop(h, None)
+            if _pending_hook is not None and not _pending_hook.done():
+                _pending_hook.cancel()
             window_config_applied.discard(h)
             client_resizing_manager.drop_keep_alive(h)
 
@@ -1778,6 +1788,45 @@ async def main():
         if client_to_boost and client_to_boost in client.title:
             global questing_leader_pid
             questing_leader_pid = client.process_id
+
+    async def _auto_hook_client(nc, handle):
+        """Wait for a vault-launched client's hooks to come ready, then finish
+        registering it. Runs as its own task (one per client) so a client still
+        at character select — whose player_struct isn't written until a wizard is
+        selected — doesn't block the detection loop or the other clients' hooking.
+        It completes whenever THIS client's wizard is selected, however long that
+        takes; only a closed window (task cancellation) or a real error aborts it."""
+        try:
+            try:
+                await nc.activate_hooks()
+            except wizwalker.errors.HookAlreadyActivated:
+                pass
+            await _init_client_attrs(nc)
+            nick = launched_account_map.get(handle)
+            logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({nick}).")
+            _send_hooked_clients_update()
+            _restart_always_on_tasks()
+            _restart_active_toggle_tasks()
+        except asyncio.CancelledError:
+            # Window closed before its wizard was selected — roll back registration
+            # so the handle is clean (re-detected fresh if the window reappears).
+            if handle in walker._managed_handles:
+                walker._managed_handles.remove(handle)
+            if nc in walker.clients:
+                walker.clients.remove(nc)
+            raise
+        except Exception as e:
+            logger.error(
+                f"Failed to auto-hook vault-launched client (handle {handle}): {e}"
+            )
+            # Unmanage it so the detection loop retries on a later tick.
+            if handle in walker._managed_handles:
+                walker._managed_handles.remove(handle)
+            if nc in walker.clients:
+                walker.clients.remove(nc)
+        finally:
+            _hooking_in_progress.discard(handle)
+            _hooking_tasks.pop(handle, None)
 
     async def handle_gui():
 
@@ -2218,10 +2267,15 @@ async def main():
                 managed = set(walker._managed_handles)
                 unmanaged = all_handles - managed - released_handles
 
-                # Auto-hook any unmanaged handle that was launched via the vault (in launch order)
-                hooked_any = False
+                # Auto-hook any unmanaged handle that was launched via the vault (in
+                # launch order). Register each synchronously (so titles/handles stay
+                # consistent), then hand the blocking hook-wait to a per-client task —
+                # a client still at character select no longer stalls the others or the
+                # detection loop; each finishes whenever ITS wizard is selected.
                 launch_order = [h for h in launched_account_map if h in unmanaged]
                 for handle in launch_order:
+                    if handle in _hooking_tasks:
+                        continue  # already waiting on this handle's hooks
                     walker._managed_handles.append(handle)
                     nc = walker.client_cls(handle)
                     walker.clients.append(nc)
@@ -2237,48 +2291,25 @@ async def main():
                     _send_hooked_clients_update()
                     # Apply the saved window/resolution/border config NOW (before
                     # activate_hooks / player select) — it needs no in-game camera.
-                    # Once per handle; the camera frustum is corrected later by the
-                    # client-resizing tick loop when the camera exists. Off-thread so
-                    # it never blocks client detection.
+                    # Gated on the client-resizing setting so the whole resolution/
+                    # resize/window-hook subsystem is one optional switch. Once per
+                    # handle; the camera frustum is corrected later by the tick loop
+                    # when the camera exists. Off-thread so it never blocks detection.
                     _wc_nick = launched_account_map.get(handle)
-                    if _wc_nick and handle not in window_config_applied:
+                    if client_resizing and _wc_nick and handle not in window_config_applied:
                         window_config_applied.add(handle)
                         asyncio.create_task(
                             _apply_account_window_config(nc, handle, _wc_nick)
                         )
-                    try:
-                        await nc.activate_hooks()
-                        await _init_client_attrs(nc)
-                        logger.info(
-                            f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]})."
-                        )
-                        hooked_any = True
-                    except wizwalker.errors.HookAlreadyActivated:
-                        await _init_client_attrs(nc)
-                        logger.info(
-                            f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked)."
-                        )
-                        hooked_any = True
-                    except Exception as e:
-                        logger.error(
-                            f"Failed to auto-hook vault-launched client (handle {handle}): {e}"
-                        )
-                        walker._managed_handles.remove(handle)
-                        walker.clients.remove(nc)
-                    finally:
-                        _hooking_in_progress.discard(handle)
+                    _hooking_tasks[handle] = asyncio.create_task(
+                        _auto_hook_client(nc, handle)
+                    )
 
-                if hooked_any:
+                # Reflect external window open/close in the manager UI.
+                current_handle_count = len(all_handles)
+                if current_handle_count != last_known_handle_count:
+                    last_known_handle_count = current_handle_count
                     _send_hooked_clients_update()
-                    last_known_handle_count = len(get_all_wizard_handles())
-                    _restart_always_on_tasks()
-                    _restart_active_toggle_tasks()
-                else:
-                    # Check if handle count changed (wizard window opened/closed externally)
-                    current_handle_count = len(all_handles)
-                    if current_handle_count != last_known_handle_count:
-                        last_known_handle_count = current_handle_count
-                        _send_hooked_clients_update()
 
             # Poll for new clients when in paused state (waiting for reconnection)
             if paused_task_names and len(walker.clients) < previous_client_count:

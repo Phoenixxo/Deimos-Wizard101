@@ -419,10 +419,14 @@ class ClientResizingManager:
         # because they aren't hooked yet (not in walker.clients); they're kept
         # alive until the window closes (drop_keep_alive on stale cleanup / kill).
         self._keep_alive: set[int] = set()
-        # Serializes forcer installation so the tick loop and a launch-time
-        # apply can't both install a forcer for the same client (double setMode
-        # hook -> the second one's pattern scan fails).
-        self._install_lock = asyncio.Lock()
+        # PER-CLIENT install locks (keyed by hwnd). A lock only needs to stop the
+        # tick loop and a launch-time apply from BOTH installing a hook for the SAME
+        # client (a double setMode hook -> the second one's pattern scan fails). A
+        # single global lock would also serialize installs across DIFFERENT clients —
+        # and each install pattern-scans + waits up to ~3s for the video manager — so
+        # N clients would hook back-to-back. Per-hwnd locks let distinct clients hook
+        # concurrently while still guarding each client against a double install.
+        self._install_locks: dict[int, asyncio.Lock] = {}
         # Latched on app close / pre-update relaunch so a tick that is still in
         # flight (or fires during cancellation) can't re-arm hooks after we've torn
         # them down — the shutdown teardown must be the last word.
@@ -431,6 +435,16 @@ class ClientResizingManager:
     def drop_keep_alive(self, hwnd: int):
         """Stop protecting a launch-managed handle (window closed / client killed)."""
         self._keep_alive.discard(hwnd)
+
+    def _install_lock(self, hwnd: int) -> asyncio.Lock:
+        """The per-client install lock for `hwnd` (created on first use). Creating
+        the entry is a single synchronous dict op, so concurrent callers for the same
+        hwnd resolve to the same lock without a race."""
+        lock = self._install_locks.get(hwnd)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._install_locks[hwnd] = lock
+        return lock
 
     async def tick(self, clients, enabled: bool):
         if self._shutdown:
@@ -442,12 +456,39 @@ class ClientResizingManager:
             return
         self._enabled = True
 
-        live = set()
+        # Collect the live windows first, then service them all CONCURRENTLY so a
+        # slow install on one client (hook pattern scan + up to ~3s waiting for the
+        # video manager to be captured) doesn't hold up the others — every client's
+        # hooks come up in parallel instead of back-to-back. Per-client state is keyed
+        # by hwnd, so concurrent servicing never touches another client's entries.
+        live_pairs = []
         for client in clients:
             hwnd = getattr(client, "window_handle", 0)
             if not hwnd or not user32.IsWindow(hwnd):
                 continue
-            live.add(hwnd)
+            live_pairs.append((client, hwnd))
+        live = {hwnd for _, hwnd in live_pairs}
+
+        if live_pairs:
+            await asyncio.gather(
+                *(self._service_client(client, hwnd) for client, hwnd in live_pairs)
+            )
+
+        # A kept-alive window that has since closed must stop being protected.
+        for hwnd in list(self._keep_alive):
+            if not user32.IsWindow(hwnd):
+                self._keep_alive.discard(hwnd)
+
+        for hwnd in set(self._forcers) | set(self._borders) | set(_armed):
+            if hwnd not in live and hwnd not in self._keep_alive:
+                await self._teardown(hwnd)
+
+    async def _service_client(self, client, hwnd: int):
+        """Install/heal one client's resize hooks and correct its aspect for a single
+        tick. Every touched piece of state is keyed by this hwnd, so it is safe to run
+        concurrently for several clients; a failure is logged and isolated so it never
+        aborts the other clients' servicing."""
+        try:
             await self._ensure_forcer(client, hwnd)
             await self._ensure_border(client, hwnd)
             if hwnd in _borderless:
@@ -466,20 +507,13 @@ class ClientResizingManager:
             # Re-assert the aspect fix on every controller each tick so switching
             # cameras (free / combat) reflects it within a tick, even with no resize.
             await correct_aspect(client, hwnd)
-
-        # A kept-alive window that has since closed must stop being protected.
-        for hwnd in list(self._keep_alive):
-            if not user32.IsWindow(hwnd):
-                self._keep_alive.discard(hwnd)
-
-        for hwnd in set(self._forcers) | set(self._borders) | set(_armed):
-            if hwnd not in live and hwnd not in self._keep_alive:
-                await self._teardown(hwnd)
+        except Exception as e:
+            logger.opt(exception=e).debug(f"[client_resizing] service tick error {hwnd:#x}")
 
     async def _ensure_forcer(self, client, hwnd: int):
         if ResolutionForcer is None or hwnd in self._forcers:
             return
-        async with self._install_lock:
+        async with self._install_lock(hwnd):
             if hwnd in self._forcers:          # re-check after acquiring the lock
                 return
             try:
@@ -541,7 +575,7 @@ class ClientResizingManager:
         # loop can't both install the hook for the same client.
         if WindowResizeBorder is None or hwnd in self._borders:
             return
-        async with self._install_lock:
+        async with self._install_lock(hwnd):
             if hwnd in self._borders:          # re-check after acquiring the lock
                 return
             try:
@@ -626,6 +660,10 @@ class ClientResizingManager:
         _borderless.pop(hwnd, None)         # guard against a leak if window is gone
         self._pending.pop(hwnd, None)
         _native_vert.pop(hwnd, None)
+        # Drop the per-client install lock unless an install is mid-flight holding it.
+        lk = self._install_locks.get(hwnd)
+        if lk is not None and not lk.locked():
+            self._install_locks.pop(hwnd, None)
 
     async def _teardown_all(self):
         for hwnd in set(self._forcers) | set(self._borders) | set(_armed) | set(_borderless):
