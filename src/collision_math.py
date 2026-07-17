@@ -479,6 +479,19 @@ def zone_bcd_walls(world: CollisionWorld, zone_name: str | None):
 
 GRID_SPACING = 100.0  # hex node centre-to-centre distance, world units
 
+# When the target's own XY isn't walkable, relocate to the nearest walkable node ranked by
+# ``dxy + Z_RANK_WEIGHT * |Δz|`` so a node on the target's own floor beats a closer one on the
+# wrong floor (see ``closest_walkable``). Modest — same-floor Δz is tiny, so it only bites
+# across floors (Δz in the hundreds).
+Z_RANK_WEIGHT = 2.0
+
+# A surface directly at the target's XY is only accepted as the exact landing when it's within
+# this of the target's own height. Beyond it the target's floor isn't represented at that XY
+# (it sits under an overhang / in a mesh gap), so we ring-search for a node on the right floor
+# instead of teleporting a whole floor away. Floors in these zones are ~900-2500u apart while a
+# floor's own z-spread (ramps/stairs) stays well under this, so the gap is unambiguous.
+FLOOR_MATCH_TOL = 300.0
+
 _SQRT3 = math.sqrt(3.0)
 # Axial hex directions (q, r). Six equidistant neighbours.
 _HEX_DIRS = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
@@ -528,10 +541,6 @@ class _ZoneWalkGrid:
         self.bcd_buf = [(fp.buffer(player_radius), zlo, zhi, box)
                         for fp, zlo, zhi, box in raw_solids]
         self.bcd_tree = STRtree([fp for fp, _, _, _ in self.bcd_buf]) if self.bcd_buf else None
-        # Unbuffered solids for the point-in-solid "is the goal buried in terrain?" test
-        # (decides snap direction). Buffered footprints would over-report, so keep these raw.
-        self.solids = raw_solids
-        self.solid_tree = STRtree([fp for fp, _, _, _ in raw_solids]) if raw_solids else None
         ev = filter_valid_polygons(extra_shapes) if extra_shapes else []
         self.static_prep = prep(unary_union(ev).buffer(player_radius)) if ev else None
         self._cache: dict = {}       # (q, r) -> teleport-valid ground_z or None
@@ -554,13 +563,21 @@ class _ZoneWalkGrid:
         not inside a bcd collider's vertical band (height-aware), and clear of static
         entity colliders.
 
-        With ``prefer_z`` (the goal's height) the surface returned is the one the goal
-        actually sits on, with collision deciding the direction: a goal *buried* in terrain
-        rises to the nearest walkable surface at/above it, a goal in open air drops to the
-        nearest surface at/below it. That fixes multi-level XYs where elevated geometry
-        overhangs a lower walkable surface — the old lowest-first pick teleported to the
-        wrong (lower) floor. Without ``prefer_z`` the legacy lowest-first surface is returned,
-        so callers that don't pass it (e.g. the walk-nav node cache) are unchanged."""
+        With ``prefer_z`` (the goal's own feet height) the surface returned is the clear
+        walkable level *closest to the goal's height* — i.e. the floor the goal is actually
+        standing on. This is what disambiguates stacked multi-level XYs: an upper-floor target
+        (high ``prefer_z``) keeps the upper surface even when ground-floor navmesh sits at the
+        same XY hundreds of units below, and vice-versa. (The earlier directional min/max pick
+        collapsed to the wrong floor whenever the target's own surface rounded a hair onto the
+        wrong side of ``prefer_z`` — a 1u boundary error that dropped teleports a whole floor.)
+
+        A collider whose vertical band *contains* ``prefer_z`` is treated as NOT walling off
+        this floor: the target is a real, reachable game position sitting inside that volume, so
+        it's a coarse structural/terrain shell the body occupies (a tower's bounding BOX, a
+        terrain cylinder), not a wall — otherwise the whole floor inside it reads as blocked.
+
+        Without ``prefer_z`` the legacy lowest-first surface is returned, so callers that don't
+        pass it (e.g. the walk-nav node cache) are unchanged."""
         if self.static_prep is not None and self.static_prep.contains(Point(x, y)):
             return None  # on/next to a teleporter pad, boat, etc.
         levels = _mesh_levels_at(x, y, self.mesh)
@@ -569,35 +586,17 @@ class _ZoneWalkGrid:
         pt = Point(x, y)
         covering = [self.bcd_buf[i] for i in self.bcd_tree.query(pt)] if self.bcd_tree is not None else []
         covering = [(zlo, zhi, box) for fp, zlo, zhi, box in covering if fp.contains(pt)]
+        if prefer_z is not None:
+            # A volume the target itself stands inside is a shell, not a wall for this floor.
+            covering = [(zlo, zhi, box) for (zlo, zhi, box) in covering
+                        if not (zlo <= prefer_z <= zhi)]
         clear = [z for z in levels  # surfaces a teleport can land on (body not in a collider)
                  if not any(_collider_blocks_foot(z, zlo, zhi, box) for zlo, zhi, box in covering)]
         if not clear:
             return None
         if prefer_z is None:
             return clear[0]  # lowest-first (legacy: ground under any overhead collider)
-        if self._is_sunken(x, y, prefer_z):
-            up = [z for z in clear if z >= prefer_z]
-            if up:
-                return min(up)            # buried -> nearest walkable surface going up
-        else:
-            down = [z for z in clear if z <= prefer_z]
-            if down:
-                return max(down)          # in open air -> nearest walkable surface going down
-        return min(clear, key=lambda z: abs(z - prefer_z))  # directional side empty -> nearest
-
-    def _is_sunken(self, x, y, z):
-        """True if ``(x, y, z)`` lies inside solid movement collision — the goal is buried in
-        terrain, so a teleport should rise to the surface above rather than drop to one below.
-        The goal is a point, so this is a plain point-in-solid test against the unbuffered
-        collider volumes (``_all_collider_solids`` already excludes non-movement volumes)."""
-        if self.solid_tree is None:
-            return False
-        pt = Point(x, y)
-        for i in self.solid_tree.query(pt):
-            fp, zlo, zhi, _box = self.solids[i]
-            if zlo <= z <= zhi and fp.contains(pt):
-                return True
-        return False
+        return min(clear, key=lambda z: abs(z - prefer_z))  # the goal's own floor
 
     def node_z(self, q, r):
         """Ground z at node ``(q, r)`` if walkable, else None. Evaluated once, memoized."""
@@ -615,23 +614,28 @@ class _ZoneWalkGrid:
     def closest_walkable(self, target, max_rings=300):
         """Nearest walkable node to ``target`` as ``(x, y, z)``, by expanding-ring search
         (evaluate on demand, stop once no farther ring could beat the best). None if the
-        whole searched area is blocked. Node selection is unchanged (cached ``node_z``
-        walkability + 2D distance), but each accepted node's height is resolved against the
-        goal's ``target.z`` so a relocated landing keeps the goal's own level."""
+        whole searched area is blocked.
+
+        Nodes are ranked by ``dxy + Z_RANK_WEIGHT * |surface_z - target.z|``, not XY distance
+        alone: when the target's own XY is unwalkable (e.g. under an overhang) the nearest node
+        in the plane can be on the *wrong floor* directly below/above the target, so a small
+        cross-floor Z penalty steers the pick to the node on the target's actual floor even if
+        it's a bit farther in XY. Same-floor nodes have ~zero Z term, so within a floor this is
+        still nearest-XY. The ring prune stays valid because cost >= dxy."""
         q0, r0 = self.to_hex(target.x, target.y)
-        best, best_d = None, None
+        best, best_cost = None, None
         for k in range(max_rings + 1):
-            if best_d is not None and (k - 1) * self.spacing > best_d:
-                break  # every node in this ring is farther than what we already have
+            if best_cost is not None and (k - 1) * self.spacing > best_cost:
+                break  # no node this far out can beat the best cost (cost >= dxy)
             for (q, r) in _hex_ring(q0, r0, k):
                 if self.node_z(q, r) is None:
                     continue  # node not teleport-valid at all
                 x, y = self.to_world(q, r)
                 z = self.ground_z_at(x, y, prefer_z=target.z)  # goal-appropriate surface here
                 if z is not None:
-                    d = math.hypot(x - target.x, y - target.y)
-                    if best_d is None or d < best_d:
-                        best, best_d = (x, y, z), d
+                    cost = math.hypot(x - target.x, y - target.y) + Z_RANK_WEIGHT * abs(z - target.z)
+                    if best_cost is None or cost < best_cost:
+                        best, best_cost = (x, y, z), cost
         return best
 
     # --- walking (more permissive than teleport-valid) + A* nav ---
@@ -733,14 +737,17 @@ def find_walkable_teleport_point(world: CollisionWorld, zone_name: str | None, t
     Returns ``(XYZ, reason)`` or ``(None, reason)``.
 
     The exact target is tested first so a clear target lands precisely on it; a *blocked* target
-    falls to the hex grid, where the post-teleport walk closes the remaining gap. Only the nodes
-    near the target are evaluated (and cached for the zone) — no full-zone sweep."""
+    — or one whose only walkable surface at that XY is a whole floor off (the target sits under
+    an overhang / in a mesh gap, so the surface there belongs to a different level) — falls to
+    the hex grid, where the ring search finds a node on the target's own floor and the
+    post-teleport walk closes the remaining gap. Only the nodes near the target are evaluated
+    (and cached for the zone) — no full-zone sweep."""
     grid = get_walk_grid(world, zone_name, extra_shapes, player_radius)
     if not grid.has_mesh:
         return None, "no_mesh"
 
     tz = grid.ground_z_at(target.x, target.y, prefer_z=target.z)
-    if tz is not None:
+    if tz is not None and abs(tz - target.z) <= FLOOR_MATCH_TOL:
         return XYZ(target.x, target.y, tz), "target_clear"
 
     best = grid.closest_walkable(target)
