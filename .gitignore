@@ -14,5 +14,10 @@ dist/
 .secret
 .secrets
 *.lock
+!tools/crossover-memory-probe/Cargo.lock
+tools/crossover-memory-probe/target/
 !.gitignore
 .*
+!.github/
+!.github/workflows/
+!.github/workflows/crossover-memory-probe.yml
