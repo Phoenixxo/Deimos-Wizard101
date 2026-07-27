@@ -1,0 +1,41 @@
+name: CrossOver memory probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/crossover-memory-probe/**"
+      - ".github/workflows/crossover-memory-probe.yml"
+  pull_request:
+    paths:
+      - "tools/crossover-memory-probe/**"
+      - ".github/workflows/crossover-memory-probe.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path tools/crossover-memory-probe/Cargo.toml -- --check
+
+      - name: Test portable PE parsing
+        run: cargo test --manifest-path tools/crossover-memory-probe/Cargo.toml
+
+      - name: Build probe
+        run: cargo build --release --manifest-path tools/crossover-memory-probe/Cargo.toml
+
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: crossover-memory-probe
+          path: tools/crossover-memory-probe/target/release/crossover-memory-probe.exe
+          if-no-files-found: error
