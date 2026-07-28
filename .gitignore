@@ -15,4 +15,7 @@ dist/
 .secrets
 *.lock
 !.gitignore
+
+# Rust build output
+target/
 .*

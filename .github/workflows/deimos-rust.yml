@@ -1,0 +1,76 @@
+name: Deimos Rust workspace
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Cargo.toml"
+      - "crates/**"
+      - ".github/workflows/deimos-rust.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "crates/**"
+      - ".github/workflows/deimos-rust.yml"
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run portable tests
+        env:
+          PYO3_PYTHON: python
+        run: cargo test --workspace
+
+      - name: Run Clippy
+        env:
+          PYO3_PYTHON: python
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  native-builds:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build workspace
+        env:
+          PYO3_PYTHON: python
+        run: cargo build --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
