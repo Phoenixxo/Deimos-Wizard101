@@ -355,6 +355,9 @@ impl RpcServer {
                 }
             },
             Err(error) => {
+                if is_disconnect_frame_error(&error) {
+                    return Ok(());
+                }
                 self.send_frame_error(&mut stream, error)?;
                 return Ok(());
             }
@@ -420,6 +423,9 @@ impl RpcServer {
             let payload = match read_frame(&mut stream, self.config.max_message_size) {
                 Ok(payload) => payload,
                 Err(error) => {
+                    if is_disconnect_frame_error(&error) {
+                        return Ok(());
+                    }
                     self.send_frame_error(&mut stream, error)?;
                     return Ok(());
                 }
@@ -714,6 +720,20 @@ fn read_response(stream: &mut TcpStream, maximum: usize) -> Result<RpcResponse, 
 
 fn is_timeout_error(error: &io::Error) -> bool {
     matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+}
+
+fn is_disconnect_frame_error(error: &FrameError) -> bool {
+    matches!(
+        error,
+        FrameError::Io(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+            )
+    )
 }
 
 fn response_error(response: RpcResponse, request_id: u64, operation: &str) -> RpcClientError {
