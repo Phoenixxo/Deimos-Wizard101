@@ -155,6 +155,10 @@ pub enum RpcErrorCode {
     Timeout,
     InvalidRequest,
     UnsupportedOperation,
+    ProcessNotFound,
+    ProcessAccessDenied,
+    ProcessExited,
+    SessionNotFound,
     Internal,
 }
 
@@ -574,6 +578,10 @@ impl fmt::Display for RpcErrorCode {
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedOperation => "unsupported_operation",
+            Self::ProcessNotFound => "process_not_found",
+            Self::ProcessAccessDenied => "process_access_denied",
+            Self::ProcessExited => "process_exited",
+            Self::SessionNotFound => "session_not_found",
             Self::Internal => "internal",
         };
         formatter.write_str(name)

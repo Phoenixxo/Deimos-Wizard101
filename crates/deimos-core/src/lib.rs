@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod process;
 pub mod rpc;
 
 pub const PROTOCOL_SCHEMA_VERSION: u32 = 1;
