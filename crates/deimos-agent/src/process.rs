@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use deimos_core::memory::MemoryRegionDescriptor;
 use deimos_core::process::{
     ListModulesResponse, ListProcessesRequest, ListProcessesResponse, ModuleDescriptor,
     OpenProcessRequest, ProcessDescriptor, ProcessIdentity, ProcessSessionId,
@@ -75,6 +76,23 @@ pub trait ProcessBackend: Send + Sync + 'static {
     ) -> Result<Vec<ModuleDescriptor>, ProcessBackendError>;
 }
 
+/// Read-only memory operations are deliberately a separate capability layered
+/// on the process/session backend. No method here can mutate a target.
+pub trait MemoryBackend: ProcessBackend {
+    fn enumerate_memory_regions(
+        &self,
+        handle: &Self::Handle,
+        expected: &ProcessIdentity,
+    ) -> Result<Vec<MemoryRegionDescriptor>, ProcessBackendError>;
+
+    fn read_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+    ) -> Result<Vec<u8>, ProcessBackendError>;
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn enumerate_modules_with_revalidation<B, F>(
     backend: &B,
@@ -136,6 +154,32 @@ impl ProcessBackend for UnsupportedProcessBackend {
         Err(ProcessBackendError::new(
             ProcessBackendErrorKind::Native,
             "process APIs require the Windows agent running natively or inside Wine/CrossOver",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+impl MemoryBackend for UnsupportedProcessBackend {
+    fn enumerate_memory_regions(
+        &self,
+        _handle: &Self::Handle,
+        _expected: &ProcessIdentity,
+    ) -> Result<Vec<MemoryRegionDescriptor>, ProcessBackendError> {
+        Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "memory APIs require the Windows agent running natively or inside Wine/CrossOver",
+        ))
+    }
+
+    fn read_memory(
+        &self,
+        _handle: &Self::Handle,
+        _address: usize,
+        _size: usize,
+    ) -> Result<Vec<u8>, ProcessBackendError> {
+        Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "memory APIs require the Windows agent running natively or inside Wine/CrossOver",
         ))
     }
 }
@@ -438,6 +482,85 @@ impl<H> ProcessSessionRegistry<H> {
             process: session.process.clone(),
             modules,
         })
+    }
+
+    /// Run a memory operation against a live session and revalidate the
+    /// process identity after it completes. The closure must not retain the
+    /// borrowed handle or process descriptor.
+    pub fn with_live_session<B, F, R, E>(
+        &mut self,
+        backend: &B,
+        session_id: &ProcessSessionId,
+        operation: F,
+    ) -> Result<R, E>
+    where
+        B: ProcessBackend<Handle = H>,
+        F: FnOnce(&B, &H, &ProcessDescriptor) -> Result<R, E>,
+        E: From<ProcessApiError> + From<ProcessBackendError>,
+    {
+        self.ensure_live(backend, session_id).map_err(E::from)?;
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.state == ProcessSessionState::Closed)
+        {
+            return Err(E::from(ProcessApiError::session_closed(session_id)));
+        }
+        let result = {
+            let session = self
+                .sessions
+                .get(session_id)
+                .expect("validated session must still exist");
+            operation(
+                backend,
+                session
+                    .handle
+                    .as_ref()
+                    .expect("open sessions always contain a handle"),
+                &session.process,
+            )
+        };
+
+        let validation = {
+            let session = self
+                .sessions
+                .get(session_id)
+                .expect("session must still exist during revalidation");
+            backend.validate_process(
+                session
+                    .handle
+                    .as_ref()
+                    .expect("open sessions always contain a handle"),
+                session
+                    .process
+                    .identity
+                    .as_ref()
+                    .expect("open sessions always contain an identity"),
+            )
+        };
+        if let Err(error) = validation {
+            let pid = self
+                .sessions
+                .get(session_id)
+                .expect("session must still exist after validation")
+                .process
+                .pid;
+            if matches!(
+                error.kind,
+                ProcessBackendErrorKind::NotFound
+                    | ProcessBackendErrorKind::Exited
+                    | ProcessBackendErrorKind::IdentityMismatch
+            ) {
+                self.mark_exited(session_id);
+            }
+            return Err(E::from(ProcessApiError::from_backend(
+                error,
+                Some(pid),
+                Some(session_id),
+            )));
+        }
+
+        result
     }
 
     fn ensure_live<B: ProcessBackend<Handle = H>>(

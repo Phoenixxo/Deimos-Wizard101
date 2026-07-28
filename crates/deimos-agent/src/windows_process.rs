@@ -1,5 +1,7 @@
+use std::ffi::c_void;
 use std::mem::size_of;
 
+use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     classify_process, ModuleDescriptor, ProcessDescriptor, ProcessIdentity,
 };
@@ -7,9 +9,15 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, STILL_ACTIVE,
 };
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
     MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Memory::{
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
@@ -18,8 +26,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::process::{
-    enumerate_modules_with_revalidation, OpenedProcess, ProcessBackend, ProcessBackendError,
-    ProcessBackendErrorKind,
+    enumerate_modules_with_revalidation, MemoryBackend, OpenedProcess, ProcessBackend,
+    ProcessBackendError, ProcessBackendErrorKind,
 };
 
 const MAX_EXECUTABLE_PATH: usize = 32_768;
@@ -169,6 +177,158 @@ impl ProcessBackend for WindowsProcessBackend {
         enumerate_modules_with_revalidation(self, handle, expected, || {
             enumerate_modules(expected.pid)
         })
+    }
+}
+
+impl MemoryBackend for WindowsProcessBackend {
+    fn enumerate_memory_regions(
+        &self,
+        handle: &Self::Handle,
+        expected: &ProcessIdentity,
+    ) -> Result<Vec<MemoryRegionDescriptor>, ProcessBackendError> {
+        self.validate_process(handle, expected)?;
+        let mut regions = Vec::new();
+        let mut address = 0usize;
+        loop {
+            let mut information = MEMORY_BASIC_INFORMATION::default();
+            let result = unsafe {
+                VirtualQueryEx(
+                    handle.raw(),
+                    Some(address as *const c_void),
+                    &mut information,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if result == 0 {
+                break;
+            }
+            let base_address = information.BaseAddress as usize;
+            let region_size = information.RegionSize;
+            if information.State == MEM_COMMIT
+                && readable_protection(information.Protect.0).is_some()
+                && region_size > 0
+            {
+                regions.push(MemoryRegionDescriptor {
+                    base_address: format!("{base_address:#x}"),
+                    size: region_size,
+                    protection: readable_protection(information.Protect.0)
+                        .expect("readable protection was checked above"),
+                });
+            }
+            let next = base_address.checked_add(region_size).ok_or_else(|| {
+                ProcessBackendError::new(
+                    ProcessBackendErrorKind::Native,
+                    "VirtualQueryEx region address overflowed",
+                )
+            })?;
+            if next <= address {
+                break;
+            }
+            address = next;
+        }
+        Ok(regions)
+    }
+
+    fn read_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+    ) -> Result<Vec<u8>, ProcessBackendError> {
+        validate_read_range(handle.raw(), address, size)?;
+        let mut bytes = vec![0u8; size];
+        let mut bytes_read = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                handle.raw(),
+                address as *const c_void,
+                bytes.as_mut_ptr().cast::<c_void>(),
+                size,
+                Some(&mut bytes_read),
+            )
+        }
+        .map_err(|error| {
+            ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "ReadProcessMemory at {address:#x} read {bytes_read} of {size} bytes: {error}"
+                ),
+            )
+            .with_native_code(error.code().0)
+        })?;
+        if bytes_read != size {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!("ReadProcessMemory at {address:#x} returned {bytes_read} of {size} bytes"),
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+fn validate_read_range(
+    handle: HANDLE,
+    address: usize,
+    size: usize,
+) -> Result<(), ProcessBackendError> {
+    let end = address.checked_add(size).ok_or_else(|| {
+        ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "ReadProcessMemory address plus size overflowed",
+        )
+    })?;
+    let mut cursor = address;
+    while cursor < end {
+        let mut information = MEMORY_BASIC_INFORMATION::default();
+        let result = unsafe {
+            VirtualQueryEx(
+                handle,
+                Some(cursor as *const c_void),
+                &mut information,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if result == 0 || information.RegionSize == 0 {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!("VirtualQueryEx could not validate read address {cursor:#x}"),
+            ));
+        }
+        let base = information.BaseAddress as usize;
+        let region_end = base.checked_add(information.RegionSize).ok_or_else(|| {
+            ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                "VirtualQueryEx region address overflowed",
+            )
+        })?;
+        if cursor < base
+            || region_end <= cursor
+            || information.State != MEM_COMMIT
+            || readable_protection(information.Protect.0).is_none()
+        {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!("memory range at {cursor:#x} is not readable and committed"),
+            ));
+        }
+        cursor = end.min(region_end);
+    }
+    Ok(())
+}
+
+fn readable_protection(protection: u32) -> Option<MemoryProtection> {
+    if protection & PAGE_GUARD.0 != 0 {
+        return None;
+    }
+    match protection & 0xff {
+        value if value == PAGE_READONLY.0 => Some(MemoryProtection::ReadOnly),
+        value if value == PAGE_READWRITE.0 => Some(MemoryProtection::ReadWrite),
+        value if value == PAGE_EXECUTE_READ.0 => Some(MemoryProtection::ExecuteRead),
+        value if value == PAGE_EXECUTE_READWRITE.0 => Some(MemoryProtection::ExecuteReadWrite),
+        value if value == PAGE_WRITECOPY.0 => Some(MemoryProtection::CopyOnWrite),
+        value if value == PAGE_EXECUTE_WRITECOPY.0 => Some(MemoryProtection::ExecuteCopyOnWrite),
+        value if value == PAGE_NOACCESS.0 => None,
+        _ => None,
     }
 }
 
