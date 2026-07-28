@@ -17,13 +17,9 @@ const ALLOCATION_SIZE: usize = 4096;
 const READ_ONLY_REGION: &str = "read_only_values";
 const READ_WRITE_REGION: &str = "read_write_values";
 const EXACT_PATTERN_NAME: &str = "exact_anchor";
-const EXACT_PATTERN: [u8; 16] = [
-    0x44, 0x4d, 0x53, 0x05, 0x91, 0xa7, 0x2c, 0xe3, 0x6d, 0x11, 0xb8, 0x4f, 0xca, 0x73, 0x20, 0xfe,
-];
-const WILDCARD_PATTERN: [u8; 16] = [
-    0xf3, 0x0d, 0x8a, 0x62, 0x17, 0xcd, 0x49, 0xb0, 0xee, 0x35, 0x74, 0x9a, 0x01, 0xd6, 0xab, 0x58,
-];
-const WILDCARD_SIGNATURE: &str = "F3 0D ?? 62 17 CD 49 ?? EE 35 74 9A ?? D6 AB 58";
+const EXACT_PATTERN_SEED: u64 = 0x4d53_5f45_5841_4354;
+const WILDCARD_PATTERN_SEED: u64 = 0x4d53_5f57_494c_4443;
+const WILDCARD_INDICES: [usize; 3] = [2, 7, 12];
 
 const VALUE_U8: u8 = 0xa5;
 const VALUE_I32: i32 = -123_456_789;
@@ -128,6 +124,8 @@ impl FixtureMemory {
         let read_write = Allocation::read_write()?;
         let node_one_address = read_write.address() + offset_of!(ReadWriteValues, node_one);
         let node_two_address = read_write.address() + offset_of!(ReadWriteValues, node_two);
+        let exact_pattern = deterministic_pattern(EXACT_PATTERN_SEED);
+        let wildcard_pattern = deterministic_pattern(WILDCARD_PATTERN_SEED);
 
         unsafe {
             read_write.write(ReadWriteValues {
@@ -147,8 +145,8 @@ impl FixtureMemory {
         let read_only = Allocation::read_write()?;
         unsafe {
             read_only.write(ReadOnlyValues {
-                exact_pattern: EXACT_PATTERN,
-                wildcard_pattern: WILDCARD_PATTERN,
+                exact_pattern,
+                wildcard_pattern,
                 value_u8: VALUE_U8,
                 padding_after_u8: [0; 3],
                 value_i32: VALUE_I32,
@@ -161,7 +159,12 @@ impl FixtureMemory {
         }
         read_only.make_read_only()?;
 
-        let metadata = metadata(read_only.address(), read_write.address());
+        let metadata = metadata(
+            read_only.address(),
+            read_write.address(),
+            &exact_pattern,
+            &wildcard_pattern,
+        );
         Ok((
             Self {
                 _read_only: read_only,
@@ -172,7 +175,12 @@ impl FixtureMemory {
     }
 }
 
-fn metadata(read_only_address: usize, read_write_address: usize) -> FixtureMetadata {
+fn metadata(
+    read_only_address: usize,
+    read_write_address: usize,
+    exact_pattern: &[u8; 16],
+    wildcard_pattern: &[u8; 16],
+) -> FixtureMetadata {
     FixtureMetadata {
         schema_version: FIXTURE_SCHEMA_VERSION,
         pid: std::process::id(),
@@ -255,7 +263,7 @@ fn metadata(read_only_address: usize, read_write_address: usize) -> FixtureMetad
                 kind: PatternKind::Exact,
                 region: READ_ONLY_REGION.to_string(),
                 offset: offset_of!(ReadOnlyValues, exact_pattern),
-                signature: signature(&EXACT_PATTERN),
+                signature: signature(exact_pattern),
                 expected_matches: 1,
             },
             PatternMetadata {
@@ -263,7 +271,7 @@ fn metadata(read_only_address: usize, read_write_address: usize) -> FixtureMetad
                 kind: PatternKind::Wildcard,
                 region: READ_ONLY_REGION.to_string(),
                 offset: offset_of!(ReadOnlyValues, wildcard_pattern),
-                signature: WILDCARD_SIGNATURE.to_string(),
+                signature: wildcard_signature(wildcard_pattern),
                 expected_matches: 1,
             },
         ],
@@ -282,6 +290,20 @@ fn metadata(read_only_address: usize, read_write_address: usize) -> FixtureMetad
             expected_bytes: bytes_hex(&POINTER_TARGET.to_le_bytes()),
         }],
     }
+}
+
+fn deterministic_pattern(seed: u64) -> [u8; 16] {
+    // A volatile read prevents the compiler from materializing the generated
+    // pattern as a contiguous constant in the executable image.
+    let mut state = unsafe { ptr::read_volatile(&seed) };
+    let mut bytes = [0u8; 16];
+    for byte in &mut bytes {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = (state >> 56) as u8;
+    }
+    bytes
 }
 
 fn primitive(
@@ -307,6 +329,21 @@ fn signature(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn wildcard_signature(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| {
+            if WILDCARD_INDICES.contains(&index) {
+                "??".to_string()
+            } else {
+                format!("{byte:02X}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
