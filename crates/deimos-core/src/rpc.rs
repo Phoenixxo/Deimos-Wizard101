@@ -159,6 +159,12 @@ pub enum RpcErrorCode {
     ProcessAccessDenied,
     ProcessExited,
     SessionNotFound,
+    MemoryInvalidAddress,
+    MemoryReadFailed,
+    MemoryRequiredMatchNotFound,
+    MemoryAmbiguousMatch,
+    MemoryLimitExceeded,
+    MemoryPatternInvalid,
     Internal,
 }
 
@@ -582,6 +588,12 @@ impl fmt::Display for RpcErrorCode {
             Self::ProcessAccessDenied => "process_access_denied",
             Self::ProcessExited => "process_exited",
             Self::SessionNotFound => "session_not_found",
+            Self::MemoryInvalidAddress => "memory_invalid_address",
+            Self::MemoryReadFailed => "memory_read_failed",
+            Self::MemoryRequiredMatchNotFound => "memory_required_match_not_found",
+            Self::MemoryAmbiguousMatch => "memory_ambiguous_match",
+            Self::MemoryLimitExceeded => "memory_limit_exceeded",
+            Self::MemoryPatternInvalid => "memory_pattern_invalid",
             Self::Internal => "internal",
         };
         formatter.write_str(name)
