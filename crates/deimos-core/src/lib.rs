@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod rpc;
+
 pub const PROTOCOL_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TARGET_PROCESS: &str = "WizardGraphicalClient.exe";
 pub const PROCESS_READ_ACCESS: &str = "PROCESS_QUERY_INFORMATION | PROCESS_VM_READ";
