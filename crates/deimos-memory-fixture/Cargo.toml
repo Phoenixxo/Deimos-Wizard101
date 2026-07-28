@@ -16,6 +16,8 @@ windows = { workspace = true, features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
+deimos-agent = { path = "../deimos-agent" }
+deimos-core.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
