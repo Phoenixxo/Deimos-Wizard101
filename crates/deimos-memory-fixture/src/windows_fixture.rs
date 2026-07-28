@@ -4,9 +4,8 @@ use std::mem::{offset_of, size_of};
 use std::ptr::{self, NonNull};
 
 use deimos_memory_fixture::{
-    FixtureMetadata, LifecycleMetadata, MemoryProtection, MemoryRegionMetadata, PatternKind,
-    PatternMetadata, PointerChainMetadata, PrimitiveMetadata, FIXTURE_SCHEMA_VERSION,
-    MUTATION_ENABLED, READY_PREFIX, SHUTDOWN_COMMAND, STOPPED_LINE,
+    FixtureMetadata, MemoryProtection, MemoryRegionMetadata, PatternKind, PatternMetadata,
+    PointerChainMetadata, PrimitiveMetadata, FIXTURE_SCHEMA_VERSION, MUTATION_ENABLED,
 };
 use windows::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY,
@@ -187,12 +186,6 @@ fn metadata(
         architecture: std::env::consts::ARCH.to_string(),
         pointer_width: size_of::<usize>(),
         mutation_enabled: MUTATION_ENABLED,
-        lifecycle: LifecycleMetadata {
-            ready_prefix: READY_PREFIX.to_string(),
-            shutdown_transport: "stdin_line".to_string(),
-            shutdown_command: SHUTDOWN_COMMAND.to_string(),
-            stopped_line: STOPPED_LINE.to_string(),
-        },
         regions: vec![
             MemoryRegionMetadata {
                 name: READ_ONLY_REGION.to_string(),

@@ -6,15 +6,16 @@ mod windows_fixture;
 
 #[cfg(windows)]
 fn main() {
-    use deimos_memory_fixture::{READY_PREFIX, SHUTDOWN_COMMAND, STOPPED_LINE};
     use windows_fixture::FixtureMemory;
+
+    const SHUTDOWN_COMMAND: &str = "shutdown";
 
     let (fixture, metadata) = FixtureMemory::create()
         .unwrap_or_else(|error| exit_with_error(&format!("failed to create fixture: {error}")));
     let json = serde_json::to_string(&metadata)
         .unwrap_or_else(|error| exit_with_error(&format!("failed to serialize metadata: {error}")));
 
-    println!("{READY_PREFIX}{json}");
+    println!("{json}");
     io::stdout()
         .flush()
         .unwrap_or_else(|error| exit_with_error(&format!("failed to publish metadata: {error}")));
@@ -29,10 +30,6 @@ fn main() {
     }
 
     drop(fixture);
-    println!("{STOPPED_LINE}");
-    io::stdout()
-        .flush()
-        .unwrap_or_else(|error| exit_with_error(&format!("failed to publish shutdown: {error}")));
 }
 
 #[cfg(not(windows))]

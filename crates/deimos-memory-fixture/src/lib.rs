@@ -2,9 +2,6 @@ use serde::{Deserialize, Serialize};
 
 pub const FIXTURE_SCHEMA_VERSION: u32 = 1;
 pub const MUTATION_ENABLED: bool = false;
-pub const READY_PREFIX: &str = "DEIMOS_MEMORY_FIXTURE=";
-pub const STOPPED_LINE: &str = "DEIMOS_MEMORY_FIXTURE_STOPPED";
-pub const SHUTDOWN_COMMAND: &str = "shutdown";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FixtureMetadata {
@@ -13,19 +10,10 @@ pub struct FixtureMetadata {
     pub architecture: String,
     pub pointer_width: usize,
     pub mutation_enabled: bool,
-    pub lifecycle: LifecycleMetadata,
     pub regions: Vec<MemoryRegionMetadata>,
     pub primitives: Vec<PrimitiveMetadata>,
     pub patterns: Vec<PatternMetadata>,
     pub pointer_chains: Vec<PointerChainMetadata>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct LifecycleMetadata {
-    pub ready_prefix: String,
-    pub shutdown_transport: String,
-    pub shutdown_command: String,
-    pub stopped_line: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -85,25 +73,16 @@ pub struct PointerChainMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FixtureMetadata, LifecycleMetadata, FIXTURE_SCHEMA_VERSION, MUTATION_ENABLED, READY_PREFIX,
-        SHUTDOWN_COMMAND, STOPPED_LINE,
-    };
+    use super::{FixtureMetadata, FIXTURE_SCHEMA_VERSION, MUTATION_ENABLED};
 
     #[test]
-    fn lifecycle_and_mutation_contract_is_explicit() {
+    fn metadata_round_trips_with_mutation_disabled() {
         let metadata = FixtureMetadata {
             schema_version: FIXTURE_SCHEMA_VERSION,
             pid: 42,
             architecture: "test".to_string(),
             pointer_width: 8,
             mutation_enabled: MUTATION_ENABLED,
-            lifecycle: LifecycleMetadata {
-                ready_prefix: READY_PREFIX.to_string(),
-                shutdown_transport: "stdin_line".to_string(),
-                shutdown_command: SHUTDOWN_COMMAND.to_string(),
-                stopped_line: STOPPED_LINE.to_string(),
-            },
             regions: Vec::new(),
             primitives: Vec::new(),
             patterns: Vec::new(),
@@ -116,6 +95,5 @@ mod tests {
 
         assert_eq!(decoded, metadata);
         assert!(!decoded.mutation_enabled);
-        assert_eq!(decoded.lifecycle.shutdown_command, SHUTDOWN_COMMAND);
     }
 }

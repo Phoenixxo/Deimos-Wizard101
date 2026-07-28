@@ -1,15 +1,16 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem::size_of;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use deimos_memory_fixture::{
-    FixtureMetadata, MemoryProtection, MemoryRegionMetadata, FIXTURE_SCHEMA_VERSION, READY_PREFIX,
-    SHUTDOWN_COMMAND, STOPPED_LINE,
+    FixtureMetadata, MemoryProtection, MemoryRegionMetadata, FIXTURE_SCHEMA_VERSION,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -17,6 +18,10 @@ use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+
+const SHUTDOWN_COMMAND: &str = "shutdown";
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct FixtureProcess {
     child: Child,
@@ -48,12 +53,26 @@ impl FixtureProcess {
                 self.finished = true;
                 return status;
             }
-            assert!(
-                Instant::now() < deadline,
-                "fixture did not stop within {timeout:?}"
-            );
+            if Instant::now() >= deadline {
+                let stderr = self.terminate();
+                panic!("fixture did not stop within {timeout:?}; stderr: {stderr}");
+            }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    fn terminate(&mut self) -> String {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.finished = true;
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        stderr.trim().to_string()
     }
 }
 
@@ -79,32 +98,13 @@ impl Drop for OwnedHandle {
 #[test]
 fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
     let mut fixture = FixtureProcess::spawn();
-    let stdout = fixture
-        .child
-        .stdout
-        .take()
-        .expect("fixture stdout should be piped");
-    let mut stdout = BufReader::new(stdout);
-    let mut ready_line = String::new();
-    stdout
-        .read_line(&mut ready_line)
-        .expect("fixture should publish metadata");
-    let metadata_json = ready_line
-        .trim_end()
-        .strip_prefix(READY_PREFIX)
-        .expect("first line should use the fixture metadata prefix");
-    let metadata: FixtureMetadata =
-        serde_json::from_str(metadata_json).expect("fixture metadata should be valid JSON");
+    let metadata = read_metadata(&mut fixture);
 
     assert_eq!(metadata.schema_version, FIXTURE_SCHEMA_VERSION);
     assert_eq!(metadata.pid, fixture.child.id());
     assert_eq!(metadata.architecture, "x86_64");
     assert_eq!(metadata.pointer_width, 8);
     assert!(!metadata.mutation_enabled, "DMS-014 owns mutation support");
-    assert_eq!(metadata.lifecycle.ready_prefix, READY_PREFIX);
-    assert_eq!(metadata.lifecycle.shutdown_transport, "stdin_line");
-    assert_eq!(metadata.lifecycle.shutdown_command, SHUTDOWN_COMMAND);
-    assert_eq!(metadata.lifecycle.stopped_line, STOPPED_LINE);
 
     let process = unsafe {
         OpenProcess(
@@ -124,34 +124,89 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
     assert_eq!(read_primitives(&process, &metadata), first_snapshot);
     assert_eq!(read_pointer_chain(&process, &metadata), first_chain);
 
-    writeln!(
-        fixture
-            .child
-            .stdin
-            .as_mut()
-            .expect("fixture stdin should be piped"),
-        "{SHUTDOWN_COMMAND}"
-    )
-    .expect("shutdown command should be writable");
-    fixture
+    let mut stdin = fixture
         .child
         .stdin
         .take()
-        .expect("fixture stdin should exist")
-        .flush()
-        .expect("shutdown command should flush");
+        .expect("fixture stdin should be piped");
+    writeln!(stdin, "{SHUTDOWN_COMMAND}").expect("shutdown command should be writable");
+    stdin.flush().expect("shutdown command should flush");
+    drop(stdin);
 
-    let status = fixture.wait_for_exit(Duration::from_secs(5));
+    let status = fixture.wait_for_exit(SHUTDOWN_TIMEOUT);
     assert!(
         status.success(),
         "fixture should exit successfully: {status}"
     );
+}
 
-    let mut remaining_stdout = String::new();
-    stdout
-        .read_to_string(&mut remaining_stdout)
-        .expect("fixture shutdown output should be readable");
-    assert_eq!(remaining_stdout.trim(), STOPPED_LINE);
+#[test]
+fn fixture_stops_cleanly_when_stdin_closes() {
+    let mut fixture = FixtureProcess::spawn();
+    let metadata = read_metadata(&mut fixture);
+    assert_eq!(metadata.pid, fixture.child.id());
+
+    drop(
+        fixture
+            .child
+            .stdin
+            .take()
+            .expect("fixture stdin should be piped"),
+    );
+
+    let status = fixture.wait_for_exit(SHUTDOWN_TIMEOUT);
+    assert!(
+        status.success(),
+        "fixture should exit successfully after stdin closes: {status}"
+    );
+}
+
+fn read_metadata(fixture: &mut FixtureProcess) -> FixtureMetadata {
+    let stdout = fixture
+        .child
+        .stdout
+        .take()
+        .expect("fixture stdout should be piped");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader.read_line(&mut line).and_then(|count| {
+            if count == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "fixture exited before publishing metadata",
+                ))
+            } else {
+                Ok(line)
+            }
+        });
+        let _ = sender.send(result);
+    });
+
+    let line = match receiver.recv_timeout(STARTUP_TIMEOUT) {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => startup_failure(fixture, format!("failed to read metadata: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => startup_failure(
+            fixture,
+            format!("fixture did not publish metadata within {STARTUP_TIMEOUT:?}"),
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            startup_failure(fixture, "metadata reader stopped unexpectedly".to_string())
+        }
+    };
+
+    serde_json::from_str(line.trim_end()).unwrap_or_else(|error| {
+        startup_failure(
+            fixture,
+            format!("fixture metadata should be valid JSON: {error}"),
+        )
+    })
+}
+
+fn startup_failure(fixture: &mut FixtureProcess, message: String) -> ! {
+    let stderr = fixture.terminate();
+    panic!("{message}; stderr: {stderr}");
 }
 
 fn verify_region_protections(process: &OwnedHandle, metadata: &FixtureMetadata) {
@@ -187,10 +242,19 @@ fn verify_region_protections(process: &OwnedHandle, metadata: &FixtureMetadata) 
 
 fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
     assert_eq!(metadata.patterns.len(), 2);
+    let executable = fs::read(env!("CARGO_BIN_EXE_deimos-memory-fixture"))
+        .expect("fixture PE should be readable");
     for pattern in &metadata.patterns {
+        let signature = parse_signature(&pattern.signature);
+        assert!(
+            scan(&executable, &signature).is_empty(),
+            "{} must be generated at runtime rather than embedded in the PE",
+            pattern.name
+        );
+
         let region = region(metadata, &pattern.region);
         let bytes = read_memory(process, parse_address(&region.address), region.size);
-        let matches = scan(&bytes, &parse_signature(&pattern.signature));
+        let matches = scan(&bytes, &signature);
         assert_eq!(matches.len(), pattern.expected_matches);
         assert_eq!(matches, vec![pattern.offset]);
     }
