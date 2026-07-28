@@ -9,6 +9,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use deimos_agent::process::ProcessSessionRegistry;
+use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
+use deimos_core::process::{
+    ListProcessesRequest, OpenProcessRequest, ProcessKind, MEMORY_FIXTURE_EXECUTABLE,
+    OP_PROCESS_STATUS,
+};
+use deimos_core::rpc::RpcErrorCode;
 use deimos_memory_fixture::{
     FixtureMetadata, MemoryProtection, MemoryRegionMetadata, FIXTURE_SCHEMA_VERSION,
 };
@@ -106,6 +113,48 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
     assert_eq!(metadata.pointer_width, 8);
     assert!(!metadata.mutation_enabled, "DMS-014 owns mutation support");
 
+    let backend = WindowsProcessBackend;
+    let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
+    let listed = sessions
+        .list(
+            &backend,
+            &ListProcessesRequest {
+                names: vec![MEMORY_FIXTURE_EXECUTABLE.to_string()],
+            },
+        )
+        .expect("agent should enumerate the fixture")
+        .processes
+        .into_iter()
+        .find(|process| process.pid == metadata.pid)
+        .expect("agent should discover the fixture by its Windows PID");
+    assert_eq!(listed.kind, ProcessKind::MemoryFixture);
+    assert!(
+        listed
+            .executable_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(MEMORY_FIXTURE_EXECUTABLE)),
+        "agent should publish the fixture executable path"
+    );
+    let session = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: listed.identity,
+            },
+        )
+        .expect("agent should open a read-only fixture session");
+    let modules = sessions
+        .modules(&backend, &session.session_id)
+        .expect("agent should enumerate fixture modules");
+    assert!(
+        modules.modules.iter().any(|module| {
+            module.name.eq_ignore_ascii_case(MEMORY_FIXTURE_EXECUTABLE)
+                && !module.executable_path.is_empty()
+        }),
+        "fixture executable module and path should be present"
+    );
+
     let process = unsafe {
         OpenProcess(
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -138,6 +187,11 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
         status.success(),
         "fixture should exit successfully: {status}"
     );
+    let stale = sessions
+        .status(&backend, &session.session_id)
+        .expect_err("exited fixture session should become stale")
+        .into_rpc_error(1, OP_PROCESS_STATUS);
+    assert_eq!(stale.code, RpcErrorCode::ProcessExited);
 }
 
 #[test]
