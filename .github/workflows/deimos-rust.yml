@@ -74,3 +74,7 @@ jobs:
         env:
           PYO3_PYTHON: python
         run: cargo build --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
+
+      - name: Run deterministic memory fixture integration test
+        if: runner.os == 'Windows'
+        run: cargo test --package deimos-memory-fixture --test windows_lifecycle --target ${{ matrix.target }}

@@ -2,6 +2,7 @@
 members = [
     "crates/deimos-core",
     "crates/deimos-agent",
+    "crates/deimos-memory-fixture",
     "crates/deimos-native",
 ]
 # wizlaunch is an independent Maturin package built by the Python workspace.
