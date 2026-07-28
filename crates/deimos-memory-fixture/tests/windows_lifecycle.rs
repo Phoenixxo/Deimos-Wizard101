@@ -1,0 +1,348 @@
+#![cfg(windows)]
+
+use std::ffi::c_void;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::mem::size_of;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use deimos_memory_fixture::{
+    FixtureMetadata, MemoryProtection, MemoryRegionMetadata, FIXTURE_SCHEMA_VERSION, READY_PREFIX,
+    SHUTDOWN_COMMAND, STOPPED_LINE,
+};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Memory::{
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+
+struct FixtureProcess {
+    child: Child,
+    finished: bool,
+}
+
+impl FixtureProcess {
+    fn spawn() -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_deimos-memory-fixture"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fixture should launch");
+        Self {
+            child,
+            finished: false,
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("fixture status should be readable")
+            {
+                self.finished = true;
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not stop within {timeout:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for FixtureProcess {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[test]
+fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
+    let mut fixture = FixtureProcess::spawn();
+    let stdout = fixture
+        .child
+        .stdout
+        .take()
+        .expect("fixture stdout should be piped");
+    let mut stdout = BufReader::new(stdout);
+    let mut ready_line = String::new();
+    stdout
+        .read_line(&mut ready_line)
+        .expect("fixture should publish metadata");
+    let metadata_json = ready_line
+        .trim_end()
+        .strip_prefix(READY_PREFIX)
+        .expect("first line should use the fixture metadata prefix");
+    let metadata: FixtureMetadata =
+        serde_json::from_str(metadata_json).expect("fixture metadata should be valid JSON");
+
+    assert_eq!(metadata.schema_version, FIXTURE_SCHEMA_VERSION);
+    assert_eq!(metadata.pid, fixture.child.id());
+    assert_eq!(metadata.architecture, "x86_64");
+    assert_eq!(metadata.pointer_width, 8);
+    assert!(!metadata.mutation_enabled, "DMS-014 owns mutation support");
+    assert_eq!(metadata.lifecycle.ready_prefix, READY_PREFIX);
+    assert_eq!(metadata.lifecycle.shutdown_transport, "stdin_line");
+    assert_eq!(metadata.lifecycle.shutdown_command, SHUTDOWN_COMMAND);
+    assert_eq!(metadata.lifecycle.stopped_line, STOPPED_LINE);
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            metadata.pid,
+        )
+    }
+    .map(OwnedHandle)
+    .expect("fixture should allow read-only process access");
+
+    verify_region_protections(&process, &metadata);
+    verify_patterns(&process, &metadata);
+    let first_snapshot = read_primitives(&process, &metadata);
+    let first_chain = read_pointer_chain(&process, &metadata);
+    thread::sleep(Duration::from_millis(25));
+    assert_eq!(read_primitives(&process, &metadata), first_snapshot);
+    assert_eq!(read_pointer_chain(&process, &metadata), first_chain);
+
+    writeln!(
+        fixture
+            .child
+            .stdin
+            .as_mut()
+            .expect("fixture stdin should be piped"),
+        "{SHUTDOWN_COMMAND}"
+    )
+    .expect("shutdown command should be writable");
+    fixture
+        .child
+        .stdin
+        .take()
+        .expect("fixture stdin should exist")
+        .flush()
+        .expect("shutdown command should flush");
+
+    let status = fixture.wait_for_exit(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "fixture should exit successfully: {status}"
+    );
+
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("fixture shutdown output should be readable");
+    assert_eq!(remaining_stdout.trim(), STOPPED_LINE);
+}
+
+fn verify_region_protections(process: &OwnedHandle, metadata: &FixtureMetadata) {
+    assert_eq!(metadata.regions.len(), 2);
+    for region in &metadata.regions {
+        let mut information = MEMORY_BASIC_INFORMATION::default();
+        let result = unsafe {
+            VirtualQueryEx(
+                process.0,
+                Some(parse_address(&region.address) as *const c_void),
+                &mut information,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        assert_eq!(
+            result,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+            "VirtualQueryEx should describe {}",
+            region.name
+        );
+        assert!(information.RegionSize >= region.size);
+        let expected = match region.protection {
+            MemoryProtection::ReadOnly => PAGE_READONLY,
+            MemoryProtection::ReadWrite => PAGE_READWRITE,
+        };
+        assert_eq!(
+            information.Protect, expected,
+            "{} protection should match metadata",
+            region.name
+        );
+    }
+}
+
+fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
+    assert_eq!(metadata.patterns.len(), 2);
+    for pattern in &metadata.patterns {
+        let region = region(metadata, &pattern.region);
+        let bytes = read_memory(process, parse_address(&region.address), region.size);
+        let matches = scan(&bytes, &parse_signature(&pattern.signature));
+        assert_eq!(matches.len(), pattern.expected_matches);
+        assert_eq!(matches, vec![pattern.offset]);
+    }
+}
+
+fn read_primitives(process: &OwnedHandle, metadata: &FixtureMetadata) -> Vec<Vec<u8>> {
+    assert!(metadata.primitives.len() >= 6);
+    metadata
+        .primitives
+        .iter()
+        .map(|primitive| {
+            let region = region(metadata, &primitive.region);
+            let actual = read_memory(
+                process,
+                parse_address(&region.address) + primitive.offset,
+                primitive.size,
+            );
+            assert_eq!(
+                actual,
+                decode_hex(&primitive.expected_bytes),
+                "{} should match its published {} value",
+                primitive.name,
+                primitive.expected
+            );
+            actual
+        })
+        .collect()
+}
+
+fn read_pointer_chain(process: &OwnedHandle, metadata: &FixtureMetadata) -> Vec<u8> {
+    let chain = metadata
+        .pointer_chains
+        .first()
+        .expect("fixture should publish a pointer chain");
+    let root_pattern = metadata
+        .patterns
+        .iter()
+        .find(|pattern| pattern.name == chain.root_pattern)
+        .expect("pointer chain root pattern should exist");
+    let root_region = region(metadata, &root_pattern.region);
+    let region_bytes = read_memory(
+        process,
+        parse_address(&root_region.address),
+        root_region.size,
+    );
+    let matches = scan(&region_bytes, &parse_signature(&root_pattern.signature));
+    assert_eq!(matches.len(), root_pattern.expected_matches);
+    assert_eq!(chain.offsets.len(), chain.dereference_count + 1);
+
+    let mut address = parse_address(&root_region.address) + matches[0];
+    for offset in &chain.offsets[..chain.dereference_count] {
+        let pointer_bytes = read_memory(process, address + offset, metadata.pointer_width);
+        address = usize::from_le_bytes(
+            pointer_bytes
+                .try_into()
+                .expect("pointer bytes should match the platform width"),
+        );
+        assert_ne!(address, 0, "pointer chain should not contain null");
+    }
+    address += chain
+        .offsets
+        .last()
+        .expect("pointer chain should have a target offset");
+    let expected = decode_hex(&chain.expected_bytes);
+    let actual = read_memory(process, address, expected.len());
+    let target_region = region(metadata, &chain.target_region);
+    let target_region_start = parse_address(&target_region.address);
+    assert!(
+        (target_region_start..target_region_start + target_region.size).contains(&address),
+        "pointer chain target should remain inside its published region"
+    );
+    assert_eq!(
+        actual, expected,
+        "pointer chain should resolve to {}",
+        chain.expected
+    );
+    actual
+}
+
+fn read_memory(process: &OwnedHandle, address: usize, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; size];
+    let mut bytes_read = 0usize;
+    unsafe {
+        ReadProcessMemory(
+            process.0,
+            address as *const c_void,
+            bytes.as_mut_ptr().cast::<c_void>(),
+            bytes.len(),
+            Some(&mut bytes_read),
+        )
+    }
+    .unwrap_or_else(|error| panic!("ReadProcessMemory at {address:#x} failed: {error}"));
+    assert_eq!(bytes_read, size);
+    bytes
+}
+
+fn region<'a>(metadata: &'a FixtureMetadata, name: &str) -> &'a MemoryRegionMetadata {
+    metadata
+        .regions
+        .iter()
+        .find(|region| region.name == name)
+        .unwrap_or_else(|| panic!("region {name} should exist"))
+}
+
+fn parse_address(address: &str) -> usize {
+    usize::from_str_radix(
+        address
+            .strip_prefix("0x")
+            .expect("address should use hexadecimal notation"),
+        16,
+    )
+    .expect("address should be valid hexadecimal")
+}
+
+fn parse_signature(signature: &str) -> Vec<Option<u8>> {
+    signature
+        .split_whitespace()
+        .map(|token| {
+            if token == "??" {
+                None
+            } else {
+                Some(u8::from_str_radix(token, 16).expect("signature byte should be hexadecimal"))
+            }
+        })
+        .collect()
+}
+
+fn scan(bytes: &[u8], signature: &[Option<u8>]) -> Vec<usize> {
+    bytes
+        .windows(signature.len())
+        .enumerate()
+        .filter_map(|(offset, window)| {
+            window
+                .iter()
+                .zip(signature)
+                .all(|(actual, expected)| expected.is_none_or(|expected| *actual == expected))
+                .then_some(offset)
+        })
+        .collect()
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    assert_eq!(
+        value.len() % 2,
+        0,
+        "hex byte string should have even length"
+    );
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16)
+                .expect("expected bytes should be hexadecimal")
+        })
+        .collect()
+}
