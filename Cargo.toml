@@ -4,6 +4,8 @@ members = [
     "crates/deimos-agent",
     "crates/deimos-native",
 ]
+# wizlaunch is an independent Maturin package built by the Python workspace.
+exclude = ["libs/wizlaunch"]
 resolver = "2"
 
 [workspace.package]
