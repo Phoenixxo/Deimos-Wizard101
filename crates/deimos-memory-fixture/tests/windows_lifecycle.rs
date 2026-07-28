@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 
 use deimos_agent::process::ProcessSessionRegistry;
 use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
+use deimos_core::memory::{
+    ByteOrder, MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem,
+    MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
+    TypedMemoryReadRequest,
+};
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessKind, MEMORY_FIXTURE_EXECUTABLE,
     OP_PROCESS_STATUS,
@@ -153,6 +158,240 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
                 && !module.executable_path.is_empty()
         }),
         "fixture executable module and path should be present"
+    );
+
+    let session_request = MemorySessionRequest {
+        session_id: session.session_id.clone(),
+    };
+    let readable = deimos_agent::memory::regions(&mut sessions, &backend, &session_request)
+        .expect("agent should enumerate readable regions")
+        .regions;
+    for region in &metadata.regions {
+        let address = parse_address(&region.address);
+        assert!(readable.iter().any(|candidate| {
+            parse_address(&candidate.base_address) <= address
+                && address < parse_address(&candidate.base_address) + candidate.size
+        }));
+    }
+
+    let first_primitive = &metadata.primitives[0];
+    let first_region = region(&metadata, &first_primitive.region);
+    let raw = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: session.session_id.clone(),
+            address: format!(
+                "{:#x}",
+                parse_address(&first_region.address) + first_primitive.offset
+            ),
+            size: first_primitive.size,
+        },
+    )
+    .expect("agent should perform a validated arbitrary read");
+    assert_eq!(raw.bytes, decode_hex(&first_primitive.expected_bytes));
+
+    let batch = deimos_agent::memory::read_batch(
+        &mut sessions,
+        &backend,
+        &MemoryBatchReadRequest {
+            session_id: session.session_id.clone(),
+            reads: metadata
+                .primitives
+                .iter()
+                .map(|primitive| MemoryReadItem {
+                    address: format!(
+                        "{:#x}",
+                        parse_address(&region(&metadata, &primitive.region).address)
+                            + primitive.offset
+                    ),
+                    size: primitive.size,
+                })
+                .collect(),
+        },
+    )
+    .expect("agent should batch-read fixture primitives");
+    assert!(batch.results.iter().all(|result| result.error.is_none()));
+    for (primitive, result) in metadata.primitives.iter().zip(batch.results) {
+        assert_eq!(
+            result
+                .bytes
+                .expect("successful batch item should contain bytes"),
+            decode_hex(&primitive.expected_bytes),
+            "{} should match its published value",
+            primitive.name
+        );
+    }
+
+    for primitive in &metadata.primitives {
+        let value_type = match primitive.data_type.as_str() {
+            "u8" => MemoryValueType::U8,
+            "i32" => MemoryValueType::I32,
+            "u32" => MemoryValueType::U32,
+            "u64" => MemoryValueType::U64,
+            "f32" => MemoryValueType::F32,
+            "f64" => MemoryValueType::F64,
+            other => panic!("unexpected fixture primitive type {other}"),
+        };
+        let typed = deimos_agent::memory::read_typed(
+            &mut sessions,
+            &backend,
+            &TypedMemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: format!(
+                    "{:#x}",
+                    parse_address(&region(&metadata, &primitive.region).address) + primitive.offset
+                ),
+                value_type,
+                byte_order: ByteOrder::LittleEndian,
+            },
+        )
+        .expect("agent should typed-read fixture primitive");
+        assert_eq!(typed.raw_bytes, decode_hex(&primitive.expected_bytes));
+    }
+
+    let exact = metadata
+        .patterns
+        .iter()
+        .find(|pattern| pattern.name == "exact_anchor")
+        .expect("exact fixture pattern should exist");
+    let exact_scan = deimos_agent::memory::scan(
+        &mut sessions,
+        &backend,
+        &MemoryScanRequest {
+            session_id: session.session_id.clone(),
+            signature: exact.signature.clone(),
+            required: true,
+            unique: true,
+            max_matches: 4,
+            scope: MemoryScanScope::Process,
+        },
+    )
+    .expect("exact fixture pattern should have one required match");
+    assert_eq!(
+        exact_scan.matches,
+        vec![format!(
+            "{:#x}",
+            parse_address(&region(&metadata, &exact.region).address) + exact.offset
+        )]
+    );
+
+    let wildcard = metadata
+        .patterns
+        .iter()
+        .find(|pattern| pattern.name == "wildcard_anchor")
+        .expect("wildcard fixture pattern should exist");
+    let wildcard_scan = deimos_agent::memory::scan(
+        &mut sessions,
+        &backend,
+        &MemoryScanRequest {
+            session_id: session.session_id.clone(),
+            signature: wildcard.signature.clone(),
+            required: true,
+            unique: true,
+            max_matches: 4,
+            scope: MemoryScanScope::Process,
+        },
+    )
+    .expect("wildcard fixture pattern should have one required match");
+    assert_eq!(
+        wildcard_scan.matches,
+        vec![format!(
+            "{:#x}",
+            parse_address(&region(&metadata, &wildcard.region).address) + wildcard.offset
+        )]
+    );
+
+    let chain = metadata
+        .pointer_chains
+        .first()
+        .expect("fixture should publish a pointer chain");
+    let root = metadata
+        .patterns
+        .iter()
+        .find(|pattern| pattern.name == chain.root_pattern)
+        .expect("pointer chain root should exist");
+    let resolved = deimos_agent::memory::pointer_chain(
+        &mut sessions,
+        &backend,
+        &MemoryPointerChainRequest {
+            session_id: session.session_id.clone(),
+            signature: root.signature.clone(),
+            offsets: chain.offsets.iter().map(|offset| *offset as u64).collect(),
+            dereference_count: chain.dereference_count,
+            pointer_width: metadata.pointer_width as u8,
+            byte_order: ByteOrder::LittleEndian,
+            value_type: MemoryValueType::U64,
+            scope: MemoryScanScope::Process,
+        },
+    )
+    .expect("agent should resolve the published pointer chain");
+    assert_eq!(resolved.raw_bytes, decode_hex(&chain.expected_bytes));
+    assert!(
+        (parse_address(&region(&metadata, &chain.target_region).address)
+            ..parse_address(&region(&metadata, &chain.target_region).address)
+                + region(&metadata, &chain.target_region).size)
+            .contains(&parse_address(&resolved.target_address))
+    );
+
+    let module_name = modules
+        .modules
+        .iter()
+        .find(|module| module.name.eq_ignore_ascii_case(MEMORY_FIXTURE_EXECUTABLE))
+        .expect("fixture module should be present")
+        .name
+        .clone();
+    let module_scan = deimos_agent::memory::scan(
+        &mut sessions,
+        &backend,
+        &MemoryScanRequest {
+            session_id: session.session_id.clone(),
+            signature: exact.signature.clone(),
+            required: false,
+            unique: true,
+            max_matches: 4,
+            scope: MemoryScanScope::Module {
+                name: module_name.clone(),
+            },
+        },
+    )
+    .expect("module scan should stay within the selected module");
+    assert!(module_scan.matches.is_empty());
+    let required_module_error = deimos_agent::memory::scan(
+        &mut sessions,
+        &backend,
+        &MemoryScanRequest {
+            session_id: session.session_id.clone(),
+            signature: exact.signature.clone(),
+            required: true,
+            unique: true,
+            max_matches: 4,
+            scope: MemoryScanScope::Module { name: module_name },
+        },
+    )
+    .expect_err("required module match should distinguish zero matches");
+    let required_module_error = required_module_error.into_rpc_error(1, "memory.scan");
+    assert_eq!(
+        required_module_error.code,
+        RpcErrorCode::MemoryRequiredMatchNotFound
+    );
+
+    let ambiguous_error = deimos_agent::memory::scan(
+        &mut sessions,
+        &backend,
+        &MemoryScanRequest {
+            session_id: session.session_id.clone(),
+            signature: "??".to_string(),
+            required: false,
+            unique: true,
+            max_matches: 4,
+            scope: MemoryScanScope::Process,
+        },
+    )
+    .expect_err("a wildcard byte should produce an ambiguous unique result");
+    assert_eq!(
+        ambiguous_error.into_rpc_error(1, "memory.scan").code,
+        RpcErrorCode::MemoryAmbiguousMatch
     );
 
     let process = unsafe {

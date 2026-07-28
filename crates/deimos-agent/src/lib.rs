@@ -2,6 +2,12 @@ use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use deimos_core::memory::{
+    MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadRequest, MemoryScanRequest,
+    MemorySessionRequest, TypedMemoryReadRequest, CAPABILITY_MEMORY_READ_ONLY,
+    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
+    OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
+};
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, SessionRequest, CAPABILITY_PROCESS_READ_ONLY,
     OP_MODULE_LIST, OP_PROCESS_CLOSE, OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
@@ -17,6 +23,7 @@ use deimos_core::WINDOWS_AGENT_TARGET;
 
 pub const CAPABILITY_PROBE: &str = "probe";
 
+pub mod memory;
 pub mod process;
 
 #[cfg(windows)]
@@ -31,7 +38,7 @@ use windows_process::WindowsProcessBackend as PlatformProcessBackend;
 #[cfg(not(windows))]
 use process::UnsupportedProcessBackend as PlatformProcessBackend;
 
-use process::{ProcessBackend, ProcessSessionRegistry};
+use process::{MemoryBackend, ProcessSessionRegistry};
 
 #[cfg(windows)]
 pub fn run(request: &ProbeRequest) -> ProbeReport {
@@ -59,6 +66,7 @@ pub fn serve(
         vec![
             CAPABILITY_PROBE.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
+            CAPABILITY_MEMORY_READ_ONLY.to_string(),
         ],
         config,
     ));
@@ -88,7 +96,7 @@ pub fn serve_connection(server: &RpcServer, stream: TcpStream) -> io::Result<()>
     serve_connection_with_service(server, stream, &service)
 }
 
-fn serve_connection_with_service<B: ProcessBackend>(
+fn serve_connection_with_service<B: MemoryBackend>(
     server: &RpcServer,
     stream: TcpStream,
     service: &AgentService<B>,
@@ -96,12 +104,12 @@ fn serve_connection_with_service<B: ProcessBackend>(
     server.serve_connection(stream, |call| service.handle_call(call))
 }
 
-pub struct AgentService<B: ProcessBackend> {
+pub struct AgentService<B: MemoryBackend> {
     backend: B,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
 }
 
-impl<B: ProcessBackend> AgentService<B> {
+impl<B: MemoryBackend> AgentService<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
@@ -114,6 +122,58 @@ impl<B: ProcessBackend> AgentService<B> {
             CAPABILITY_PROBE => {
                 let request: ProbeRequest = decode_payload(call)?;
                 encode_payload(call, run(&request))
+            }
+            OP_MEMORY_REGIONS => {
+                let request: MemorySessionRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    memory::regions(&mut sessions, &self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_READ => {
+                let request: MemoryReadRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    memory::read(&mut sessions, &self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_READ_BATCH => {
+                let request: MemoryBatchReadRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response = memory::read_batch(&mut sessions, &self.backend, &request).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_READ_TYPED => {
+                let request: TypedMemoryReadRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response = memory::read_typed(&mut sessions, &self.backend, &request).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_SCAN => {
+                let request: MemoryScanRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    memory::scan(&mut sessions, &self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_POINTER_CHAIN => {
+                let request: MemoryPointerChainRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response = memory::pointer_chain(&mut sessions, &self.backend, &request)
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
             }
             OP_PROCESS_LIST => {
                 let request: ListProcessesRequest = decode_payload(call)?;
@@ -217,8 +277,9 @@ fn encode_payload<T: Serialize>(call: &RpcCall, value: T) -> Result<Value, Box<R
 mod tests {
     use super::{serve_connection, serve_connection_with_service, AgentService, CAPABILITY_PROBE};
     use crate::process::{
-        OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
+        MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
     };
+    use deimos_core::memory::MemoryRegionDescriptor;
     use deimos_core::process::{
         classify_process, ModuleDescriptor, OpenProcessRequest, ProcessDescriptor, ProcessIdentity,
         ProcessSessionResponse, SessionRequest, CAPABILITY_PROCESS_READ_ONLY, OP_PROCESS_OPEN,
@@ -391,6 +452,28 @@ mod tests {
             _expected: &ProcessIdentity,
         ) -> Result<Vec<ModuleDescriptor>, ProcessBackendError> {
             Ok(Vec::new())
+        }
+    }
+
+    impl MemoryBackend for RpcTestBackend {
+        fn enumerate_memory_regions(
+            &self,
+            _handle: &Self::Handle,
+            _expected: &ProcessIdentity,
+        ) -> Result<Vec<MemoryRegionDescriptor>, ProcessBackendError> {
+            Ok(Vec::new())
+        }
+
+        fn read_memory(
+            &self,
+            _handle: &Self::Handle,
+            _address: usize,
+            _size: usize,
+        ) -> Result<Vec<u8>, ProcessBackendError> {
+            Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                "RPC test backend has no memory fixture",
+            ))
         }
     }
 

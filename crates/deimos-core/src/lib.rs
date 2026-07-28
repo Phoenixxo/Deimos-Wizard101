@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod memory;
 pub mod process;
 pub mod rpc;
 
