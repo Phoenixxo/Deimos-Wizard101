@@ -1,7 +1,10 @@
 #![allow(clippy::useless_conversion)]
 
+pub mod lifecycle;
+
 #[cfg(feature = "python")]
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcConfig};
+#[cfg(feature = "python")]
 use deimos_core::{ProbeRequest, PROTOCOL_SCHEMA_VERSION};
 #[cfg(feature = "python")]
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
