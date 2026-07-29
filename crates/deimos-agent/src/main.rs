@@ -1,3 +1,4 @@
+use deimos_agent::instance::AgentInstanceGuard;
 use deimos_agent::run;
 use deimos_core::rpc::{loopback_address, AuthToken, RpcConfig};
 use deimos_core::ProbeRequest;
@@ -6,6 +7,9 @@ use std::net::TcpListener;
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if let Some(token) = argument_value(&args, "--token") {
+        let _instance_guard = AgentInstanceGuard::acquire().unwrap_or_else(|error| {
+            exit_with_error(&format!("failed to acquire agent instance: {error}"))
+        });
         let port = argument_value(&args, "--listen-port")
             .unwrap_or_else(|| "0".to_string())
             .parse::<u16>()
@@ -18,6 +22,17 @@ fn main() {
             exit_with_error(&format!("failed to inspect agent listener: {error}"))
         });
         println!("DEIMOS_AGENT_LISTEN={address}");
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "component": "deimos-agent",
+                "event": "listening",
+                "address": address.to_string(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "process_id": std::process::id(),
+                "ready": false
+            })
+        );
         if let Err(error) = deimos_agent::serve(listener, token, RpcConfig::default()) {
             exit_with_error(&format!("agent server stopped: {error}"));
         }
@@ -52,6 +67,14 @@ fn argument_value(args: &[String], name: &str) -> Option<String> {
 }
 
 fn exit_with_error(message: &str) -> ! {
-    eprintln!("{message}");
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "component": "deimos-agent",
+            "event": "fatal_error",
+            "message": message,
+            "process_id": std::process::id()
+        })
+    );
     std::process::exit(3);
 }

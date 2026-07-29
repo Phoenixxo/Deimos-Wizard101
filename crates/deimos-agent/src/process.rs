@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::MemoryRegionDescriptor;
 use deimos_core::process::{
     ListModulesResponse, ListProcessesRequest, ListProcessesResponse, ModuleDescriptor,
@@ -306,6 +307,57 @@ impl<H> ProcessSessionRegistry<H> {
         }
         processes.sort_by_key(|process| process.pid);
         Ok(ListProcessesResponse { processes })
+    }
+
+    pub fn refresh_and_diagnose<B: ProcessBackend<Handle = H>>(
+        &mut self,
+        backend: &B,
+    ) -> SessionDiagnostics {
+        let open_sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.state == ProcessSessionState::Open)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+
+        for session_id in open_sessions {
+            let session = self
+                .sessions
+                .get(&session_id)
+                .expect("collected session must still exist");
+            let validation = backend.validate_process(
+                session
+                    .handle
+                    .as_ref()
+                    .expect("open sessions always contain a handle"),
+                session
+                    .process
+                    .identity
+                    .as_ref()
+                    .expect("open sessions always contain an identity"),
+            );
+            if validation.as_ref().is_err_and(|error| {
+                matches!(
+                    error.kind,
+                    ProcessBackendErrorKind::NotFound
+                        | ProcessBackendErrorKind::Exited
+                        | ProcessBackendErrorKind::IdentityMismatch
+                )
+            }) {
+                self.mark_exited(&session_id);
+            }
+        }
+
+        self.sessions
+            .values()
+            .fold(SessionDiagnostics::default(), |mut counts, session| {
+                match session.state {
+                    ProcessSessionState::Open => counts.open += 1,
+                    ProcessSessionState::Closed => counts.closed += 1,
+                    ProcessSessionState::Exited => counts.exited += 1,
+                }
+                counts
+            })
     }
 
     pub fn open<B: ProcessBackend<Handle = H>>(

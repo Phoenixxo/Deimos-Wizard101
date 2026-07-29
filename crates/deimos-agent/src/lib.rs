@@ -1,7 +1,13 @@
 use std::io;
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use deimos_core::lifecycle::{
+    AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
+    AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
+};
 use deimos_core::memory::{
     MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadRequest, MemoryScanRequest,
     MemorySessionRequest, TypedMemoryReadRequest, CAPABILITY_MEMORY_READ_ONLY,
@@ -12,7 +18,7 @@ use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, SessionRequest, CAPABILITY_PROCESS_READ_ONLY,
     OP_MODULE_LIST, OP_PROCESS_CLOSE, OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
 };
-use deimos_core::rpc::{RpcCall, RpcConfig, RpcError, RpcErrorCode, RpcServer};
+use deimos_core::rpc::{AuthToken, RpcCall, RpcConfig, RpcError, RpcErrorCode, RpcServer};
 use deimos_core::{ProbeReport, ProbeRequest};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -23,6 +29,7 @@ use deimos_core::WINDOWS_AGENT_TARGET;
 
 pub const CAPABILITY_PROBE: &str = "probe";
 
+pub mod instance;
 pub mod memory;
 pub mod process;
 
@@ -56,43 +63,63 @@ pub fn run(request: &ProbeRequest) -> ProbeReport {
     report
 }
 
-pub fn serve(
-    listener: TcpListener,
-    token: deimos_core::rpc::AuthToken,
-    config: RpcConfig,
-) -> io::Result<()> {
-    let server = Arc::new(RpcServer::new(
+pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::Result<()> {
+    let service = Arc::new(AgentService::try_new(PlatformProcessBackend)?);
+    let server = Arc::new(RpcServer::with_agent_identity(
         token,
         vec![
+            CAPABILITY_AGENT_LIFECYCLE.to_string(),
             CAPABILITY_PROBE.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
         ],
+        service.identity().clone(),
         config,
     ));
-    let service = Arc::new(AgentService::new(PlatformProcessBackend));
-    for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(stream) => stream,
+    listener.set_nonblocking(true)?;
+    let mut workers = Vec::new();
+    while !service.is_shutting_down() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                let server = Arc::clone(&server);
+                let service = Arc::clone(&service);
+                workers.push(std::thread::spawn(move || {
+                    if let Err(error) = serve_connection_with_service(&server, stream, &service) {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "component": "deimos-agent",
+                                "event": "connection_error",
+                                "message": error.to_string(),
+                                "process_id": std::process::id()
+                            })
+                        );
+                    }
+                }));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => {
-                eprintln!("Deimos agent failed to accept a connection: {error}");
-                continue;
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("agent failed to accept a connection: {error}"),
+                ));
             }
-        };
-
-        let server = Arc::clone(&server);
-        let service = Arc::clone(&service);
-        std::thread::spawn(move || {
-            if let Err(error) = serve_connection_with_service(&server, stream, &service) {
-                eprintln!("Deimos agent connection failed: {error}");
-            }
-        });
+        }
+    }
+    drop(listener);
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("agent connection worker panicked"))?;
     }
     Ok(())
 }
 
 pub fn serve_connection(server: &RpcServer, stream: TcpStream) -> io::Result<()> {
-    let service = AgentService::new(PlatformProcessBackend);
+    let service = AgentService::try_new(PlatformProcessBackend)?;
     serve_connection_with_service(server, stream, &service)
 }
 
@@ -106,19 +133,93 @@ fn serve_connection_with_service<B: MemoryBackend>(
 
 pub struct AgentService<B: MemoryBackend> {
     backend: B,
+    identity: AgentIdentity,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
+    shutting_down: AtomicBool,
 }
 
 impl<B: MemoryBackend> AgentService<B> {
-    pub fn new(backend: B) -> Self {
+    pub fn try_new(backend: B) -> io::Result<Self> {
+        let instance_id = AuthToken::generate()?.as_str().to_string();
+        Ok(Self::with_identity(
+            backend,
+            AgentIdentity {
+                instance_id,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                process_id: std::process::id(),
+            },
+        ))
+    }
+
+    pub fn with_identity(backend: B, identity: AgentIdentity) -> Self {
         Self {
             backend,
+            identity,
             sessions: Mutex::new(ProcessSessionRegistry::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
+    pub fn identity(&self) -> &AgentIdentity {
+        &self.identity
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
     pub fn handle_call(&self, call: &RpcCall) -> Result<Value, Box<RpcError>> {
+        if self.is_shutting_down()
+            && !matches!(call.operation.as_str(), OP_AGENT_HEALTH | OP_AGENT_SHUTDOWN)
+        {
+            return Err(Box::new(RpcError::new(
+                RpcErrorCode::AgentShuttingDown,
+                "agent is shutting down; reconnect after the host starts a replacement",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            )));
+        }
+
         match call.operation.as_str() {
+            OP_AGENT_HEALTH => {
+                let _: AgentHealthRequest = decode_payload(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let sessions = sessions.refresh_and_diagnose(&self.backend);
+                encode_payload(
+                    call,
+                    AgentHealth {
+                        identity: self.identity.clone(),
+                        state: if self.is_shutting_down() {
+                            AgentState::ShuttingDown
+                        } else {
+                            AgentState::Ready
+                        },
+                        sessions,
+                    },
+                )
+            }
+            OP_AGENT_SHUTDOWN => {
+                let request: AgentShutdownRequest = decode_payload(call)?;
+                if request.reason.trim().is_empty() {
+                    return Err(Box::new(RpcError::new(
+                        RpcErrorCode::InvalidRequest,
+                        "agent.shutdown requires a non-empty reason",
+                        call.request_id,
+                        call.operation.clone(),
+                        call.native_context.clone(),
+                    )));
+                }
+                self.shutting_down.store(true, Ordering::Release);
+                encode_payload(
+                    call,
+                    AgentShutdownResponse {
+                        identity: self.identity.clone(),
+                        state: AgentState::ShuttingDown,
+                        reason: request.reason,
+                    },
+                )
+            }
             CAPABILITY_PROBE => {
                 let request: ProbeRequest = decode_payload(call)?;
                 encode_payload(call, run(&request))
@@ -275,9 +376,15 @@ fn encode_payload<T: Serialize>(call: &RpcCall, value: T) -> Result<Value, Box<R
 
 #[cfg(test)]
 mod tests {
-    use super::{serve_connection, serve_connection_with_service, AgentService, CAPABILITY_PROBE};
+    use super::{
+        serve, serve_connection, serve_connection_with_service, AgentService, CAPABILITY_PROBE,
+    };
     use crate::process::{
         MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
+    };
+    use deimos_core::lifecycle::{
+        AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentState,
+        CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
     };
     use deimos_core::memory::MemoryRegionDescriptor;
     use deimos_core::process::{
@@ -286,13 +393,21 @@ mod tests {
         OP_PROCESS_STATUS, WIZARD101_EXECUTABLE,
     };
     use deimos_core::rpc::{
-        AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig, RpcErrorCode,
+        AuthToken, NativeContext, RpcCall, RpcClient, RpcClientError, RpcConfig, RpcErrorCode,
     };
     use deimos_core::{ProbeRequest, PROTOCOL_SCHEMA_VERSION};
     use serde_json::to_value;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
+
+    fn test_identity() -> AgentIdentity {
+        AgentIdentity {
+            instance_id: "agent-lifecycle-test".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            process_id: std::process::id(),
+        }
+    }
 
     #[test]
     fn probe_round_trip_uses_the_authenticated_protocol() {
@@ -509,7 +624,9 @@ mod tests {
         let backend = RpcTestBackend {
             alive: Arc::new(AtomicBool::new(true)),
         };
-        let service = Arc::new(AgentService::new(backend.clone()));
+        let service = Arc::new(
+            AgentService::try_new(backend.clone()).expect("agent identity should be generated"),
+        );
         let server_thread = thread::spawn(move || {
             let mut workers = Vec::new();
             for _ in 0..2 {
@@ -585,5 +702,129 @@ mod tests {
         drop(first);
         drop(second);
         server_thread.join().expect("server should not panic");
+    }
+
+    #[test]
+    fn disconnect_does_not_stop_agent_and_shutdown_is_acknowledged() {
+        let token = AuthToken::generate().expect("token generation should work");
+        let listener = std::net::TcpListener::bind(deimos_core::rpc::loopback_address(0))
+            .expect("agent should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server_token = token.clone();
+        let server_thread = thread::spawn(move || {
+            serve(listener, server_token, RpcConfig::default())
+                .expect("agent should stop gracefully");
+        });
+
+        let first_identity = {
+            let client = RpcClient::connect(
+                address,
+                token.clone(),
+                vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+                None,
+                RpcConfig::default(),
+            )
+            .expect("first host should complete readiness handshake");
+            assert_eq!(
+                client.capabilities,
+                vec![CAPABILITY_AGENT_LIFECYCLE.to_string()]
+            );
+            client.agent.expect("handshake should identify the agent")
+        };
+
+        let mut reconnected = RpcClient::connect(
+            address,
+            token,
+            vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+            None,
+            RpcConfig::default(),
+        )
+        .expect("host should reconnect after disconnect");
+        assert_eq!(
+            reconnected.agent.as_ref(),
+            Some(&first_identity),
+            "disconnect must not replace the agent"
+        );
+        let health: AgentHealth = serde_json::from_value(
+            reconnected
+                .call(
+                    OP_AGENT_HEALTH,
+                    to_value(AgentHealthRequest::default()).expect("health should serialize"),
+                    None,
+                )
+                .expect("reconnected agent should be healthy"),
+        )
+        .expect("health should deserialize");
+        assert_eq!(health.state, AgentState::Ready);
+
+        let shutdown = reconnected
+            .call(
+                OP_AGENT_SHUTDOWN,
+                to_value(AgentShutdownRequest {
+                    reason: "test complete".to_string(),
+                })
+                .expect("shutdown should serialize"),
+                None,
+            )
+            .expect("shutdown should be acknowledged");
+        assert_eq!(
+            shutdown.get("state").and_then(serde_json::Value::as_str),
+            Some("shutting_down")
+        );
+        drop(reconnected);
+        server_thread.join().expect("agent server should not panic");
+    }
+
+    #[test]
+    fn health_invalidates_exited_game_sessions_without_stopping_agent() {
+        let backend = RpcTestBackend {
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        let service = AgentService::with_identity(backend.clone(), test_identity());
+        let open_call = RpcCall {
+            request_id: 1,
+            operation: OP_PROCESS_OPEN.to_string(),
+            payload: to_value(OpenProcessRequest {
+                pid: 336,
+                expected_identity: None,
+            })
+            .expect("open request should serialize"),
+            native_context: None,
+        };
+        service
+            .handle_call(&open_call)
+            .expect("game session should open");
+        backend.alive.store(false, Ordering::SeqCst);
+
+        let health_call = RpcCall {
+            request_id: 2,
+            operation: OP_AGENT_HEALTH.to_string(),
+            payload: to_value(AgentHealthRequest::default())
+                .expect("health request should serialize"),
+            native_context: None,
+        };
+        let health: AgentHealth = serde_json::from_value(
+            service
+                .handle_call(&health_call)
+                .expect("agent health should remain available"),
+        )
+        .expect("health should deserialize");
+
+        assert_eq!(health.state, AgentState::Ready);
+        assert_eq!(health.sessions.open, 0);
+        assert_eq!(health.sessions.exited, 1);
+        assert!(!service.is_shutting_down());
+        assert_eq!(
+            serde_json::from_value::<AgentHealth>(
+                service
+                    .handle_call(&health_call)
+                    .expect("agent should remain healthy after game exit")
+            )
+            .expect("health should deserialize")
+            .state,
+            AgentState::Ready
+        );
     }
 }
