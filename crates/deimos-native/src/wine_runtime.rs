@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,9 @@ pub const DEPLOYED_AGENT_FILE: &str = "deimos-agent.exe";
 const RENDEZVOUS_SCHEMA_VERSION: u32 = 1;
 const MAX_RENDEZVOUS_BYTES: u64 = 16 * 1024;
 const MAX_STDERR_BYTES: u64 = 16 * 1024;
+const MAX_STDERR_ON_DISK_BYTES: u64 = MAX_STDERR_BYTES * 2;
 const MAX_STARTUP_STDOUT_BYTES: usize = 16 * 1024;
+const LOG_LIMIT_INTERVAL: Duration = Duration::from_millis(250);
 const LISTENER_MARKER: &str = "DEIMOS_AGENT_LISTEN=";
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
@@ -150,23 +153,19 @@ struct HostProcessIdentity {
     start_id: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct RendezvousRecord {
     schema_version: u32,
     bottle_id: String,
     address: String,
     token: String,
-    host_process: HostProcessIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_process: Option<HostProcessIdentity>,
     deployed_agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_process_id: Option<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct LaunchLockRecord {
-    owner: HostProcessIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +224,7 @@ impl BottleLayout {
 #[derive(Debug)]
 pub struct WineAgentRuntime {
     config: WineRuntimeConfig,
+    owned_processes: HashMap<BottleId, SharedChild>,
 }
 
 impl WineAgentRuntime {
@@ -235,8 +235,15 @@ impl WineAgentRuntime {
                 Some(validate_executable(&wineserver, "wineserver executable")?);
         }
         config.agent_artifact = validate_agent_artifact(&config.agent_artifact)?;
+        config
+            .environment
+            .entry(OsString::from("WINEDEBUG"))
+            .or_insert_with(|| OsString::from("-all"));
         validate_timing(&config)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            owned_processes: HashMap::new(),
+        })
     }
 
     pub fn config(&self) -> &WineRuntimeConfig {
@@ -272,16 +279,15 @@ impl WineAgentRuntime {
         };
         let record: RendezvousRecord = match serde_json::from_slice(&bytes) {
             Ok(record) => record,
-            Err(error) => {
+            Err(_) => {
                 remove_owned_regular_file(&layout.rendezvous)?;
-                return Err(WineRuntimeError::at_path(
-                    WineRuntimeErrorKind::RendezvousFailed,
-                    &layout.rendezvous,
-                    format!("removed malformed agent rendezvous metadata: {error}"),
-                ));
+                return Ok(None);
             }
         };
-        validate_record(layout, &record)?;
+        if validate_record(layout, &record).is_err() {
+            remove_owned_regular_file(&layout.rendezvous)?;
+            return Ok(None);
+        }
         Ok(Some(record))
     }
 
@@ -344,14 +350,16 @@ impl WineAgentRuntime {
         &self,
         layout: &BottleLayout,
         token: &AuthToken,
+        expected_address: SocketAddr,
     ) -> Result<(Child, SocketAddr, HostProcessIdentity), WineRuntimeError> {
+        cap_diagnostic_file(&layout.stderr)?;
         let stderr = open_secure_log(&layout.stderr)?;
         let mut command = Command::new(&self.config.wine_executable);
         command
             .arg(&layout.deployed_agent)
             .arg("--token-stdin")
             .arg("--listen-port")
-            .arg("0")
+            .arg(expected_address.port().to_string())
             .current_dir(&layout.deployment_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -442,7 +450,19 @@ impl WineAgentRuntime {
                 ));
             }
             match receiver.recv_timeout(self.config.poll_interval.min(remaining)) {
-                Ok(Ok(address)) => return Ok((child, address, process)),
+                Ok(Ok(address)) if address == expected_address => {
+                    return Ok((child, address, process))
+                }
+                Ok(Ok(address)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(WineRuntimeError::new(
+                        WineRuntimeErrorKind::ProcessFailed,
+                        format!(
+                            "Wine agent reported listener {address}, expected {expected_address}"
+                        ),
+                    ));
+                }
                 Ok(Err(error)) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -472,7 +492,27 @@ impl WineAgentRuntime {
         let Ok(record) = serde_json::from_slice::<RendezvousRecord>(&bytes) else {
             return Ok(());
         };
-        if record.host_process == *expected {
+        if record.host_process.as_ref() == Some(expected) {
+            remove_owned_regular_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_record_if_endpoint(
+        &self,
+        path: &Path,
+        endpoint: &AgentEndpoint,
+    ) -> Result<(), WineRuntimeError> {
+        let Some(bytes) = read_secure_file(path, MAX_RENDEZVOUS_BYTES)? else {
+            return Ok(());
+        };
+        let Ok(record) = serde_json::from_slice::<RendezvousRecord>(&bytes) else {
+            return Ok(());
+        };
+        let Ok(recorded) = endpoint_from_record(&record) else {
+            return Ok(());
+        };
+        if recorded.address == endpoint.address && recorded.token == endpoint.token {
             remove_owned_regular_file(path)?;
         }
         Ok(())
@@ -512,22 +552,39 @@ impl AgentRuntime for WineAgentRuntime {
     fn discover(&mut self, bottle: &BottleId) -> Result<Option<AgentEndpoint>, String> {
         let layout = BottleLayout::resolve(bottle).map_err(|error| error.to_string())?;
         ensure_secure_directory(&layout.state_directory).map_err(|error| error.to_string())?;
+        cap_diagnostic_file(&layout.stderr).map_err(|error| error.to_string())?;
         let Some(record) = self
             .read_record(&layout)
             .map_err(|error| error.to_string())?
         else {
             return Ok(None);
         };
-        if !process_identity_matches(&record.host_process)
-            .map_err(|error| format!("failed to inspect recorded Wine agent: {error}"))?
-        {
-            self.cleanup_record_if_process(&layout.rendezvous, &record.host_process)
-                .map_err(|error| error.to_string())?;
+        let endpoint = endpoint_from_record(&record).map_err(|error| error.to_string())?;
+        if let Some(process) = &record.host_process {
+            if !process_identity_matches(process)
+                .map_err(|error| format!("failed to inspect recorded Wine agent: {error}"))?
+            {
+                self.cleanup_record_if_process(&layout.rendezvous, process)
+                    .map_err(|error| error.to_string())?;
+                self.owned_processes.remove(bottle);
+                return Ok(None);
+            }
+            return Ok(Some(endpoint));
+        }
+
+        if launch_lock_is_held(&layout).map_err(|error| error.to_string())? {
             return Ok(None);
         }
-        endpoint_from_record(&record)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        if wait_for_listener(
+            endpoint.address,
+            self.config.startup_timeout,
+            self.config.poll_interval,
+        ) {
+            return Ok(Some(endpoint));
+        }
+        self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint)
+            .map_err(|error| error.to_string())?;
+        Ok(None)
     }
 
     fn launch(&mut self, bottle: &BottleId) -> Result<AgentLaunch, AgentLaunchError> {
@@ -543,15 +600,28 @@ impl AgentRuntime for WineAgentRuntime {
             }
         };
         match self.read_record(&layout) {
-            Ok(Some(record)) => match process_identity_matches(&record.host_process) {
-                Ok(true) => return Err(AgentLaunchError::AlreadyRunning),
-                Ok(false) => self
-                    .cleanup_record_if_process(&layout.rendezvous, &record.host_process)
-                    .map_err(|error| AgentLaunchError::Failed(error.to_string()))?,
-                Err(error) => {
-                    return Err(AgentLaunchError::Failed(format!(
-                        "failed to inspect an existing Wine agent before launch: {error}"
-                    )))
+            Ok(Some(record)) => match record.host_process.as_ref() {
+                Some(process) => match process_identity_matches(process) {
+                    Ok(true) => return Err(AgentLaunchError::AlreadyRunning),
+                    Ok(false) => self
+                        .cleanup_record_if_process(&layout.rendezvous, process)
+                        .map_err(|error| AgentLaunchError::Failed(error.to_string()))?,
+                    Err(error) => {
+                        return Err(AgentLaunchError::Failed(format!(
+                            "failed to inspect an existing Wine agent before launch: {error}"
+                        )))
+                    }
+                },
+                None => {
+                    let endpoint = endpoint_from_record(&record)
+                        .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+                    if TcpStream::connect_timeout(&endpoint.address, self.config.poll_interval)
+                        .is_ok()
+                    {
+                        return Err(AgentLaunchError::AlreadyRunning);
+                    }
+                    self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint)
+                        .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
                 }
             },
             Ok(None) => {}
@@ -562,19 +632,38 @@ impl AgentRuntime for WineAgentRuntime {
         let token = AuthToken::generate().map_err(|error| {
             AgentLaunchError::Failed(format!("failed to generate token: {error}"))
         })?;
-        let (child, address, process) = self
-            .spawn_agent(&layout, &token)
-            .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
-        let record = RendezvousRecord {
+        let reservation = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| {
+            AgentLaunchError::Failed(format!("failed to reserve agent loopback port: {error}"))
+        })?;
+        let address = reservation.local_addr().map_err(|error| {
+            AgentLaunchError::Failed(format!("failed to inspect reserved agent port: {error}"))
+        })?;
+        let endpoint = AgentEndpoint {
+            address,
+            token: token.clone(),
+        };
+        let mut record = RendezvousRecord {
             schema_version: RENDEZVOUS_SCHEMA_VERSION,
             bottle_id: bottle.as_str().to_string(),
             address: address.to_string(),
             token: token.as_str().to_string(),
-            host_process: process.clone(),
+            host_process: None,
             deployed_agent: layout.deployed_agent.to_string_lossy().into_owned(),
             agent_instance_id: None,
             agent_process_id: None,
         };
+        self.write_record(&layout, &record)
+            .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+        drop(reservation);
+
+        let (child, reported_address, process) = match self.spawn_agent(&layout, &token, address) {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint);
+                return Err(AgentLaunchError::Failed(error.to_string()));
+            }
+        };
+        record.host_process = Some(process.clone());
         if let Err(error) = self.write_record(&layout, &record) {
             let mut child = child;
             terminate_owned_child(
@@ -582,15 +671,23 @@ impl AgentRuntime for WineAgentRuntime {
                 self.config.terminate_timeout,
                 self.config.poll_interval,
             );
+            let _ = self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint);
             return Err(AgentLaunchError::Failed(error.to_string()));
         }
+        let child = SharedChild::new(child);
+        let limiter = DiagnosticLimiter::start(layout.stderr.clone(), process.clone());
+        self.owned_processes.insert(bottle.clone(), child.clone());
         Ok(AgentLaunch {
-            endpoint: AgentEndpoint { address, token },
+            endpoint: AgentEndpoint {
+                address: reported_address,
+                token,
+            },
             process: Box::new(LaunchedWineProcess {
                 child,
                 identity: process,
                 rendezvous: layout.rendezvous,
                 stderr: layout.stderr,
+                _limiter: limiter,
             }),
         })
     }
@@ -614,21 +711,38 @@ impl AgentRuntime for WineAgentRuntime {
                 "agent rendezvous metadata changed during authenticated reconnect".to_string(),
             );
         }
-        if !process_identity_matches(&record.host_process)
-            .map_err(|error| format!("failed to inspect reconnected Wine agent: {error}"))?
-        {
-            self.cleanup_record_if_process(&layout.rendezvous, &record.host_process)
-                .map_err(|error| error.to_string())?;
-            return Err("reconnected Wine agent process already exited".to_string());
+        if let Some(process) = &record.host_process {
+            if !process_identity_matches(process)
+                .map_err(|error| format!("failed to inspect reconnected Wine agent: {error}"))?
+            {
+                self.cleanup_record_if_process(&layout.rendezvous, process)
+                    .map_err(|error| error.to_string())?;
+                self.owned_processes.remove(bottle);
+                return Err("reconnected Wine agent process already exited".to_string());
+            }
         }
         record.agent_instance_id = Some(identity.instance_id.clone());
         record.agent_process_id = Some(identity.process_id);
         self.write_record(&layout, &record)
             .map_err(|error| error.to_string())?;
+        if let (Some(child), Some(process)) = (
+            self.owned_processes.get(bottle).cloned(),
+            record.host_process.clone(),
+        ) {
+            return Ok(Box::new(LaunchedWineProcess {
+                child,
+                identity: process.clone(),
+                rendezvous: layout.rendezvous,
+                stderr: layout.stderr.clone(),
+                _limiter: DiagnosticLimiter::start(layout.stderr, process),
+            }));
+        }
+        let process = record.host_process;
         Ok(Box::new(ReconnectedWineProcess {
-            identity: record.host_process,
+            identity: process.clone(),
             rendezvous: layout.rendezvous,
-            stderr: layout.stderr,
+            stderr: layout.stderr.clone(),
+            _limiter: process.map(|process| DiagnosticLimiter::start(layout.stderr, process)),
         }))
     }
 
@@ -654,47 +768,244 @@ impl AgentRuntime for WineAgentRuntime {
             );
         }
 
-        if self
-            .wait_until_exited(&record.host_process, self.config.graceful_retire_timeout)
-            .map_err(|error| error.to_string())?
-        {
-            self.cleanup_record_if_process(&layout.rendezvous, &record.host_process)
-                .map_err(|error| error.to_string())?;
-            return Ok(());
-        }
+        let Some(process) = record.host_process else {
+            thread::sleep(self.config.graceful_retire_timeout);
+            if TcpStream::connect_timeout(&endpoint.address, self.config.poll_interval).is_ok() {
+                return Err(
+                    "agent was recovered from an interrupted launch and remained reachable after graceful shutdown; refusing unsafe PID-only termination"
+                        .to_string(),
+                );
+            }
+            return self
+                .cleanup_record_if_endpoint(&layout.rendezvous, endpoint)
+                .map_err(|error| error.to_string());
+        };
 
-        signal_if_same_process(&record.host_process, libc::SIGTERM)
-            .map_err(|error| error.to_string())?;
-        if !self
-            .wait_until_exited(&record.host_process, self.config.terminate_timeout)
-            .map_err(|error| error.to_string())?
-        {
-            signal_if_same_process(&record.host_process, libc::SIGKILL)
-                .map_err(|error| error.to_string())?;
-            if !self
-                .wait_until_exited(&record.host_process, self.config.terminate_timeout)
+        if let Some(child) = self.owned_processes.remove(bottle) {
+            if !child
+                .wait_until_exited(
+                    self.config.graceful_retire_timeout,
+                    self.config.poll_interval,
+                )
                 .map_err(|error| error.to_string())?
             {
-                return Err(format!(
-                    "Wine agent process {} did not exit after bounded termination",
-                    record.host_process.pid
-                ));
+                child
+                    .signal(libc::SIGTERM)
+                    .map_err(|error| error.to_string())?;
+                if !child
+                    .wait_until_exited(self.config.terminate_timeout, self.config.poll_interval)
+                    .map_err(|error| error.to_string())?
+                {
+                    child.kill().map_err(|error| error.to_string())?;
+                    if !child
+                        .wait_until_exited(self.config.terminate_timeout, self.config.poll_interval)
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Err(format!(
+                            "Wine agent process {} did not exit after bounded termination",
+                            process.pid
+                        ));
+                    }
+                }
             }
+        } else if !self
+            .wait_until_exited(&process, self.config.graceful_retire_timeout)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "reconnected Wine agent process {} did not exit gracefully; refusing unsafe PID-only termination",
+                process.pid
+            ));
         }
-        self.cleanup_record_if_process(&layout.rendezvous, &record.host_process)
+        self.cleanup_record_if_process(&layout.rendezvous, &process)
             .map_err(|error| error.to_string())
     }
 }
 
+#[derive(Clone)]
+struct SharedChild {
+    inner: Arc<SharedChildInner>,
+}
+
+struct SharedChildInner {
+    state: Mutex<SharedChildState>,
+}
+
+struct SharedChildState {
+    child: Option<Child>,
+    exit: Option<ExitStatus>,
+}
+
+impl SharedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            inner: Arc::new(SharedChildInner {
+                state: Mutex::new(SharedChildState {
+                    child: Some(child),
+                    exit: None,
+                }),
+            }),
+        }
+    }
+
+    fn try_wait(&self) -> io::Result<Option<ExitStatus>> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Wine child process lock was poisoned"))?;
+        if let Some(exit) = state.exit {
+            return Ok(Some(exit));
+        }
+        let Some(child) = state.child.as_mut() else {
+            return Ok(state.exit);
+        };
+        let Some(exit) = child.try_wait()? else {
+            return Ok(None);
+        };
+        state.exit = Some(exit);
+        state.child.take();
+        Ok(Some(exit))
+    }
+
+    fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Wine child process lock was poisoned"))?;
+        if state.exit.is_some() {
+            return Ok(());
+        }
+        let Some(child) = state.child.as_mut() else {
+            return Ok(());
+        };
+        if let Some(exit) = child.try_wait()? {
+            state.exit = Some(exit);
+            state.child.take();
+            return Ok(());
+        }
+        let pid = i32::try_from(child.id())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds i32"))?;
+        if unsafe { libc::kill(pid, signal) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    fn kill(&self) -> io::Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("Wine child process lock was poisoned"))?;
+        if state.exit.is_some() {
+            return Ok(());
+        }
+        let Some(child) = state.child.as_mut() else {
+            return Ok(());
+        };
+        match child.try_wait()? {
+            Some(exit) => {
+                state.exit = Some(exit);
+                state.child.take();
+                Ok(())
+            }
+            None => child.kill(),
+        }
+    }
+
+    fn wait_until_exited(&self, timeout: Duration, poll: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+}
+
+impl fmt::Debug for SharedChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedChild(..)")
+    }
+}
+
+impl Drop for SharedChildInner {
+    fn drop(&mut self) {
+        let Ok(state) = self.state.get_mut() else {
+            return;
+        };
+        let Some(mut child) = state.child.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(exit)) => state.exit = Some(exit),
+            Ok(None) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+struct DiagnosticLimiter {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DiagnosticLimiter {
+    fn start(path: PathBuf, process: HostProcessIdentity) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let _ = cap_diagnostic_file_io(&path);
+                if !process_identity_matches(&process).unwrap_or(false) {
+                    break;
+                }
+                thread::sleep(LOG_LIMIT_INTERVAL);
+            }
+            let _ = cap_diagnostic_file_io(&path);
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for DiagnosticLimiter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct LaunchedWineProcess {
-    child: Child,
+    child: SharedChild,
     identity: HostProcessIdentity,
     rendezvous: PathBuf,
     stderr: PathBuf,
+    _limiter: DiagnosticLimiter,
 }
 
 impl AgentProcess for LaunchedWineProcess {
     fn try_wait(&mut self) -> io::Result<Option<AgentExit>> {
+        cap_diagnostic_file_io(&self.stderr)?;
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
@@ -706,24 +1017,23 @@ impl AgentProcess for LaunchedWineProcess {
     }
 }
 
-impl Drop for LaunchedWineProcess {
-    fn drop(&mut self) {
-        let _ = self.child.try_wait();
-    }
-}
-
 struct ReconnectedWineProcess {
-    identity: HostProcessIdentity,
+    identity: Option<HostProcessIdentity>,
     rendezvous: PathBuf,
     stderr: PathBuf,
+    _limiter: Option<DiagnosticLimiter>,
 }
 
 impl AgentProcess for ReconnectedWineProcess {
     fn try_wait(&mut self) -> io::Result<Option<AgentExit>> {
-        if process_identity_matches(&self.identity)? {
+        cap_diagnostic_file_io(&self.stderr)?;
+        let Some(identity) = &self.identity else {
+            return Ok(None);
+        };
+        if process_identity_matches(identity)? {
             return Ok(None);
         }
-        let _ = remove_rendezvous_if_process(&self.rendezvous, &self.identity);
+        let _ = remove_rendezvous_if_process(&self.rendezvous, identity);
         Ok(Some(AgentExit {
             code: None,
             stderr: read_bounded_diagnostic(&self.stderr).unwrap_or_default(),
@@ -731,117 +1041,75 @@ impl AgentProcess for ReconnectedWineProcess {
     }
 }
 
+#[derive(Debug)]
 enum LaunchLockError {
     AlreadyRunning,
     Failed(WineRuntimeError),
 }
 
 struct LaunchGuard {
-    path: PathBuf,
-    owner: HostProcessIdentity,
+    _file: File,
 }
 
 impl LaunchGuard {
     fn acquire(layout: &BottleLayout) -> Result<Self, LaunchLockError> {
-        let owner = process_identity(std::process::id())
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(SECURE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&layout.launch_lock)
             .map_err(|error| {
-                LaunchLockError::Failed(WineRuntimeError::new(
-                    WineRuntimeErrorKind::ProcessFailed,
-                    format!("failed to record launch-lock process identity: {error}"),
-                ))
-            })?
-            .ok_or_else(|| {
-                LaunchLockError::Failed(WineRuntimeError::new(
-                    WineRuntimeErrorKind::ProcessFailed,
-                    "current process disappeared while acquiring launch lock",
+                LaunchLockError::Failed(WineRuntimeError::at_path(
+                    WineRuntimeErrorKind::RendezvousFailed,
+                    &layout.launch_lock,
+                    format!("failed to open launch lock: {error}"),
                 ))
             })?;
-        let record = serde_json::to_vec(&LaunchLockRecord {
-            owner: owner.clone(),
-        })
-        .map_err(|error| {
-            LaunchLockError::Failed(WineRuntimeError::new(
+        let metadata = file.metadata().map_err(|error| {
+            LaunchLockError::Failed(WineRuntimeError::at_path(
                 WineRuntimeErrorKind::RendezvousFailed,
-                format!("failed to serialize launch lock: {error}"),
+                &layout.launch_lock,
+                format!("failed to inspect launch lock: {error}"),
             ))
         })?;
-
-        for _ in 0..2 {
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(SECURE_FILE_MODE)
-                .open(&layout.launch_lock)
-            {
-                Ok(mut file) => {
-                    file.write_all(&record)
-                        .and_then(|_| file.sync_all())
-                        .map_err(|error| {
-                            let _ = fs::remove_file(&layout.launch_lock);
-                            LaunchLockError::Failed(WineRuntimeError::at_path(
-                                WineRuntimeErrorKind::RendezvousFailed,
-                                &layout.launch_lock,
-                                format!("failed to persist launch lock: {error}"),
-                            ))
-                        })?;
-                    return Ok(Self {
-                        path: layout.launch_lock.clone(),
-                        owner,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let existing = read_secure_file(&layout.launch_lock, MAX_RENDEZVOUS_BYTES)
-                        .map_err(LaunchLockError::Failed)?
-                        .ok_or_else(|| {
-                            LaunchLockError::Failed(WineRuntimeError::at_path(
-                                WineRuntimeErrorKind::RendezvousFailed,
-                                &layout.launch_lock,
-                                "launch lock disappeared while being inspected",
-                            ))
-                        })?;
-                    let lock: LaunchLockRecord =
-                        serde_json::from_slice(&existing).map_err(|error| {
-                            LaunchLockError::Failed(WineRuntimeError::at_path(
-                                WineRuntimeErrorKind::RendezvousFailed,
-                                &layout.launch_lock,
-                                format!("launch lock is malformed: {error}"),
-                            ))
-                        })?;
-                    if process_identity_matches(&lock.owner).map_err(|error| {
-                        LaunchLockError::Failed(WineRuntimeError::new(
-                            WineRuntimeErrorKind::ProcessFailed,
-                            format!("failed to inspect launch-lock owner: {error}"),
-                        ))
-                    })? {
-                        return Err(LaunchLockError::AlreadyRunning);
-                    }
-                    remove_owned_regular_file(&layout.launch_lock)
-                        .map_err(LaunchLockError::Failed)?;
-                }
-                Err(error) => {
-                    return Err(LaunchLockError::Failed(WineRuntimeError::at_path(
-                        WineRuntimeErrorKind::RendezvousFailed,
-                        &layout.launch_lock,
-                        format!("failed to acquire launch lock: {error}"),
-                    )))
-                }
-            }
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(LaunchLockError::Failed(WineRuntimeError::at_path(
+                WineRuntimeErrorKind::UnsafeFilesystem,
+                &layout.launch_lock,
+                "launch lock must be an owner-only regular file",
+            )));
         }
-        Err(LaunchLockError::AlreadyRunning)
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(Self { _file: file });
+        }
+        let error = io::Error::last_os_error();
+        let code = error.raw_os_error();
+        if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+            Err(LaunchLockError::AlreadyRunning)
+        } else {
+            Err(LaunchLockError::Failed(WineRuntimeError::at_path(
+                WineRuntimeErrorKind::RendezvousFailed,
+                &layout.launch_lock,
+                format!("failed to acquire launch lock: {error}"),
+            )))
+        }
     }
 }
 
-impl Drop for LaunchGuard {
-    fn drop(&mut self) {
-        let Ok(Some(bytes)) = read_secure_file(&self.path, MAX_RENDEZVOUS_BYTES) else {
-            return;
-        };
-        let Ok(record) = serde_json::from_slice::<LaunchLockRecord>(&bytes) else {
-            return;
-        };
-        if record.owner == self.owner {
-            let _ = fs::remove_file(&self.path);
+fn launch_lock_is_held(layout: &BottleLayout) -> Result<bool, WineRuntimeError> {
+    match LaunchGuard::acquire(layout) {
+        Ok(guard) => {
+            drop(guard);
+            Ok(false)
         }
+        Err(LaunchLockError::AlreadyRunning) => Ok(true),
+        Err(LaunchLockError::Failed(error)) => Err(error),
     }
 }
 
@@ -1086,6 +1354,51 @@ fn write_atomic_secure(
     sync_directory(directory)
 }
 
+fn cap_diagnostic_file(path: &Path) -> Result<(), WineRuntimeError> {
+    cap_diagnostic_file_io(path).map_err(|error| {
+        WineRuntimeError::at_path(
+            WineRuntimeErrorKind::ProcessFailed,
+            path,
+            format!("failed to cap agent stderr diagnostics: {error}"),
+        )
+    })
+}
+
+fn cap_diagnostic_file_io(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent stderr log is not an owner-only regular file",
+        ));
+    }
+    if metadata.len() <= MAX_STDERR_ON_DISK_BYTES {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.seek(SeekFrom::End(-(MAX_STDERR_BYTES as i64)))?;
+    let mut tail = Vec::with_capacity(MAX_STDERR_BYTES as usize);
+    file.read_to_end(&mut tail)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(b"[TRUNCATED]\n")?;
+    file.write_all(&tail)?;
+    file.sync_data()
+}
+
 fn open_secure_log(path: &Path) -> Result<File, WineRuntimeError> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink()
@@ -1104,6 +1417,7 @@ fn open_secure_log(path: &Path) -> Result<File, WineRuntimeError> {
         .truncate(true)
         .write(true)
         .mode(SECURE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_APPEND)
         .open(path)
         .and_then(|file| {
             fs::set_permissions(path, fs::Permissions::from_mode(SECURE_FILE_MODE))?;
@@ -1140,6 +1454,20 @@ fn endpoint_from_record(record: &RendezvousRecord) -> Result<AgentEndpoint, Wine
     Ok(AgentEndpoint { address, token })
 }
 
+fn wait_for_listener(address: SocketAddr, timeout: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if TcpStream::connect_timeout(&address, poll.min(remaining)).is_ok() {
+            return true;
+        }
+        thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 fn validate_record(
     layout: &BottleLayout,
     record: &RendezvousRecord,
@@ -1170,7 +1498,11 @@ fn validate_record(
         ));
     }
     endpoint_from_record(record)?;
-    if record.host_process.pid <= 1 || record.host_process.start_id == 0 {
+    if record
+        .host_process
+        .as_ref()
+        .is_some_and(|process| process.pid <= 1 || process.start_id == 0)
+    {
         return Err(WineRuntimeError::at_path(
             WineRuntimeErrorKind::RendezvousFailed,
             &layout.rendezvous,
@@ -1316,7 +1648,7 @@ fn remove_rendezvous_if_process(path: &Path, expected: &HostProcessIdentity) -> 
     };
     let record: RendezvousRecord = serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if record.host_process == *expected {
+    if record.host_process.as_ref() == Some(expected) {
         fs::remove_file(path)?;
     }
     Ok(())
@@ -1350,42 +1682,6 @@ fn terminate_owned_child(child: &mut Child, timeout: Duration, poll: Duration) {
             Ok(None) if Instant::now() >= deadline => return,
             Ok(None) => thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now()))),
         }
-    }
-}
-
-fn signal_if_same_process(
-    expected: &HostProcessIdentity,
-    signal: libc::c_int,
-) -> Result<(), WineRuntimeError> {
-    if !process_identity_matches(expected).map_err(|error| {
-        WineRuntimeError::new(
-            WineRuntimeErrorKind::ProcessFailed,
-            format!("failed to revalidate Wine process before signaling: {error}"),
-        )
-    })? {
-        return Ok(());
-    }
-    let pid = i32::try_from(expected.pid).map_err(|_| {
-        WineRuntimeError::new(
-            WineRuntimeErrorKind::ProcessFailed,
-            "Wine process ID cannot be represented safely",
-        )
-    })?;
-    let result = unsafe { libc::kill(pid, signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(WineRuntimeError::new(
-            WineRuntimeErrorKind::ProcessFailed,
-            format!(
-                "failed to signal Wine agent process {}: {error}",
-                expected.pid
-            ),
-        ))
     }
 }
 
@@ -1518,11 +1814,15 @@ mod tests {
             .expect("test executable should be executable");
     }
 
-    fn fake_wine_script(port: u16) -> String {
+    fn fake_wine_script() -> String {
         format!(
             r#"#!/bin/sh
 set -eu
 IFS= read -r token
+port=''
+for argument in "$@"; do
+  port="$argument"
+done
 capture="$WINEPREFIX/{MANAGED_STATE_DIRECTORY}/test-capture.txt"
 {{
   printf 'prefix=%s\n' "$WINEPREFIX"
@@ -1532,7 +1832,7 @@ capture="$WINEPREFIX/{MANAGED_STATE_DIRECTORY}/test-capture.txt"
   printf '\n'
   printf 'token_length=%s\n' "${{#token}}"
 }} > "$capture"
-printf '{LISTENER_MARKER}127.0.0.1:{port}\n'
+printf '{LISTENER_MARKER}127.0.0.1:%s\n' "$port"
 trap 'exit 0' TERM INT
 while :; do
   sleep 1
@@ -1543,7 +1843,7 @@ done
 
     fn runtime_fixture(root: &Path, port: u16) -> WineAgentRuntime {
         let wine = root.join(format!("fake-wine-{port}"));
-        write_executable(&wine, &fake_wine_script(port));
+        write_executable(&wine, &fake_wine_script());
         let artifact = root.join(format!("deimos-agent-{port}.exe"));
         fs::write(&artifact, b"MZportable-test-agent")
             .expect("test agent artifact should be written");
@@ -1632,7 +1932,8 @@ done
         let mut runtime = runtime_fixture(&root.path, 43101);
 
         let mut launch = runtime.launch(&bottle).expect("agent should launch");
-        assert_eq!(launch.endpoint.address, "127.0.0.1:43101".parse().unwrap());
+        assert!(launch.endpoint.address.ip().is_loopback());
+        assert_ne!(launch.endpoint.address.port(), 0);
         let endpoint_debug = format!("{:?}", launch.endpoint);
         assert!(endpoint_debug.contains("REDACTED"));
         assert!(!endpoint_debug.contains(launch.endpoint.token.as_str()));
@@ -1735,11 +2036,39 @@ done
         );
         assert_eq!(record.agent_process_id, Some(identity.process_id));
 
-        restarted_host
+        launcher
             .retire(&bottle, &endpoint, "host restart test complete")
-            .expect("reconnected agent should retire");
+            .expect("owned agent should retire");
         let exit = wait_for_exit(&mut monitor);
         assert_eq!(exit.code, None);
+        let _ = wait_for_exit(&mut launch.process);
+    }
+
+    #[test]
+    fn reconnected_runtime_refuses_unsafe_pid_only_termination() {
+        let root = TestDirectory::new("reconnect-retire");
+        let bottle_path = create_bottle(&root.path, "wizard101");
+        let bottle = WineAgentRuntime::bottle_id(&bottle_path).expect("bottle should be valid");
+        let mut launcher = runtime_fixture(&root.path, 43107);
+        let mut launch = launcher.launch(&bottle).expect("agent should launch");
+        let mut restarted_host = runtime_fixture(&root.path, 43107);
+        let endpoint = restarted_host
+            .discover(&bottle)
+            .expect("discovery should work")
+            .expect("agent should be discoverable");
+
+        let error = restarted_host
+            .retire(&bottle, &endpoint, "simulate unresponsive reconnect")
+            .expect_err("reconnected host must not force-signal by PID");
+        assert!(error.contains("refusing unsafe PID-only termination"));
+        assert!(launcher
+            .discover(&bottle)
+            .expect("owned agent should remain discoverable")
+            .is_some());
+
+        launcher
+            .retire(&bottle, &launch.endpoint, "test cleanup")
+            .expect("owning runtime should safely retire the agent");
         let _ = wait_for_exit(&mut launch.process);
     }
 
@@ -1794,15 +2123,34 @@ done
             .expect("malformed state should be written");
         malformed.write_all(b"{not-json").unwrap();
         drop(malformed);
-        let error = runtime
+        assert!(runtime
             .discover(&bottle)
-            .expect_err("malformed state should be reported");
-        assert!(error.contains("removed malformed"));
+            .expect("malformed state should be recovered")
+            .is_none());
         assert!(!layout.rendezvous.exists());
         assert!(runtime
             .discover(&bottle)
             .expect("second discovery should recover")
             .is_none());
+
+        let invalid_schema = RendezvousRecord {
+            schema_version: RENDEZVOUS_SCHEMA_VERSION + 1,
+            bottle_id: bottle.as_str().to_string(),
+            address: "127.0.0.1:43105".to_string(),
+            token: "a".repeat(64),
+            host_process: None,
+            deployed_agent: layout.deployed_agent.to_string_lossy().into_owned(),
+            agent_instance_id: None,
+            agent_process_id: None,
+        };
+        runtime
+            .write_record(&layout, &invalid_schema)
+            .expect("invalid-schema fixture should be written");
+        assert!(runtime
+            .discover(&bottle)
+            .expect("semantic corruption should be recovered")
+            .is_none());
+        assert!(!layout.rendezvous.exists());
 
         let outside = root.path.join("outside-state");
         fs::write(&outside, b"{}").expect("outside state should be written");
@@ -1836,7 +2184,129 @@ done
     }
 
     #[test]
-    fn pid_start_identity_prevents_signaling_a_reused_process_id() {
+    fn interrupted_launch_state_preserves_the_endpoint_and_token() {
+        let root = TestDirectory::new("interrupted-launch");
+        let bottle_path = create_bottle(&root.path, "wizard101");
+        let bottle = WineAgentRuntime::bottle_id(&bottle_path).expect("bottle should be valid");
+        let mut runtime = runtime_fixture(&root.path, 43108);
+        let layout = BottleLayout::resolve(&bottle).expect("layout should resolve");
+        ensure_secure_directory(&layout.state_directory).expect("state directory should exist");
+        ensure_secure_directory(&layout.deployment_directory)
+            .expect("deployment directory should exist");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let record = RendezvousRecord {
+            schema_version: RENDEZVOUS_SCHEMA_VERSION,
+            bottle_id: bottle.as_str().to_string(),
+            address: address.to_string(),
+            token: "b".repeat(64),
+            host_process: None,
+            deployed_agent: layout.deployed_agent.to_string_lossy().into_owned(),
+            agent_instance_id: None,
+            agent_process_id: None,
+        };
+        runtime
+            .write_record(&layout, &record)
+            .expect("pre-launch rendezvous should persist");
+
+        let endpoint = runtime
+            .discover(&bottle)
+            .expect("interrupted launch should be discoverable")
+            .expect("live endpoint should be recovered");
+        assert_eq!(endpoint.address, address);
+        assert_eq!(endpoint.token.as_str(), record.token);
+
+        drop(listener);
+        runtime
+            .retire(&bottle, &endpoint, "interrupted launch cleanup")
+            .expect("untracked endpoint should clean up after becoming unreachable");
+        assert!(!layout.rendezvous.exists());
+    }
+
+    #[test]
+    fn advisory_launch_lock_ignores_partial_file_contents() {
+        let root = TestDirectory::new("launch-lock");
+        let bottle_path = create_bottle(&root.path, "wizard101");
+        let bottle = WineAgentRuntime::bottle_id(&bottle_path).expect("bottle should be valid");
+        let layout = BottleLayout::resolve(&bottle).expect("layout should resolve");
+        ensure_secure_directory(&layout.state_directory).expect("state directory should exist");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(SECURE_FILE_MODE)
+            .open(&layout.launch_lock)
+            .expect("partial lock fixture should be created");
+        file.write_all(b"{partial").unwrap();
+        drop(file);
+
+        let guard =
+            LaunchGuard::acquire(&layout).expect("advisory lock should ignore file contents");
+        assert!(
+            launch_lock_is_held(&layout).expect("held lock should be observable"),
+            "a concurrent manager in the same process must observe the lock"
+        );
+        drop(guard);
+        assert!(layout.launch_lock.exists());
+    }
+
+    #[test]
+    fn diagnostic_log_is_capped_and_wine_debug_is_disabled_by_default() {
+        let root = TestDirectory::new("diagnostic-cap");
+        let bottle_path = create_bottle(&root.path, "wizard101");
+        let bottle = WineAgentRuntime::bottle_id(&bottle_path).expect("bottle should be valid");
+        let runtime = runtime_fixture(&root.path, 43109);
+        assert_eq!(
+            runtime.config().environment.get(OsStr::new("WINEDEBUG")),
+            Some(&OsString::from("-all"))
+        );
+        let layout = BottleLayout::resolve(&bottle).expect("layout should resolve");
+        ensure_secure_directory(&layout.state_directory).expect("state directory should exist");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(SECURE_FILE_MODE)
+            .open(&layout.stderr)
+            .expect("diagnostic fixture should be created");
+        file.write_all(&vec![b'x'; (MAX_STDERR_ON_DISK_BYTES + 4096) as usize])
+            .unwrap();
+        file.write_all(b"TAIL").unwrap();
+        drop(file);
+
+        cap_diagnostic_file(&layout.stderr).expect("diagnostic file should be capped");
+        let capped = fs::read(&layout.stderr).expect("capped log should be readable");
+        assert!(capped.len() <= MAX_STDERR_BYTES as usize + b"[TRUNCATED]\n".len());
+        assert!(capped.ends_with(b"TAIL"));
+    }
+
+    #[test]
+    fn dropping_the_last_shared_child_handle_transfers_it_to_a_reaper() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 0.05")
+            .spawn()
+            .expect("short-lived child should start");
+        let pid = child.id() as libc::pid_t;
+        let shared = SharedChild::new(child);
+        drop(shared);
+        thread::sleep(Duration::from_millis(300));
+
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(
+            result, -1,
+            "shared child should already have been reaped by its final owner"
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn pid_start_identity_detects_a_reused_process_id() {
         let current = process_identity(std::process::id())
             .expect("current process identity should be readable")
             .expect("current process should exist");
@@ -1844,8 +2314,7 @@ done
             pid: current.pid,
             start_id: current.start_id.saturating_add(1),
         };
-        signal_if_same_process(&forged, libc::SIGTERM)
-            .expect("mismatched process identity should not be signaled");
+        assert!(!process_identity_matches(&forged).expect("forged identity should be inspectable"));
         assert!(process_identity_matches(&current).expect("current process should remain alive"));
     }
 
