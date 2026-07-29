@@ -1,23 +1,15 @@
-#![allow(clippy::useless_conversion)]
+#![allow(clippy::useless_conversion, unexpected_cfgs)]
 
 pub mod lifecycle;
+#[cfg(feature = "python")]
+mod python_api;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod wine_runtime;
 
 #[cfg(feature = "python")]
-use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcConfig};
-#[cfg(feature = "python")]
 use deimos_core::{ProbeRequest, PROTOCOL_SCHEMA_VERSION};
 #[cfg(feature = "python")]
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-#[cfg(feature = "python")]
 use pyo3::prelude::*;
-#[cfg(feature = "python")]
-use serde_json::Value;
-#[cfg(feature = "python")]
-use std::net::SocketAddr;
-#[cfg(feature = "python")]
-use std::time::Duration;
 
 #[cfg(feature = "python")]
 #[pyfunction]
@@ -32,63 +24,82 @@ fn default_probe_request_json() -> String {
 }
 
 #[cfg(feature = "python")]
-#[allow(clippy::useless_conversion)]
-#[pyfunction]
-fn new_auth_token() -> PyResult<String> {
-    AuthToken::generate()
-        .map(|token| token.as_str().to_string())
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
-}
-
-#[cfg(feature = "python")]
-#[allow(clippy::useless_conversion)]
-#[pyfunction]
-#[pyo3(signature = (address, token, operation, payload_json, timeout_ms = 5000, native_context_json = None))]
-fn rpc_call_json(
-    address: &str,
-    token: &str,
-    operation: &str,
-    payload_json: &str,
-    timeout_ms: u64,
-    native_context_json: Option<&str>,
-) -> PyResult<String> {
-    let address: SocketAddr = address
-        .parse()
-        .map_err(|error| PyValueError::new_err(format!("invalid RPC address: {error}")))?;
-    let token =
-        AuthToken::from_string(token).map_err(|error| PyValueError::new_err(error.to_string()))?;
-    let payload: Value = serde_json::from_str(payload_json)
-        .map_err(|error| PyValueError::new_err(format!("invalid RPC payload JSON: {error}")))?;
-    let native_context: Option<NativeContext> = native_context_json
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|error| PyValueError::new_err(format!("invalid native context JSON: {error}")))?;
-    let timeout = Duration::from_millis(timeout_ms);
-    let mut client = RpcClient::connect(
-        address,
-        token,
-        Vec::new(),
-        native_context.clone(),
-        RpcConfig {
-            io_timeout: timeout,
-            ..RpcConfig::default()
-        },
-    )
-    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    let response = client
-        .call(operation, payload, native_context)
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-    serde_json::to_string(&response).map_err(|error| {
-        PyRuntimeError::new_err(format!("failed to serialize RPC response: {error}"))
-    })
-}
-
-#[cfg(feature = "python")]
 #[pymodule]
 fn deimos_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
     module.add_function(wrap_pyfunction!(default_probe_request_json, module)?)?;
-    module.add_function(wrap_pyfunction!(new_auth_token, module)?)?;
-    module.add_function(wrap_pyfunction!(rpc_call_json, module)?)?;
+    python_api::register(module)?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "python"))]
+mod tests {
+    use pyo3::prelude::*;
+    use pyo3::types::PyModule;
+
+    #[test]
+    fn python_module_registers_the_managed_read_only_api() {
+        Python::with_gil(|py| {
+            let module =
+                PyModule::new_bound(py, "deimos_native").expect("test module should be created");
+            super::deimos_native(&module).expect("Python module should register");
+
+            for name in [
+                "AgentManager",
+                "DeimosNativeError",
+                "ConfigurationError",
+                "UnsupportedPlatformError",
+                "AgentLifecycleError",
+                "AgentProtocolError",
+                "ProcessError",
+                "MemoryError",
+                "NativePanicError",
+            ] {
+                assert!(
+                    module
+                        .getattr(name)
+                        .unwrap_or_else(|_| panic!("{name} should be exported"))
+                        .is_callable(),
+                    "{name} should be a Python type"
+                );
+            }
+
+            let manager = module
+                .getattr("AgentManager")
+                .expect("AgentManager should be exported");
+            for forbidden in ["new_auth_token", "rpc_call_json"] {
+                assert!(
+                    !module
+                        .hasattr(forbidden)
+                        .expect("module attribute lookup should succeed"),
+                    "{forbidden} must not expose authentication material"
+                );
+            }
+            for method in [
+                "start",
+                "status",
+                "stop",
+                "capabilities",
+                "list_processes",
+                "open_process",
+                "process_status",
+                "close_process",
+                "list_modules",
+                "memory_regions",
+                "read_memory",
+                "read_memory_batch",
+                "read_typed",
+                "scan_memory",
+                "resolve_pointer_chain",
+            ] {
+                assert!(
+                    manager
+                        .getattr(method)
+                        .unwrap_or_else(|_| panic!("AgentManager.{method} should be exported"))
+                        .is_callable(),
+                    "AgentManager.{method} should be callable"
+                );
+            }
+        });
+    }
 }
