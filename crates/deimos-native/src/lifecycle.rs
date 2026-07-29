@@ -13,6 +13,9 @@ use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcC
 use serde::Serialize;
 
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 4096;
+const MAX_STDERR_INPUT_BYTES: usize = MAX_STDERR_DIAGNOSTIC_BYTES * 2;
+const REDACTION_MARKER: &str = "[REDACTED]";
+const TRUNCATION_MARKER: &str = "[TRUNCATED]";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -743,55 +746,95 @@ fn artifact_mismatch_error(
 }
 
 fn bounded_stderr_diagnostic(stderr: &str, token: &str) -> String {
-    let input = stderr
-        .char_indices()
-        .take_while(|(index, character)| {
-            index + character.len_utf8() <= MAX_STDERR_DIAGNOSTIC_BYTES * 2
-        })
-        .map(|(_, character)| character)
-        .collect::<String>();
-    let redacted = if token.is_empty() {
-        input
-    } else {
-        input.replace(token, "[REDACTED]")
-    };
-    let characters = redacted.chars().collect::<Vec<_>>();
+    let mut input_end = stderr.len().min(MAX_STDERR_INPUT_BYTES);
+    while !stderr.is_char_boundary(input_end) {
+        input_end -= 1;
+    }
+    let input = &stderr[..input_end];
+    let input_was_truncated = input_end < stderr.len();
     let mut output = String::new();
     let mut index = 0;
-    while index < characters.len() && output.len() < MAX_STDERR_DIAGNOSTIC_BYTES {
-        if characters[index].is_ascii_hexdigit() {
+    let mut output_was_truncated = false;
+    while index < input.len() {
+        let remaining = &input[index..];
+        if !token.is_empty() && remaining.starts_with(token) {
+            if !push_bounded(&mut output, REDACTION_MARKER, MAX_STDERR_DIAGNOSTIC_BYTES) {
+                output_was_truncated = true;
+                break;
+            }
+            index += token.len();
+            continue;
+        }
+        if input_was_truncated
+            && !token.is_empty()
+            && remaining.len() < token.len()
+            && token.starts_with(remaining)
+        {
+            if !push_bounded(&mut output, REDACTION_MARKER, MAX_STDERR_DIAGNOSTIC_BYTES) {
+                output_was_truncated = true;
+            }
+            index = input.len();
+            continue;
+        }
+
+        if input.as_bytes()[index].is_ascii_hexdigit() {
             let start = index;
-            while index < characters.len() && characters[index].is_ascii_hexdigit() {
+            while index < input.len() && input.as_bytes()[index].is_ascii_hexdigit() {
                 index += 1;
             }
             if index - start >= 64 {
-                push_bounded(&mut output, "[REDACTED]", MAX_STDERR_DIAGNOSTIC_BYTES);
+                if !push_bounded(&mut output, REDACTION_MARKER, MAX_STDERR_DIAGNOSTIC_BYTES) {
+                    output_was_truncated = true;
+                    break;
+                }
                 continue;
             }
             index = start;
         }
 
-        let character = match characters[index] {
-            '\n' | '\t' => characters[index],
+        let character = input[index..]
+            .chars()
+            .next()
+            .expect("index should remain inside input");
+        let character = match character {
+            '\n' | '\t' => character,
             character if character.is_control() => '\u{fffd}',
             character => character,
         };
         if output.len() + character.len_utf8() > MAX_STDERR_DIAGNOSTIC_BYTES {
+            output_was_truncated = true;
             break;
         }
         output.push(character);
-        index += 1;
+        index += input[index..]
+            .chars()
+            .next()
+            .expect("index should remain inside input")
+            .len_utf8();
+    }
+
+    if input_was_truncated || output_was_truncated {
+        let maximum_prefix = MAX_STDERR_DIAGNOSTIC_BYTES - TRUNCATION_MARKER.len();
+        if output.len() > maximum_prefix {
+            let mut boundary = maximum_prefix;
+            while !output.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            output.truncate(boundary);
+        }
+        output.push_str(TRUNCATION_MARKER);
     }
     output
 }
 
-fn push_bounded(output: &mut String, value: &str, maximum: usize) {
+fn push_bounded(output: &mut String, value: &str, maximum: usize) -> bool {
     for character in value.chars() {
         if output.len() + character.len_utf8() > maximum {
-            break;
+            return false;
         }
         output.push(character);
     }
+    true
 }
 
 fn call_health(
@@ -1450,6 +1493,25 @@ mod tests {
                 .len()
                 < MAX_STDERR_DIAGNOSTIC_BYTES + 1024
         );
+    }
+
+    #[test]
+    fn stderr_redaction_covers_token_prefix_at_input_boundary() {
+        let token = "0123456789abcdef".repeat(4);
+        assert_eq!(token.len(), 64);
+        let stderr = format!("{}|{token}", token.repeat(127));
+
+        let diagnostic = bounded_stderr_diagnostic(&stderr, &token);
+
+        assert!(diagnostic.len() <= MAX_STDERR_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.ends_with(TRUNCATION_MARKER));
+        for prefix_length in 16..=token.len() {
+            assert!(
+                !diagnostic.contains(&token[..prefix_length]),
+                "diagnostic exposed a {prefix_length}-byte token prefix"
+            );
+        }
+        assert_eq!(diagnostic.matches(REDACTION_MARKER).count(), 128);
     }
 
     #[test]
