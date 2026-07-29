@@ -5,11 +5,13 @@ on:
   push:
     paths:
       - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/**"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
       - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/**"
       - ".github/workflows/deimos-rust.yml"
 
@@ -56,8 +58,10 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            toolchain: "1.77.2"
           - os: macos-14
             target: aarch64-apple-darwin
+            toolchain: stable
 
     runs-on: ${{ matrix.os }}
 
@@ -66,8 +70,18 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
+        if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
         with:
+          targets: ${{ matrix.target }}
+
+      # Rust 1.78 raised the standard Windows target baseline to Windows 10 and
+      # introduced imports that the Wizard101 CrossOver 23 runtime cannot load.
+      - name: Install Wine-compatible Rust
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@1.77.2
+        with:
+          components: llvm-tools-preview
           targets: ${{ matrix.target }}
 
       - name: Set up Python
@@ -78,8 +92,8 @@ jobs:
       - name: Build workspace
         env:
           PYO3_PYTHON: python
-        run: cargo build --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
+        run: rustup run ${{ matrix.toolchain }} cargo build --locked --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
 
       - name: Run deterministic memory fixture integration test
         if: runner.os == 'Windows'
-        run: cargo test --package deimos-memory-fixture --test windows_lifecycle --target ${{ matrix.target }}
+        run: rustup run ${{ matrix.toolchain }} cargo test --locked --package deimos-memory-fixture --test windows_lifecycle --target ${{ matrix.target }}
