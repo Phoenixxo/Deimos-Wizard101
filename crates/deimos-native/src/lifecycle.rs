@@ -12,6 +12,8 @@ use deimos_core::lifecycle::{
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig};
 use serde::Serialize;
 
+const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 4096;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct BottleId(String);
@@ -34,13 +36,25 @@ impl BottleId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AgentEndpoint {
     pub address: SocketAddr,
     pub token: AuthToken,
 }
 
+impl fmt::Debug for AgentEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentEndpoint")
+            .field("address", &self.address)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 pub trait AgentProcess: Send {
+    /// Nonblocking process-status poll. DMS-009 implementations must bound any
+    /// platform I/O and return already-captured diagnostics.
     fn try_wait(&mut self) -> io::Result<Option<AgentExit>>;
 }
 
@@ -55,6 +69,21 @@ pub struct AgentLaunch {
     pub process: Box<dyn AgentProcess>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentLaunchError {
+    AlreadyRunning,
+    Failed(String),
+}
+
+impl fmt::Display for AgentLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyRunning => formatter.write_str("another host started the bottle agent"),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub trait AgentRuntime {
     /// Return reconnect metadata previously recorded for this opaque bottle.
     /// DMS-009 owns how that metadata is discovered and persisted.
@@ -62,7 +91,16 @@ pub trait AgentRuntime {
 
     /// Start the already-selected agent artifact in the already-selected
     /// runtime. This lifecycle layer does not choose paths or Wine binaries.
-    fn launch(&mut self, bottle: &BottleId) -> Result<AgentLaunch, String>;
+    fn launch(&mut self, bottle: &BottleId) -> Result<AgentLaunch, AgentLaunchError>;
+
+    /// Attach a bounded, nonblocking monitor to an agent discovered after host
+    /// restart. DMS-009 owns the Wine/PID-specific implementation.
+    fn reconnect_monitor(
+        &mut self,
+        bottle: &BottleId,
+        endpoint: &AgentEndpoint,
+        identity: &AgentIdentity,
+    ) -> Result<Box<dyn AgentProcess>, String>;
 
     /// Wait for graceful exit when possible, clear stale rendezvous state, and
     /// safely terminate an unresponsive old process before `launch` returns.
@@ -99,6 +137,7 @@ pub enum LifecycleErrorCode {
     HandshakeFailed,
     HealthCheckFailed,
     AgentExited,
+    MonitoringFailed,
     MissingCapability,
     IdentityMismatch,
     VersionMismatch,
@@ -159,7 +198,7 @@ struct ManagedAgent {
     endpoint: AgentEndpoint,
     identity: AgentIdentity,
     client: RpcClient,
-    process: Option<Box<dyn AgentProcess>>,
+    process: Box<dyn AgentProcess>,
 }
 
 enum Candidate {
@@ -176,6 +215,7 @@ enum Candidate {
 pub struct AgentManager<R: AgentRuntime> {
     runtime: R,
     expected_version: String,
+    expected_build_id: String,
     native_context: NativeContext,
     config: RpcConfig,
     readiness_timeout: Duration,
@@ -184,14 +224,25 @@ pub struct AgentManager<R: AgentRuntime> {
 }
 
 impl<R: AgentRuntime> AgentManager<R> {
-    pub fn new(
+    pub fn new(runtime: R, native_context: NativeContext) -> Self {
+        Self::for_expected_artifact(
+            runtime,
+            env!("CARGO_PKG_VERSION"),
+            deimos_core::BUILD_ID,
+            native_context,
+        )
+    }
+
+    pub fn for_expected_artifact(
         runtime: R,
         expected_version: impl Into<String>,
+        expected_build_id: impl Into<String>,
         native_context: NativeContext,
     ) -> Self {
         Self {
             runtime,
             expected_version: expected_version.into(),
+            expected_build_id: expected_build_id.into(),
             native_context,
             config: RpcConfig::default(),
             readiness_timeout: Duration::from_secs(10),
@@ -239,21 +290,13 @@ impl<R: AgentRuntime> AgentManager<R> {
         if let Some(endpoint) = existing {
             match self.connect_candidate(&bottle, &endpoint) {
                 Ok(Candidate::Ready { client, identity }) => {
-                    let ready = ReadyAgent {
-                        bottle_id: bottle.0.clone(),
-                        identity: identity.clone(),
-                        disposition: AgentDisposition::Reconnected,
-                    };
-                    self.managed.insert(
+                    return self.manage_reconnected(
                         bottle,
-                        ManagedAgent {
-                            endpoint,
-                            identity,
-                            client,
-                            process: None,
-                        },
+                        endpoint,
+                        client,
+                        identity,
+                        AgentDisposition::Reconnected,
                     );
-                    return Ok(ready);
                 }
                 Ok(Candidate::VersionMismatch {
                     mut client,
@@ -261,8 +304,11 @@ impl<R: AgentRuntime> AgentManager<R> {
                 }) => {
                     replacement = true;
                     let reason = format!(
-                        "replace agent version {} with {}",
-                        identity.version, self.expected_version
+                        "replace agent artifact {} ({}) with {} ({})",
+                        identity.version,
+                        identity.build_id,
+                        self.expected_version,
+                        self.expected_build_id
                     );
                     let _ = self.request_shutdown(&bottle, &mut client, &identity, &reason);
                     drop(client);
@@ -276,14 +322,15 @@ impl<R: AgentRuntime> AgentManager<R> {
             }
         }
 
-        let launch = self.runtime.launch(&bottle).map_err(|error| {
-            LifecycleError::new(
+        match self.runtime.launch(&bottle) {
+            Ok(launch) => self.finish_launch(bottle, launch, replacement),
+            Err(AgentLaunchError::AlreadyRunning) => self.converge_after_launch_race(bottle),
+            Err(AgentLaunchError::Failed(error)) => Err(LifecycleError::new(
                 LifecycleErrorCode::LaunchFailed,
                 bottle.as_str(),
                 format!("failed to launch the agent: {error}"),
-            )
-        })?;
-        self.finish_launch(bottle, launch, replacement)
+            )),
+        }
     }
 
     pub fn health(&mut self, bottle: &BottleId) -> Result<AgentHealth, LifecycleError> {
@@ -295,37 +342,22 @@ impl<R: AgentRuntime> AgentManager<R> {
             )
         })?;
 
-        if let Some(process) = managed.process.as_mut() {
-            if let Some(exit) = process.try_wait().map_err(|error| {
-                LifecycleError::new(
-                    LifecycleErrorCode::AgentExited,
-                    bottle.as_str(),
-                    format!("failed to inspect the agent process: {error}"),
-                )
-                .with_instance(&managed.identity)
-            })? {
-                let code = exit
-                    .code
-                    .map_or_else(|| "signal_or_unknown".to_string(), |code| code.to_string());
-                return Err(LifecycleError::new(
-                    LifecycleErrorCode::AgentExited,
-                    bottle.as_str(),
-                    format!(
-                        "agent exited unexpectedly with code {code}; restart the agent for this bottle"
-                    ),
-                )
-                .with_instance(&managed.identity)
-                .with_detail("exit_code", code)
-                .with_detail("stderr", exit.stderr));
-            }
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error);
         }
 
-        call_health(
+        let health = call_health(
             bottle,
             &mut managed.client,
             &managed.identity,
             self.native_context.clone(),
-        )
+        );
+        if health.is_err() {
+            if let Some(error) = poll_process_exit(bottle, managed)? {
+                return Err(error);
+            }
+        }
+        health
     }
 
     pub fn shutdown(
@@ -379,11 +411,98 @@ impl<R: AgentRuntime> AgentManager<R> {
                 "agent handshake omitted identity diagnostics; replace the agent",
             )
         })?;
-        if identity.version != self.expected_version {
+        if identity.version != self.expected_version || identity.build_id != self.expected_build_id
+        {
             return Ok(Candidate::VersionMismatch { client, identity });
         }
         call_health(bottle, &mut client, &identity, self.native_context.clone())?;
         Ok(Candidate::Ready { client, identity })
+    }
+
+    fn manage_reconnected(
+        &mut self,
+        bottle: BottleId,
+        endpoint: AgentEndpoint,
+        client: RpcClient,
+        identity: AgentIdentity,
+        disposition: AgentDisposition,
+    ) -> Result<ReadyAgent, LifecycleError> {
+        let process = self
+            .runtime
+            .reconnect_monitor(&bottle, &endpoint, &identity)
+            .map_err(|error| {
+                LifecycleError::new(
+                    LifecycleErrorCode::MonitoringFailed,
+                    bottle.as_str(),
+                    format!(
+                        "failed to monitor reconnected agent {}; restart or replace it: {error}",
+                        identity.instance_id
+                    ),
+                )
+                .with_instance(&identity)
+            })?;
+        let ready = ReadyAgent {
+            bottle_id: bottle.0.clone(),
+            identity: identity.clone(),
+            disposition,
+        };
+        self.managed.insert(
+            bottle,
+            ManagedAgent {
+                endpoint,
+                identity,
+                client,
+                process,
+            },
+        );
+        Ok(ready)
+    }
+
+    fn converge_after_launch_race(
+        &mut self,
+        bottle: BottleId,
+    ) -> Result<ReadyAgent, LifecycleError> {
+        let deadline = Instant::now() + self.readiness_timeout;
+        let mut last_error = "winner rendezvous metadata is not available yet".to_string();
+        loop {
+            match self.runtime.discover(&bottle) {
+                Ok(Some(endpoint)) => match self.connect_candidate(&bottle, &endpoint) {
+                    Ok(Candidate::Ready { client, identity }) => {
+                        return self.manage_reconnected(
+                            bottle,
+                            endpoint,
+                            client,
+                            identity,
+                            AgentDisposition::Reconnected,
+                        );
+                    }
+                    Ok(Candidate::VersionMismatch { identity, .. }) => {
+                        return Err(artifact_mismatch_error(
+                            &bottle,
+                            &identity,
+                            &self.expected_version,
+                            &self.expected_build_id,
+                            "concurrent launch produced an incompatible agent artifact",
+                        ));
+                    }
+                    Err(error) => last_error = error.message,
+                },
+                Ok(None) => {}
+                Err(error) => last_error = error,
+            }
+            if Instant::now() >= deadline {
+                return Err(LifecycleError::new(
+                    LifecycleErrorCode::LaunchFailed,
+                    bottle.as_str(),
+                    "another host won the agent launch race, but its agent did not become ready",
+                )
+                .with_detail("last_error", last_error));
+            }
+            thread::sleep(
+                self.retry_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
     }
 
     fn finish_launch(
@@ -401,17 +520,13 @@ impl<R: AgentRuntime> AgentManager<R> {
                     format!("failed to inspect the starting agent process: {error}"),
                 )
             })? {
-                let mut error = LifecycleError::new(
-                    LifecycleErrorCode::AgentExited,
-                    bottle.as_str(),
+                let mut error = process_exit_error(
+                    &bottle,
+                    &launch.endpoint,
+                    None,
+                    exit,
                     "agent exited before completing its readiness handshake",
-                )
-                .with_detail(
-                    "exit_code",
-                    exit.code
-                        .map_or_else(|| "signal_or_unknown".to_string(), |code| code.to_string()),
-                )
-                .with_detail("stderr", exit.stderr);
+                );
                 self.record_failed_launch_cleanup(&bottle, &launch.endpoint, &mut error);
                 return Err(error);
             }
@@ -434,7 +549,7 @@ impl<R: AgentRuntime> AgentManager<R> {
                             endpoint: launch.endpoint,
                             identity,
                             client,
-                            process: Some(launch.process),
+                            process: launch.process,
                         },
                     );
                     return Ok(ready);
@@ -444,19 +559,21 @@ impl<R: AgentRuntime> AgentManager<R> {
                     identity,
                 }) => {
                     let reason = format!(
-                        "launched agent version {} does not match required version {}",
-                        identity.version, self.expected_version
+                        "launched agent artifact {} ({}) does not match required artifact {} ({})",
+                        identity.version,
+                        identity.build_id,
+                        self.expected_version,
+                        self.expected_build_id
                     );
                     let _ = self.request_shutdown(&bottle, &mut client, &identity, &reason);
                     drop(client);
-                    let mut error = LifecycleError::new(
-                        LifecycleErrorCode::VersionMismatch,
-                        bottle.as_str(),
+                    let mut error = artifact_mismatch_error(
+                        &bottle,
+                        &identity,
+                        &self.expected_version,
+                        &self.expected_build_id,
                         reason,
-                    )
-                    .with_instance(&identity)
-                    .with_detail("expected_version", self.expected_version.clone())
-                    .with_detail("actual_version", identity.version);
+                    );
                     self.record_failed_launch_cleanup(&bottle, &launch.endpoint, &mut error);
                     return Err(error);
                 }
@@ -557,6 +674,126 @@ impl<R: AgentRuntime> AgentManager<R> {
     }
 }
 
+fn poll_process_exit(
+    bottle: &BottleId,
+    managed: &mut ManagedAgent,
+) -> Result<Option<LifecycleError>, LifecycleError> {
+    let exit = managed.process.try_wait().map_err(|error| {
+        LifecycleError::new(
+            LifecycleErrorCode::AgentExited,
+            bottle.as_str(),
+            format!("failed to inspect the agent process: {error}"),
+        )
+        .with_instance(&managed.identity)
+    })?;
+    Ok(exit.map(|exit| {
+        process_exit_error(
+            bottle,
+            &managed.endpoint,
+            Some(&managed.identity),
+            exit,
+            "agent exited unexpectedly; restart or replace it for this bottle",
+        )
+    }))
+}
+
+fn process_exit_error(
+    bottle: &BottleId,
+    endpoint: &AgentEndpoint,
+    identity: Option<&AgentIdentity>,
+    exit: AgentExit,
+    message: &str,
+) -> LifecycleError {
+    let code = exit
+        .code
+        .map_or_else(|| "signal_or_unknown".to_string(), |code| code.to_string());
+    let mut error = LifecycleError::new(
+        LifecycleErrorCode::AgentExited,
+        bottle.as_str(),
+        format!("{message} (exit code {code})"),
+    )
+    .with_detail("exit_code", code)
+    .with_detail(
+        "stderr",
+        bounded_stderr_diagnostic(&exit.stderr, endpoint.token.as_str()),
+    );
+    if let Some(identity) = identity {
+        error = error.with_instance(identity);
+    }
+    error
+}
+
+fn artifact_mismatch_error(
+    bottle: &BottleId,
+    identity: &AgentIdentity,
+    expected_version: &str,
+    expected_build_id: &str,
+    message: impl Into<String>,
+) -> LifecycleError {
+    LifecycleError::new(
+        LifecycleErrorCode::VersionMismatch,
+        bottle.as_str(),
+        message,
+    )
+    .with_instance(identity)
+    .with_detail("expected_version", expected_version)
+    .with_detail("actual_version", identity.version.clone())
+    .with_detail("expected_build_id", expected_build_id)
+    .with_detail("actual_build_id", identity.build_id.clone())
+}
+
+fn bounded_stderr_diagnostic(stderr: &str, token: &str) -> String {
+    let input = stderr
+        .char_indices()
+        .take_while(|(index, character)| {
+            index + character.len_utf8() <= MAX_STDERR_DIAGNOSTIC_BYTES * 2
+        })
+        .map(|(_, character)| character)
+        .collect::<String>();
+    let redacted = if token.is_empty() {
+        input
+    } else {
+        input.replace(token, "[REDACTED]")
+    };
+    let characters = redacted.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < characters.len() && output.len() < MAX_STDERR_DIAGNOSTIC_BYTES {
+        if characters[index].is_ascii_hexdigit() {
+            let start = index;
+            while index < characters.len() && characters[index].is_ascii_hexdigit() {
+                index += 1;
+            }
+            if index - start >= 64 {
+                push_bounded(&mut output, "[REDACTED]", MAX_STDERR_DIAGNOSTIC_BYTES);
+                continue;
+            }
+            index = start;
+        }
+
+        let character = match characters[index] {
+            '\n' | '\t' => characters[index],
+            character if character.is_control() => '\u{fffd}',
+            character => character,
+        };
+        if output.len() + character.len_utf8() > MAX_STDERR_DIAGNOSTIC_BYTES {
+            break;
+        }
+        output.push(character);
+        index += 1;
+    }
+    output
+}
+
+fn push_bounded(output: &mut String, value: &str, maximum: usize) {
+    for character in value.chars() {
+        if output.len() + character.len_utf8() > maximum {
+            break;
+        }
+        output.push(character);
+    }
+}
+
 fn call_health(
     bottle: &BottleId,
     client: &mut RpcClient,
@@ -618,7 +855,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use deimos_core::lifecycle::{
         AgentHealth, AgentHealthRequest, AgentShutdownRequest, AgentShutdownResponse,
@@ -632,6 +869,8 @@ mod tests {
     #[derive(Clone)]
     struct TestRuntime {
         state: Arc<Mutex<TestRuntimeState>>,
+        discover_barrier: Option<Arc<Barrier>>,
+        discover_barrier_used: bool,
     }
 
     struct TestRuntimeState {
@@ -640,7 +879,9 @@ mod tests {
         launch_count: usize,
         retire_count: usize,
         launch_version: String,
+        launch_build_id: String,
         launch_unready: bool,
+        launch_in_progress: bool,
         process_exit: Arc<Mutex<Option<AgentExit>>>,
     }
 
@@ -653,14 +894,23 @@ mod tests {
                     launch_count: 0,
                     retire_count: 0,
                     launch_version: version.to_string(),
+                    launch_build_id: "test-build-current".to_string(),
                     launch_unready: false,
+                    launch_in_progress: false,
                     process_exit: Arc::new(Mutex::new(None)),
                 })),
+                discover_barrier: None,
+                discover_barrier_used: false,
             }
         }
 
-        fn install_existing(&self, version: &str) -> AgentEndpoint {
-            let (endpoint, shutdown) = start_test_agent(version);
+        fn with_discover_barrier(mut self, barrier: Arc<Barrier>) -> Self {
+            self.discover_barrier = Some(barrier);
+            self
+        }
+
+        fn install_existing(&self, version: &str, build_id: &str) -> AgentEndpoint {
+            let (endpoint, shutdown) = start_test_agent(version, build_id);
             let mut state = self.state.lock().expect("runtime state should lock");
             state.current = Some(endpoint.clone());
             state.agents.insert(endpoint.address, shutdown);
@@ -713,44 +963,78 @@ mod tests {
                 .expect("runtime state should lock")
                 .launch_unready = true;
         }
+
+        fn current_token(&self) -> String {
+            self.state
+                .lock()
+                .expect("runtime state should lock")
+                .current
+                .as_ref()
+                .expect("runtime should have an endpoint")
+                .token
+                .as_str()
+                .to_string()
+        }
     }
 
     impl AgentRuntime for TestRuntime {
         fn discover(&mut self, _bottle: &BottleId) -> Result<Option<AgentEndpoint>, String> {
-            Ok(self
+            let discovered = self
                 .state
                 .lock()
                 .map_err(|error| error.to_string())?
                 .current
-                .clone())
+                .clone();
+            if !self.discover_barrier_used {
+                if let Some(barrier) = &self.discover_barrier {
+                    self.discover_barrier_used = true;
+                    barrier.wait();
+                }
+            }
+            Ok(discovered)
         }
 
-        fn launch(&mut self, _bottle: &BottleId) -> Result<AgentLaunch, String> {
-            let (version, launch_unready, process_exit) = {
-                let state = self.state.lock().map_err(|error| error.to_string())?;
+        fn launch(&mut self, _bottle: &BottleId) -> Result<AgentLaunch, AgentLaunchError> {
+            let (version, build_id, launch_unready, process_exit) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+                if state.current.is_some() || state.launch_in_progress {
+                    return Err(AgentLaunchError::AlreadyRunning);
+                }
+                state.launch_in_progress = true;
                 (
                     state.launch_version.clone(),
+                    state.launch_build_id.clone(),
                     state.launch_unready,
                     Arc::clone(&state.process_exit),
                 )
             };
             let (endpoint, shutdown) = if launch_unready {
-                let listener =
-                    TcpListener::bind(loopback_address(0)).map_err(|error| error.to_string())?;
-                let address = listener.local_addr().map_err(|error| error.to_string())?;
+                let listener = TcpListener::bind(loopback_address(0))
+                    .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+                let address = listener
+                    .local_addr()
+                    .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
                 drop(listener);
                 (
                     AgentEndpoint {
                         address,
-                        token: AuthToken::generate().map_err(|error| error.to_string())?,
+                        token: AuthToken::generate()
+                            .map_err(|error| AgentLaunchError::Failed(error.to_string()))?,
                     },
                     Arc::new(AtomicBool::new(false)),
                 )
             } else {
-                start_test_agent(&version)
+                start_test_agent(&version, &build_id)
             };
             {
-                let mut state = self.state.lock().map_err(|error| error.to_string())?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+                state.launch_in_progress = false;
                 state.launch_count += 1;
                 state.current = Some(endpoint.clone());
                 state.agents.insert(endpoint.address, shutdown);
@@ -759,6 +1043,22 @@ mod tests {
                 endpoint,
                 process: Box::new(TestProcess { exit: process_exit }),
             })
+        }
+
+        fn reconnect_monitor(
+            &mut self,
+            _bottle: &BottleId,
+            _endpoint: &AgentEndpoint,
+            _identity: &AgentIdentity,
+        ) -> Result<Box<dyn AgentProcess>, String> {
+            let process_exit = Arc::clone(
+                &self
+                    .state
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .process_exit,
+            );
+            Ok(Box::new(TestProcess { exit: process_exit }))
         }
 
         fn retire(
@@ -807,16 +1107,25 @@ mod tests {
     }
 
     fn manager(runtime: TestRuntime, version: &str) -> AgentManager<TestRuntime> {
-        AgentManager::new(runtime, version, context())
+        manager_with_build(runtime, version, "test-build-current")
+    }
+
+    fn manager_with_build(
+        runtime: TestRuntime,
+        version: &str,
+        build_id: &str,
+    ) -> AgentManager<TestRuntime> {
+        AgentManager::for_expected_artifact(runtime, version, build_id, context())
             .with_timing(Duration::from_millis(100), Duration::from_millis(2))
     }
 
-    fn start_test_agent(version: &str) -> (AgentEndpoint, Arc<AtomicBool>) {
+    fn start_test_agent(version: &str, build_id: &str) -> (AgentEndpoint, Arc<AtomicBool>) {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
         let identity = AgentIdentity {
             instance_id: format!("test-agent-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             version: version.to_string(),
+            build_id: build_id.to_string(),
             process_id: std::process::id(),
         };
         let token = AuthToken::generate().expect("token should generate");
@@ -976,12 +1285,22 @@ mod tests {
         assert_eq!(reconnected.disposition, AgentDisposition::Reconnected);
         assert_eq!(reconnected.identity, first_identity);
         assert_eq!(runtime.launch_count(), 1);
+
+        runtime.set_process_exit(AgentExit {
+            code: Some(41),
+            stderr: "reconnected agent terminated".to_string(),
+        });
+        let error = restarted_host
+            .health(&bottle())
+            .expect_err("reconnected process exit should remain actionable");
+        assert_eq!(error.code, LifecycleErrorCode::AgentExited);
+        assert_eq!(error.details.get("exit_code"), Some(&"41".to_string()));
     }
 
     #[test]
     fn incompatible_existing_agent_is_gracefully_replaced() {
         let runtime = TestRuntime::new("2.0.0");
-        runtime.install_existing("1.0.0");
+        runtime.install_existing("1.0.0", "test-build-old");
         let mut manager = manager(runtime.clone(), "2.0.0");
 
         let ready = manager
@@ -992,6 +1311,56 @@ mod tests {
         assert_eq!(ready.identity.version, "2.0.0");
         assert_eq!(runtime.retire_count(), 1);
         assert_eq!(runtime.launch_count(), 1);
+    }
+
+    #[test]
+    fn same_version_different_build_is_gracefully_replaced() {
+        let runtime = TestRuntime::new("2.0.0");
+        runtime.install_existing("2.0.0", "test-build-old");
+        let mut manager = manager_with_build(runtime.clone(), "2.0.0", "test-build-current");
+
+        let ready = manager
+            .ensure_agent(bottle())
+            .expect("old build should be replaced");
+
+        assert_eq!(ready.disposition, AgentDisposition::Replaced);
+        assert_eq!(ready.identity.version, "2.0.0");
+        assert_eq!(ready.identity.build_id, "test-build-current");
+        assert_eq!(runtime.retire_count(), 1);
+        assert_eq!(runtime.launch_count(), 1);
+    }
+
+    #[test]
+    fn concurrent_managers_converge_on_the_winning_agent() {
+        let barrier = Arc::new(Barrier::new(2));
+        let runtime = TestRuntime::new("1.2.3").with_discover_barrier(barrier);
+        let first_runtime = runtime.clone();
+        let second_runtime = runtime.clone();
+
+        let first = thread::spawn(move || {
+            let mut manager = manager(first_runtime, "1.2.3")
+                .with_timing(Duration::from_millis(500), Duration::from_millis(2));
+            manager.ensure_agent(bottle())
+        });
+        let second = thread::spawn(move || {
+            let mut manager = manager(second_runtime, "1.2.3")
+                .with_timing(Duration::from_millis(500), Duration::from_millis(2));
+            manager.ensure_agent(bottle())
+        });
+
+        let first = first
+            .join()
+            .expect("first manager should not panic")
+            .expect("first manager should converge");
+        let second = second
+            .join()
+            .expect("second manager should not panic")
+            .expect("second manager should converge");
+
+        assert_eq!(first.identity, second.identity);
+        assert_eq!(runtime.launch_count(), 1);
+        assert!([first.disposition, second.disposition].contains(&AgentDisposition::Started));
+        assert!([first.disposition, second.disposition].contains(&AgentDisposition::Reconnected));
     }
 
     #[test]
@@ -1039,6 +1408,48 @@ mod tests {
             Some(&"wine: agent fault".to_string())
         );
         assert!(error.instance_id.is_some());
+    }
+
+    #[test]
+    fn endpoint_debug_and_exit_diagnostics_redact_tokens_and_bound_stderr() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime.clone(), "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+        let token = runtime.current_token();
+        let endpoint = runtime
+            .state
+            .lock()
+            .expect("runtime state should lock")
+            .current
+            .clone()
+            .expect("endpoint should exist");
+        let endpoint_debug = format!("{endpoint:?}");
+        assert!(!endpoint_debug.contains(&token));
+        assert!(endpoint_debug.contains("REDACTED"));
+
+        runtime.set_process_exit(AgentExit {
+            code: Some(23),
+            stderr: format!("token={token}\0{}", "x".repeat(16_000)),
+        });
+        let error = manager
+            .health(&bottle())
+            .expect_err("terminated agent must fail health");
+        let stderr = error
+            .details
+            .get("stderr")
+            .expect("stderr should be recorded");
+        assert!(!stderr.contains(&token));
+        assert!(!stderr.contains('\0'));
+        assert!(stderr.contains("REDACTED"));
+        assert!(stderr.len() <= MAX_STDERR_DIAGNOSTIC_BYTES);
+        assert!(
+            serde_json::to_string(&error)
+                .expect("error should serialize")
+                .len()
+                < MAX_STDERR_DIAGNOSTIC_BYTES + 1024
+        );
     }
 
     #[test]
