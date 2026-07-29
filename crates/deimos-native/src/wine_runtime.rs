@@ -627,9 +627,10 @@ impl AgentRuntime for WineAgentRuntime {
         ) {
             return Ok(Some(endpoint));
         }
-        self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint)
-            .map_err(|error| error.to_string())?;
-        Ok(None)
+        Err(
+            "interrupted Wine agent launch could not be authenticated; preserving rendezvous metadata because handshake failure is not proof of process exit"
+                .to_string(),
+        )
     }
 
     fn launch(&mut self, bottle: &BottleId) -> Result<AgentLaunch, AgentLaunchError> {
@@ -663,8 +664,10 @@ impl AgentRuntime for WineAgentRuntime {
                     if authenticated_agent_reachable(&endpoint, self.config.poll_interval) {
                         return Err(AgentLaunchError::AlreadyRunning);
                     }
-                    self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint)
-                        .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
+                    return Err(AgentLaunchError::Failed(
+                        "interrupted Wine agent launch could not be authenticated; refusing to discard its only recovery metadata without proof of process exit"
+                            .to_string(),
+                    ));
                 }
             },
             Ok(None) => {}
@@ -809,15 +812,14 @@ impl AgentRuntime for WineAgentRuntime {
 
         let Some(process) = record.host_process else {
             thread::sleep(self.config.graceful_retire_timeout);
-            if authenticated_agent_reachable(endpoint, self.config.poll_interval) {
-                return Err(
-                    "agent was recovered from an interrupted launch and remained reachable after graceful shutdown; refusing unsafe PID-only termination"
-                        .to_string(),
-                );
-            }
-            return self
-                .cleanup_record_if_endpoint(&layout.rendezvous, endpoint)
-                .map_err(|error| error.to_string());
+            let state = if authenticated_agent_reachable(endpoint, self.config.poll_interval) {
+                "remained reachable"
+            } else {
+                "could not be authenticated"
+            };
+            return Err(format!(
+                "agent was recovered from an interrupted launch and {state} after graceful shutdown; preserving rendezvous metadata because handshake failure is not proof of process exit"
+            ));
         };
 
         if let Some(child) = self.owned_processes.remove(bottle) {
@@ -2296,10 +2298,20 @@ done
         assert_eq!(endpoint.token.as_str(), record.token);
 
         server.join().expect("test server should stop");
-        runtime
+        let error = runtime
             .retire(&bottle, &endpoint, "interrupted launch cleanup")
-            .expect("untracked endpoint should clean up after becoming unreachable");
-        assert!(!layout.rendezvous.exists());
+            .expect_err("untracked endpoint must fail closed without proof of process exit");
+        assert!(error.contains("preserving rendezvous metadata"));
+        assert!(layout.rendezvous.exists());
+        let launch_error = match runtime.launch(&bottle) {
+            Ok(_) => panic!("direct launch must not discard interrupted recovery state"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            launch_error,
+            AgentLaunchError::Failed(message)
+                if message.contains("refusing to discard its only recovery metadata")
+        ));
     }
 
     #[test]
