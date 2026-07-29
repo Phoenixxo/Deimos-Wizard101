@@ -25,24 +25,29 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to locate the sysroot for Rust toolchain '$Toolchain'."
 }
 
-$llvmObjdump = Join-Path $sysroot "lib/rustlib/$hostTriple/bin/llvm-objdump.exe"
-if (-not (Test-Path -LiteralPath $llvmObjdump -PathType Leaf)) {
+$llvmReadobj = Join-Path $sysroot "lib/rustlib/$hostTriple/bin/llvm-readobj.exe"
+if (-not (Test-Path -LiteralPath $llvmReadobj -PathType Leaf)) {
     throw @"
-llvm-objdump was not found for Rust toolchain '$Toolchain'.
+llvm-readobj was not found for Rust toolchain '$Toolchain'.
 Install it with:
   rustup component add llvm-tools-preview --toolchain $Toolchain
 "@
 }
 
-$importOutput = & $llvmObjdump -p $AgentPath 2>&1
+$resolvedAgentPath = (Resolve-Path -LiteralPath $AgentPath).Path
+$importOutput = & $llvmReadobj --coff-imports $resolvedAgentPath 2>&1
 if ($LASTEXITCODE -ne 0) {
-    throw "llvm-objdump could not inspect '$AgentPath'."
+    $diagnostic = ($importOutput | ForEach-Object { "$_" }) -join [Environment]::NewLine
+    throw @"
+llvm-readobj could not inspect '$resolvedAgentPath' (exit code $LASTEXITCODE).
+$diagnostic
+"@
 }
 
 $imports = @(
     $importOutput |
         ForEach-Object {
-            if ($_ -match "DLL Name:\s*(\S+)") {
+            if ($_ -match "^\s*Name:\s*(\S+\.dll)\s*$") {
                 $Matches[1].ToLowerInvariant()
             }
         } |
