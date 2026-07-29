@@ -3,18 +3,18 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use deimos_core::lifecycle::AgentIdentity;
-use deimos_core::rpc::AuthToken;
+use deimos_core::rpc::{AuthToken, RpcClient, RpcConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{
@@ -33,7 +33,6 @@ const MAX_RENDEZVOUS_BYTES: u64 = 16 * 1024;
 const MAX_STDERR_BYTES: u64 = 16 * 1024;
 const MAX_STDERR_ON_DISK_BYTES: u64 = MAX_STDERR_BYTES * 2;
 const MAX_STARTUP_STDOUT_BYTES: usize = 16 * 1024;
-const LOG_LIMIT_INTERVAL: Duration = Duration::from_millis(250);
 const LISTENER_MARKER: &str = "DEIMOS_AGENT_LISTEN=";
 const SECURE_DIRECTORY_MODE: u32 = 0o700;
 const SECURE_FILE_MODE: u32 = 0o600;
@@ -279,12 +278,42 @@ impl WineAgentRuntime {
         };
         let record: RendezvousRecord = match serde_json::from_slice(&bytes) {
             Ok(record) => record,
-            Err(_) => {
-                remove_owned_regular_file(&layout.rendezvous)?;
-                return Ok(None);
+            Err(error) => {
+                return Err(WineRuntimeError::at_path(
+                    WineRuntimeErrorKind::RendezvousFailed,
+                    &layout.rendezvous,
+                    format!(
+                        "agent rendezvous metadata is malformed; preserving it to avoid orphaning a potentially live agent: {error}"
+                    ),
+                ));
             }
         };
-        if validate_record(layout, &record).is_err() {
+        if let Err(validation_error) = validate_record(layout, &record) {
+            let live_process = match record.host_process.as_ref() {
+                Some(process) => process_identity_matches(process).map_err(|error| {
+                    WineRuntimeError::at_path(
+                        WineRuntimeErrorKind::RendezvousFailed,
+                        &layout.rendezvous,
+                        format!(
+                            "failed to determine whether invalid rendezvous metadata belongs to a live process: {error}"
+                        ),
+                    )
+                })?,
+                None => endpoint_from_record(&record)
+                    .ok()
+                    .is_some_and(|endpoint| {
+                        authenticated_agent_reachable(&endpoint, self.config.poll_interval)
+                    }),
+            };
+            if live_process {
+                return Err(WineRuntimeError::at_path(
+                    WineRuntimeErrorKind::RendezvousFailed,
+                    &layout.rendezvous,
+                    format!(
+                        "agent rendezvous metadata is invalid but still identifies a live agent; preserving it for safe recovery: {validation_error}"
+                    ),
+                ));
+            }
             remove_owned_regular_file(&layout.rendezvous)?;
             return Ok(None);
         }
@@ -353,7 +382,7 @@ impl WineAgentRuntime {
         expected_address: SocketAddr,
     ) -> Result<(Child, SocketAddr, HostProcessIdentity), WineRuntimeError> {
         cap_diagnostic_file(&layout.stderr)?;
-        let stderr = open_secure_log(&layout.stderr)?;
+        let diagnostic_file = open_secure_log(&layout.stderr)?;
         let mut command = Command::new(&self.config.wine_executable);
         command
             .arg(&layout.deployed_agent)
@@ -363,7 +392,7 @@ impl WineAgentRuntime {
             .current_dir(&layout.deployment_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::piped())
             .envs(&self.config.environment)
             .env("WINEPREFIX", &layout.bottle)
             .env("WINELOADER", &self.config.wine_executable);
@@ -378,6 +407,22 @@ impl WineAgentRuntime {
                 format!("failed to start the Wine agent process: {error}"),
             )
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            WineRuntimeError::new(
+                WineRuntimeErrorKind::ProcessFailed,
+                "Wine agent stderr was not piped",
+            )
+        })?;
+        if let Err(error) = start_diagnostic_capture(stderr, diagnostic_file, layout.stderr.clone())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(WineRuntimeError::at_path(
+                WineRuntimeErrorKind::ProcessFailed,
+                &layout.stderr,
+                format!("failed to start bounded agent diagnostic capture: {error}"),
+            ));
+        }
         let process = match process_identity(child.id()) {
             Ok(Some(identity)) => identity,
             Ok(None) => {
@@ -575,8 +620,8 @@ impl AgentRuntime for WineAgentRuntime {
         if launch_lock_is_held(&layout).map_err(|error| error.to_string())? {
             return Ok(None);
         }
-        if wait_for_listener(
-            endpoint.address,
+        if wait_for_authenticated_agent(
+            &endpoint,
             self.config.startup_timeout,
             self.config.poll_interval,
         ) {
@@ -615,9 +660,7 @@ impl AgentRuntime for WineAgentRuntime {
                 None => {
                     let endpoint = endpoint_from_record(&record)
                         .map_err(|error| AgentLaunchError::Failed(error.to_string()))?;
-                    if TcpStream::connect_timeout(&endpoint.address, self.config.poll_interval)
-                        .is_ok()
-                    {
+                    if authenticated_agent_reachable(&endpoint, self.config.poll_interval) {
                         return Err(AgentLaunchError::AlreadyRunning);
                     }
                     self.cleanup_record_if_endpoint(&layout.rendezvous, &endpoint)
@@ -675,7 +718,6 @@ impl AgentRuntime for WineAgentRuntime {
             return Err(AgentLaunchError::Failed(error.to_string()));
         }
         let child = SharedChild::new(child);
-        let limiter = DiagnosticLimiter::start(layout.stderr.clone(), process.clone());
         self.owned_processes.insert(bottle.clone(), child.clone());
         Ok(AgentLaunch {
             endpoint: AgentEndpoint {
@@ -687,7 +729,6 @@ impl AgentRuntime for WineAgentRuntime {
                 identity: process,
                 rendezvous: layout.rendezvous,
                 stderr: layout.stderr,
-                _limiter: limiter,
             }),
         })
     }
@@ -733,16 +774,14 @@ impl AgentRuntime for WineAgentRuntime {
                 child,
                 identity: process.clone(),
                 rendezvous: layout.rendezvous,
-                stderr: layout.stderr.clone(),
-                _limiter: DiagnosticLimiter::start(layout.stderr, process),
+                stderr: layout.stderr,
             }));
         }
         let process = record.host_process;
         Ok(Box::new(ReconnectedWineProcess {
             identity: process.clone(),
             rendezvous: layout.rendezvous,
-            stderr: layout.stderr.clone(),
-            _limiter: process.map(|process| DiagnosticLimiter::start(layout.stderr, process)),
+            stderr: layout.stderr,
         }))
     }
 
@@ -770,7 +809,7 @@ impl AgentRuntime for WineAgentRuntime {
 
         let Some(process) = record.host_process else {
             thread::sleep(self.config.graceful_retire_timeout);
-            if TcpStream::connect_timeout(&endpoint.address, self.config.poll_interval).is_ok() {
+            if authenticated_agent_reachable(endpoint, self.config.poll_interval) {
                 return Err(
                     "agent was recovered from an interrupted launch and remained reachable after graceful shutdown; refusing unsafe PID-only termination"
                         .to_string(),
@@ -960,47 +999,11 @@ impl Drop for SharedChildInner {
     }
 }
 
-struct DiagnosticLimiter {
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl DiagnosticLimiter {
-    fn start(path: PathBuf, process: HostProcessIdentity) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let handle = thread::spawn(move || {
-            while !thread_stop.load(Ordering::Acquire) {
-                let _ = cap_diagnostic_file_io(&path);
-                if !process_identity_matches(&process).unwrap_or(false) {
-                    break;
-                }
-                thread::sleep(LOG_LIMIT_INTERVAL);
-            }
-            let _ = cap_diagnostic_file_io(&path);
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for DiagnosticLimiter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 struct LaunchedWineProcess {
     child: SharedChild,
     identity: HostProcessIdentity,
     rendezvous: PathBuf,
     stderr: PathBuf,
-    _limiter: DiagnosticLimiter,
 }
 
 impl AgentProcess for LaunchedWineProcess {
@@ -1021,7 +1024,6 @@ struct ReconnectedWineProcess {
     identity: Option<HostProcessIdentity>,
     rendezvous: PathBuf,
     stderr: PathBuf,
-    _limiter: Option<DiagnosticLimiter>,
 }
 
 impl AgentProcess for ReconnectedWineProcess {
@@ -1432,6 +1434,36 @@ fn open_secure_log(path: &Path) -> Result<File, WineRuntimeError> {
         })
 }
 
+fn start_diagnostic_capture(
+    mut reader: impl Read + Send + 'static,
+    mut output: File,
+    path: PathBuf,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("deimos-agent-stderr".to_string())
+        .spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if output.write_all(&buffer[..read]).is_err() {
+                            break;
+                        }
+                        if cap_diagnostic_file_io(&path).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = output.flush();
+            let _ = cap_diagnostic_file_io(&path);
+        })
+        .map(|_| ())
+}
+
 fn endpoint_from_record(record: &RendezvousRecord) -> Result<AgentEndpoint, WineRuntimeError> {
     let address: SocketAddr = record.address.parse().map_err(|error| {
         WineRuntimeError::new(
@@ -1454,14 +1486,33 @@ fn endpoint_from_record(record: &RendezvousRecord) -> Result<AgentEndpoint, Wine
     Ok(AgentEndpoint { address, token })
 }
 
-fn wait_for_listener(address: SocketAddr, timeout: Duration, poll: Duration) -> bool {
+fn authenticated_agent_reachable(endpoint: &AgentEndpoint, timeout: Duration) -> bool {
+    let default = RpcConfig::default();
+    RpcClient::connect(
+        endpoint.address,
+        endpoint.token.clone(),
+        Vec::new(),
+        None,
+        RpcConfig {
+            max_message_size: default.max_message_size,
+            io_timeout: timeout,
+        },
+    )
+    .is_ok()
+}
+
+fn wait_for_authenticated_agent(
+    endpoint: &AgentEndpoint,
+    timeout: Duration,
+    poll: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return false;
         }
-        if TcpStream::connect_timeout(&address, poll.min(remaining)).is_ok() {
+        if authenticated_agent_reachable(endpoint, poll.min(remaining)) {
             return true;
         }
         thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
@@ -1773,6 +1824,8 @@ fn format_exit_status(status: ExitStatus) -> String {
 mod tests {
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use deimos_core::rpc::RpcServer;
 
     use super::*;
 
@@ -2123,15 +2176,14 @@ done
             .expect("malformed state should be written");
         malformed.write_all(b"{not-json").unwrap();
         drop(malformed);
-        assert!(runtime
+        let error = runtime
             .discover(&bottle)
-            .expect("malformed state should be recovered")
-            .is_none());
-        assert!(!layout.rendezvous.exists());
-        assert!(runtime
-            .discover(&bottle)
-            .expect("second discovery should recover")
-            .is_none());
+            .expect_err("malformed state must fail closed without being destroyed");
+        assert!(error.contains("malformed"));
+        assert!(error.contains("preserving"));
+        assert!(layout.rendezvous.exists());
+        remove_owned_regular_file(&layout.rendezvous)
+            .expect("test should remove the preserved malformed fixture");
 
         let invalid_schema = RendezvousRecord {
             schema_version: RENDEZVOUS_SCHEMA_VERSION + 1,
@@ -2151,6 +2203,22 @@ done
             .expect("semantic corruption should be recovered")
             .is_none());
         assert!(!layout.rendezvous.exists());
+
+        let live_invalid_schema = RendezvousRecord {
+            host_process: process_identity(std::process::id())
+                .expect("test process identity should be readable"),
+            ..invalid_schema
+        };
+        runtime
+            .write_record(&layout, &live_invalid_schema)
+            .expect("live invalid-schema fixture should be written");
+        let error = runtime
+            .discover(&bottle)
+            .expect_err("invalid live state must be preserved");
+        assert!(error.contains("invalid but still identifies a live agent"));
+        assert!(layout.rendezvous.exists());
+        remove_owned_regular_file(&layout.rendezvous)
+            .expect("test should remove the preserved live fixture");
 
         let outside = root.path.join("outside-state");
         fs::write(&outside, b"{}").expect("outside state should be written");
@@ -2198,11 +2266,19 @@ done
         let address = listener
             .local_addr()
             .expect("listener should have an address");
+        let token = AuthToken::from_string("b".repeat(64)).expect("test token should be accepted");
+        let server_token = token.clone();
+        let server = thread::spawn(move || {
+            let rpc = RpcServer::new(server_token, Vec::new(), RpcConfig::default());
+            let (stream, _) = listener.accept().expect("test server should accept");
+            rpc.serve_connection(stream, |_| Ok(serde_json::Value::Null))
+                .expect("test server should authenticate");
+        });
         let record = RendezvousRecord {
             schema_version: RENDEZVOUS_SCHEMA_VERSION,
             bottle_id: bottle.as_str().to_string(),
             address: address.to_string(),
-            token: "b".repeat(64),
+            token: token.as_str().to_string(),
             host_process: None,
             deployed_agent: layout.deployed_agent.to_string_lossy().into_owned(),
             agent_instance_id: None,
@@ -2219,11 +2295,27 @@ done
         assert_eq!(endpoint.address, address);
         assert_eq!(endpoint.token.as_str(), record.token);
 
-        drop(listener);
+        server.join().expect("test server should stop");
         runtime
             .retire(&bottle, &endpoint, "interrupted launch cleanup")
             .expect("untracked endpoint should clean up after becoming unreachable");
         assert!(!layout.rendezvous.exists());
+    }
+
+    #[test]
+    fn interrupted_launch_rejects_an_unauthenticated_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let endpoint = AgentEndpoint {
+            address: listener
+                .local_addr()
+                .expect("listener should have an address"),
+            token: AuthToken::from_string("c".repeat(64)).expect("test token should be accepted"),
+        };
+
+        assert!(
+            !authenticated_agent_reachable(&endpoint, Duration::from_millis(20)),
+            "generic TCP reachability must not be mistaken for the managed agent"
+        );
     }
 
     #[test]
@@ -2279,6 +2371,29 @@ done
         let capped = fs::read(&layout.stderr).expect("capped log should be readable");
         assert!(capped.len() <= MAX_STDERR_BYTES as usize + b"[TRUNCATED]\n".len());
         assert!(capped.ends_with(b"TAIL"));
+
+        let mut captured_input = vec![b'y'; (MAX_STDERR_ON_DISK_BYTES * 3) as usize];
+        captured_input.extend_from_slice(b"CAPTURE-TAIL");
+        let output = open_secure_log(&layout.stderr).expect("capture log should open securely");
+        start_diagnostic_capture(
+            io::Cursor::new(captured_input),
+            output,
+            layout.stderr.clone(),
+        )
+        .expect("capture thread should start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let captured = fs::read(&layout.stderr).expect("capture log should be readable");
+            if captured.ends_with(b"CAPTURE-TAIL") {
+                assert!(captured.len() <= MAX_STDERR_ON_DISK_BYTES as usize);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "diagnostic capture did not finish before the deadline"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
