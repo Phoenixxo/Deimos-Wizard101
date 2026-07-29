@@ -10,8 +10,8 @@ pub struct AgentIdentity {
     pub instance_id: String,
     /// Agent application version, independent of the RPC protocol version.
     pub version: String,
-    /// Immutable artifact identity. Production builds should set
-    /// `DEIMOS_BUILD_ID` to the artifact digest or source revision.
+    /// Immutable artifact identity. Release packaging must set
+    /// `DEIMOS_BUILD_ID` explicitly to the artifact digest or source revision.
     #[serde(default = "unknown_build_id")]
     pub build_id: String,
     pub process_id: u32,
