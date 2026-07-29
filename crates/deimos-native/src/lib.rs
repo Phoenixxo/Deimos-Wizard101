@@ -1,6 +1,8 @@
 #![allow(clippy::useless_conversion)]
 
 pub mod lifecycle;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub mod wine_runtime;
 
 #[cfg(feature = "python")]
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcConfig};
