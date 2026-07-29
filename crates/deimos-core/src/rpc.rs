@@ -7,6 +7,8 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::lifecycle::AgentIdentity;
+
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -134,6 +136,8 @@ pub struct HelloResponse {
     pub protocol: ProtocolVersion,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,6 +163,7 @@ pub enum RpcErrorCode {
     ProcessAccessDenied,
     ProcessExited,
     SessionNotFound,
+    AgentShuttingDown,
     MemoryInvalidAddress,
     MemoryReadFailed,
     MemoryRequiredMatchNotFound,
@@ -308,6 +313,7 @@ fn is_allowed_address(address: SocketAddr) -> bool {
 pub struct RpcServer {
     auth_token: AuthToken,
     capabilities: Vec<String>,
+    agent: Option<AgentIdentity>,
     supported_versions: Vec<ProtocolVersion>,
     config: RpcConfig,
 }
@@ -317,6 +323,22 @@ impl RpcServer {
         Self {
             auth_token,
             capabilities,
+            agent: None,
+            supported_versions: vec![CURRENT_PROTOCOL_VERSION],
+            config,
+        }
+    }
+
+    pub fn with_agent_identity(
+        auth_token: AuthToken,
+        capabilities: Vec<String>,
+        agent: AgentIdentity,
+        config: RpcConfig,
+    ) -> Self {
+        Self {
+            auth_token,
+            capabilities,
+            agent: Some(agent),
             supported_versions: vec![CURRENT_PROTOCOL_VERSION],
             config,
         }
@@ -425,6 +447,7 @@ impl RpcServer {
                 request_id: hello.request_id,
                 protocol,
                 capabilities,
+                agent: self.agent.clone(),
             }),
             self.config.max_message_size,
         )?;
@@ -588,6 +611,7 @@ impl fmt::Display for RpcErrorCode {
             Self::ProcessAccessDenied => "process_access_denied",
             Self::ProcessExited => "process_exited",
             Self::SessionNotFound => "session_not_found",
+            Self::AgentShuttingDown => "agent_shutting_down",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
             Self::MemoryRequiredMatchNotFound => "memory_required_match_not_found",
@@ -606,6 +630,7 @@ pub struct RpcClient {
     next_request_id: u64,
     pub protocol: ProtocolVersion,
     pub capabilities: Vec<String>,
+    pub agent: Option<AgentIdentity>,
     config: RpcConfig,
 }
 
@@ -674,6 +699,7 @@ impl RpcClient {
             next_request_id: 2,
             protocol: response.protocol,
             capabilities: response.capabilities,
+            agent: response.agent,
             config,
         })
     }
