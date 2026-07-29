@@ -7,9 +7,11 @@ const MAX_BUILD_ID_LENGTH: usize = 128;
 
 /// Inputs shared by the native host and managed agent artifacts.
 ///
+/// Every input is text-only so source hashing can canonicalize CRLF to LF
+/// across platform checkouts without changing any binary artifact semantics.
 /// Keep this list source-only: watching `target` or another generated output
 /// directory would create an endless Cargo rebuild loop.
-const ARTIFACT_INPUTS: &[&str] = &[
+const ARTIFACT_TEXT_INPUTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
     "crates/deimos-core/Cargo.toml",
@@ -37,7 +39,7 @@ pub fn sanitize_build_id(value: &str) -> Option<String> {
 }
 
 pub fn artifact_watch_paths(repository: &Path) -> Vec<PathBuf> {
-    ARTIFACT_INPUTS
+    ARTIFACT_TEXT_INPUTS
         .iter()
         .map(|path| repository.join(path))
         .collect()
@@ -80,6 +82,7 @@ pub fn source_digest(repository: &Path) -> io::Result<String> {
         })?;
         let relative = portable_relative_path(relative)?;
         let contents = fs::read(&path)?;
+        let contents = canonical_text_contents(&contents);
         hash_field(&mut hasher, relative.as_bytes());
         hash_field(&mut hasher, &contents);
     }
@@ -88,7 +91,7 @@ pub fn source_digest(repository: &Path) -> io::Result<String> {
 
 fn artifact_source_files(repository: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for input in ARTIFACT_INPUTS {
+    for input in ARTIFACT_TEXT_INPUTS {
         collect_files(&repository.join(input), &mut files)?;
     }
     files.sort_by(|left, right| {
@@ -147,6 +150,21 @@ fn portable_relative_path(path: &Path) -> io::Result<String> {
 fn hash_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
+}
+
+fn canonical_text_contents(contents: &[u8]) -> Vec<u8> {
+    let mut canonical = Vec::with_capacity(contents.len());
+    let mut index = 0;
+    while index < contents.len() {
+        if contents[index..].starts_with(b"\r\n") {
+            canonical.push(b'\n');
+            index += 2;
+        } else {
+            canonical.push(contents[index]);
+            index += 1;
+        }
+    }
+    canonical
 }
 
 fn git_revision(repository: &Path) -> Option<String> {
@@ -218,18 +236,21 @@ impl Sha256 {
                 .copy_from_slice(&input[..copied]);
             self.buffer_len += copied;
             input = &input[copied..];
-            if self.buffer_len == 64 {
-                compress(&mut self.state, &self.buffer);
-                self.buffer_len = 0;
+            if self.buffer_len < 64 {
+                return;
             }
+            compress(&mut self.state, &self.buffer);
+            self.buffer_len = 0;
         }
         while input.len() >= 64 {
             let block: &[u8; 64] = input[..64].try_into().expect("block length is fixed");
             compress(&mut self.state, block);
             input = &input[64..];
         }
-        self.buffer[..input.len()].copy_from_slice(input);
-        self.buffer_len = input.len();
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
     }
 
     fn finalize(mut self) -> [u8; 32] {
@@ -320,8 +341,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_watch_paths, derived_build_id, git_control_paths, hex_digest, sanitize_build_id,
-        source_digest, Sha256, ARTIFACT_INPUTS,
+        artifact_watch_paths, canonical_text_contents, derived_build_id, git_control_paths,
+        hex_digest, sanitize_build_id, source_digest, Sha256, ARTIFACT_TEXT_INPUTS,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -353,6 +374,29 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_fragmented_standard_vectors() {
+        assert_fragmented_digest(
+            b"abc",
+            &[1],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        assert_fragmented_digest(
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            &[1, 2, 3, 5, 8, 13],
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        );
+    }
+
+    #[test]
+    fn sha256_matches_boundary_split_vectors() {
+        let message = vec![b'a'; 1_000_000];
+        let expected = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+        for pattern in [&[1][..], &[63], &[64], &[65], &[1, 63, 64, 65]] {
+            assert_fragmented_digest(&message, pattern, expected);
+        }
+    }
+
+    #[test]
     fn gitless_identity_is_content_derived_and_core_changes_invalidate_it() {
         let first = Fixture::new("gitless-first");
         let second = Fixture::new("gitless-second");
@@ -380,7 +424,7 @@ mod tests {
         let first = Fixture::new("ordered");
         let second = Fixture::new("reverse");
         populate_source(first.path());
-        for input in ARTIFACT_INPUTS.iter().rev() {
+        for input in ARTIFACT_TEXT_INPUTS.iter().rev() {
             populate_input(second.path(), input);
         }
 
@@ -391,6 +435,45 @@ mod tests {
         assert!(artifact_watch_paths(first.path())
             .iter()
             .all(|path| !path.ends_with("target")));
+    }
+
+    #[test]
+    fn equal_length_source_mutation_changes_the_digest() {
+        let fixture = Fixture::new("equal-length-mutation");
+        populate_source(fixture.path());
+        let source = fixture.path().join("crates/deimos-core/src/lib.rs");
+        fs::write(&source, b"pub const VALUE: u8 = 1;\n").expect("source should be written");
+        let initial = source_digest(fixture.path()).expect("initial digest should compute");
+
+        fs::write(&source, b"pub const VALUE: u8 = 2;\n").expect("source should mutate");
+        let changed = source_digest(fixture.path()).expect("changed digest should compute");
+
+        assert_ne!(initial, changed);
+    }
+
+    #[test]
+    fn lf_and_crlf_source_trees_have_the_same_identity() {
+        let lf = Fixture::new("lf-tree");
+        let crlf = Fixture::new("crlf-tree");
+        populate_source_with_line_ending(lf.path(), "\n");
+        populate_source_with_line_ending(crlf.path(), "\r\n");
+
+        assert_eq!(
+            source_digest(lf.path()).expect("LF digest should compute"),
+            source_digest(crlf.path()).expect("CRLF digest should compute")
+        );
+        assert_eq!(
+            derived_build_id(lf.path()).expect("LF identity should derive"),
+            derived_build_id(crlf.path()).expect("CRLF identity should derive")
+        );
+    }
+
+    #[test]
+    fn canonical_text_preserves_lone_carriage_returns() {
+        assert_eq!(
+            canonical_text_contents(b"first\r\nsecond\nthird\rfourth\r\n"),
+            b"first\nsecond\nthird\rfourth\n"
+        );
     }
 
     #[test]
@@ -449,22 +532,49 @@ mod tests {
     }
 
     fn populate_source(repository: &Path) {
-        for input in ARTIFACT_INPUTS {
-            populate_input(repository, input);
+        populate_source_with_line_ending(repository, "\n");
+    }
+
+    fn populate_source_with_line_ending(repository: &Path, line_ending: &str) {
+        for input in ARTIFACT_TEXT_INPUTS {
+            populate_input_with_line_ending(repository, input, line_ending);
         }
     }
 
     fn populate_input(repository: &Path, input: &str) {
+        populate_input_with_line_ending(repository, input, "\n");
+    }
+
+    fn populate_input_with_line_ending(repository: &Path, input: &str, line_ending: &str) {
         let path = repository.join(input);
         if Path::new(input).extension().is_some() {
             fs::create_dir_all(path.parent().expect("input should have a parent"))
                 .expect("fixture parent should be created");
-            fs::write(&path, format!("fixture:{input}\n")).expect("fixture file should be written");
+            fs::write(&path, format!("fixture:{input}{line_ending}"))
+                .expect("fixture file should be written");
         } else {
             fs::create_dir_all(&path).expect("fixture source directory should be created");
-            fs::write(path.join("fixture.rs"), format!("fixture:{input}\n"))
-                .expect("fixture source should be written");
+            fs::write(
+                path.join("fixture.rs"),
+                format!("fixture:{input}{line_ending}"),
+            )
+            .expect("fixture source should be written");
         }
+    }
+
+    fn assert_fragmented_digest(message: &[u8], pattern: &[usize], expected: &str) {
+        assert!(!pattern.is_empty());
+        assert!(pattern.iter().all(|length| *length != 0));
+        let mut hasher = Sha256::new();
+        let mut offset = 0;
+        let mut segment = 0;
+        while offset < message.len() {
+            let length = pattern[segment % pattern.len()].min(message.len() - offset);
+            hasher.update(&message[offset..offset + length]);
+            offset += length;
+            segment += 1;
+        }
+        assert_eq!(hex_digest(hasher.finalize()), expected);
     }
 
     fn git_available() -> bool {
