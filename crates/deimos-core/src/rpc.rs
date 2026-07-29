@@ -7,6 +7,8 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::lifecycle::AgentIdentity;
+
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,7 +36,7 @@ pub struct NativeContext {
     pub launch_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthToken(String);
 
 impl AuthToken {
@@ -62,6 +64,12 @@ impl AuthToken {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for AuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthToken([REDACTED])")
     }
 }
 
@@ -134,6 +142,8 @@ pub struct HelloResponse {
     pub protocol: ProtocolVersion,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -308,6 +318,7 @@ fn is_allowed_address(address: SocketAddr) -> bool {
 pub struct RpcServer {
     auth_token: AuthToken,
     capabilities: Vec<String>,
+    agent: Option<AgentIdentity>,
     supported_versions: Vec<ProtocolVersion>,
     config: RpcConfig,
 }
@@ -317,6 +328,22 @@ impl RpcServer {
         Self {
             auth_token,
             capabilities,
+            agent: None,
+            supported_versions: vec![CURRENT_PROTOCOL_VERSION],
+            config,
+        }
+    }
+
+    pub fn with_agent_identity(
+        auth_token: AuthToken,
+        capabilities: Vec<String>,
+        agent: AgentIdentity,
+        config: RpcConfig,
+    ) -> Self {
+        Self {
+            auth_token,
+            capabilities,
+            agent: Some(agent),
             supported_versions: vec![CURRENT_PROTOCOL_VERSION],
             config,
         }
@@ -335,6 +362,19 @@ impl RpcServer {
     pub fn serve_connection<F>(&self, stream: TcpStream, handler: F) -> io::Result<()>
     where
         F: Fn(&RpcCall) -> Result<Value, Box<RpcError>>,
+    {
+        self.serve_connection_with_after_response(stream, handler, |_, _| false)
+    }
+
+    pub fn serve_connection_with_after_response<F, A>(
+        &self,
+        stream: TcpStream,
+        handler: F,
+        after_response: A,
+    ) -> io::Result<()>
+    where
+        F: Fn(&RpcCall) -> Result<Value, Box<RpcError>>,
+        A: Fn(&str, bool) -> bool,
     {
         stream.set_read_timeout(Some(self.config.io_timeout))?;
         stream.set_write_timeout(Some(self.config.io_timeout))?;
@@ -425,6 +465,7 @@ impl RpcServer {
                 request_id: hello.request_id,
                 protocol,
                 capabilities,
+                agent: self.agent.clone(),
             }),
             self.config.max_message_size,
         )?;
@@ -482,6 +523,7 @@ impl RpcServer {
                 continue;
             }
 
+            let operation = call.operation.clone();
             let response = match handler(&call) {
                 Ok(payload) => RpcResponse::Result(RpcResult {
                     request_id: call.request_id,
@@ -497,7 +539,12 @@ impl RpcServer {
                     RpcResponse::Error { error }
                 }
             };
-            write_message(&mut stream, &response, self.config.max_message_size)?;
+            let write_result = write_message(&mut stream, &response, self.config.max_message_size);
+            let close_connection = after_response(&operation, write_result.is_ok());
+            write_result?;
+            if close_connection {
+                return Ok(());
+            }
         }
     }
 
@@ -606,6 +653,7 @@ pub struct RpcClient {
     next_request_id: u64,
     pub protocol: ProtocolVersion,
     pub capabilities: Vec<String>,
+    pub agent: Option<AgentIdentity>,
     config: RpcConfig,
 }
 
@@ -674,6 +722,7 @@ impl RpcClient {
             next_request_id: 2,
             protocol: response.protocol,
             capabilities: response.capabilities,
+            agent: response.agent,
             config,
         })
     }
@@ -768,6 +817,7 @@ fn response_error(response: RpcResponse, request_id: u64, operation: &str) -> Rp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::thread;
 
     fn context() -> NativeContext {
@@ -777,6 +827,17 @@ mod tests {
             native_pid: Some(42),
             launch_id: Some("launch-test".to_string()),
         }
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum ProtocolV1ErrorCode {
+        InvalidRequest,
+    }
+
+    #[derive(Deserialize)]
+    struct ProtocolV1Error {
+        code: ProtocolV1ErrorCode,
     }
 
     fn start_server<F>(
@@ -840,6 +901,36 @@ mod tests {
             .join()
             .expect("server should not panic")
             .expect("server should finish");
+    }
+
+    #[test]
+    fn authentication_tokens_are_redacted_from_debug_output() {
+        let token = AuthToken::from_string("debug-secret-token").expect("token should be valid");
+        let debug = format!("{token:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains(token.as_str()));
+    }
+
+    #[test]
+    fn shutting_down_error_remains_decodable_by_protocol_1_0_clients() {
+        let response = RpcResponse::Error {
+            error: RpcError::new(
+                RpcErrorCode::InvalidRequest,
+                "agent is shutting down",
+                2,
+                "probe",
+                None,
+            ),
+        };
+        let value = serde_json::to_value(response).expect("response should serialize");
+        let legacy: ProtocolV1Error = serde_json::from_value(
+            value
+                .get("error")
+                .cloned()
+                .expect("response should contain an error"),
+        )
+        .expect("protocol 1.0 client should decode the error code");
+        assert_eq!(legacy.code, ProtocolV1ErrorCode::InvalidRequest);
     }
 
     #[test]
