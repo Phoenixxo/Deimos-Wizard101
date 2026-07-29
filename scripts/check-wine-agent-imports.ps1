@@ -2,44 +2,52 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
-    [string] $AgentPath,
-
-    [string] $Toolchain = "1.77.2"
+    [string] $AgentPath
 )
 
 $ErrorActionPreference = "Stop"
 
-$rustcVersion = & rustup run $Toolchain rustc --version --verbose
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to inspect Rust toolchain '$Toolchain'."
-}
+function Resolve-Dumpbin {
+    $command = Get-Command "dumpbin.exe" -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
 
-$hostLine = $rustcVersion | Where-Object { $_ -match "^host:\s+(.+)$" } | Select-Object -First 1
-if ($null -eq $hostLine) {
-    throw "Rust toolchain '$Toolchain' did not report its host triple."
-}
-$hostTriple = [regex]::Match($hostLine, "^host:\s+(.+)$").Groups[1].Value.Trim()
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+    if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+        throw "dumpbin.exe is not on PATH and vswhere.exe could not be found."
+    }
 
-$sysroot = (& rustup run $Toolchain rustc --print sysroot).Trim()
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to locate the sysroot for Rust toolchain '$Toolchain'."
-}
+    $installationPath = (
+        & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+    ) | Select-Object -First 1
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
+        throw "Visual Studio C++ build tools could not be located with vswhere.exe."
+    }
 
-$llvmReadobj = Join-Path $sysroot "lib/rustlib/$hostTriple/bin/llvm-readobj.exe"
-if (-not (Test-Path -LiteralPath $llvmReadobj -PathType Leaf)) {
-    throw @"
-llvm-readobj was not found for Rust toolchain '$Toolchain'.
-Install it with:
-  rustup component add llvm-tools-preview --toolchain $Toolchain
-"@
+    $toolsetsRoot = Join-Path $installationPath "VC/Tools/MSVC"
+    $toolsets = @(Get-ChildItem -LiteralPath $toolsetsRoot -Directory | Sort-Object Name -Descending)
+    foreach ($toolset in $toolsets) {
+        $candidate = Join-Path $toolset.FullName "bin/Hostx64/x64/dumpbin.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    throw "dumpbin.exe was not found in the installed Visual Studio C++ build tools."
 }
 
 $resolvedAgentPath = (Resolve-Path -LiteralPath $AgentPath).Path
-$importOutput = & $llvmReadobj --coff-imports $resolvedAgentPath 2>&1
+$dumpbin = Resolve-Dumpbin
+$importOutput = & $dumpbin /NOLOGO /DEPENDENTS $resolvedAgentPath 2>&1
 if ($LASTEXITCODE -ne 0) {
     $diagnostic = ($importOutput | ForEach-Object { "$_" }) -join [Environment]::NewLine
     throw @"
-llvm-readobj could not inspect '$resolvedAgentPath' (exit code $LASTEXITCODE).
+dumpbin could not inspect '$resolvedAgentPath' (exit code $LASTEXITCODE).
 $diagnostic
 "@
 }
@@ -47,7 +55,7 @@ $diagnostic
 $imports = @(
     $importOutput |
         ForEach-Object {
-            if ($_ -match "^\s*Name:\s*(\S+\.dll)\s*$") {
+            if ($_ -match "^\s*([A-Za-z0-9_.-]+\.dll)\s*$") {
                 $Matches[1].ToLowerInvariant()
             }
         } |

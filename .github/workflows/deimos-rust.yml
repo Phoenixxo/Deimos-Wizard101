@@ -7,6 +7,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
@@ -14,6 +15,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - ".github/workflows/deimos-rust.yml"
 
@@ -83,7 +85,6 @@ jobs:
         if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@1.77.2
         with:
-          components: llvm-tools-preview
           targets: ${{ matrix.target }}
 
       - name: Set up Python
@@ -102,7 +103,6 @@ jobs:
         run: >-
           ./scripts/check-wine-agent-imports.ps1
           -AgentPath ./target/${{ matrix.target }}/release/deimos-agent.exe
-          -Toolchain ${{ matrix.toolchain }}
 
       - name: Run deterministic memory fixture integration test
         if: runner.os == 'Windows'
