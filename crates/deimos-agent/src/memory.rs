@@ -470,7 +470,9 @@ fn scan_region<B: MemoryBackend>(
                 || !window
                     .iter()
                     .zip(options.signature)
-                    .all(|(actual, expected)| expected.is_none_or(|expected| *actual == expected))
+                    .all(|(actual, expected)| {
+                        expected.is_none() || expected.as_ref() == Some(actual)
+                    })
             {
                 continue;
             }
