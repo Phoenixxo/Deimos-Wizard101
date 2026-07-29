@@ -9,13 +9,21 @@ use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
+use deimos_core::memory::CAPABILITY_MEMORY_READ_ONLY;
+use deimos_core::process::CAPABILITY_PROCESS_READ_ONLY;
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig};
 use serde::Serialize;
+use serde_json::Value;
 
 const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 4096;
 const MAX_STDERR_INPUT_BYTES: usize = MAX_STDERR_DIAGNOSTIC_BYTES * 2;
 const REDACTION_MARKER: &str = "[REDACTED]";
 const TRUNCATION_MARKER: &str = "[TRUNCATED]";
+const REQUIRED_AGENT_CAPABILITIES: [&str; 3] = [
+    CAPABILITY_AGENT_LIFECYCLE,
+    CAPABILITY_PROCESS_READ_ONLY,
+    CAPABILITY_MEMORY_READ_ONLY,
+];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -197,6 +205,40 @@ impl fmt::Display for LifecycleError {
 
 impl std::error::Error for LifecycleError {}
 
+#[derive(Debug)]
+pub enum AgentCallError {
+    Lifecycle(LifecycleError),
+    Rpc {
+        operation: String,
+        native_context: NativeContext,
+        source: Box<RpcClientError>,
+    },
+}
+
+impl fmt::Display for AgentCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lifecycle(error) => error.fmt(formatter),
+            Self::Rpc { source, .. } => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AgentCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lifecycle(error) => Some(error),
+            Self::Rpc { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<LifecycleError> for AgentCallError {
+    fn from(error: LifecycleError) -> Self {
+        Self::Lifecycle(error)
+    }
+}
+
 struct ManagedAgent {
     endpoint: AgentEndpoint,
     identity: AgentIdentity,
@@ -363,6 +405,56 @@ impl<R: AgentRuntime> AgentManager<R> {
         health
     }
 
+    pub fn call(
+        &mut self,
+        bottle: &BottleId,
+        operation: &str,
+        payload: Value,
+    ) -> Result<Value, AgentCallError> {
+        let managed = self.managed.get_mut(bottle).ok_or_else(|| {
+            LifecycleError::new(
+                LifecycleErrorCode::HealthCheckFailed,
+                bottle.as_str(),
+                "no managed agent exists for this bottle; call ensure_agent first",
+            )
+        })?;
+
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error.into());
+        }
+
+        let native_context = self.native_context.clone();
+        let result = managed
+            .client
+            .call(operation, payload, Some(native_context.clone()));
+        if result.is_err() {
+            if let Some(error) = poll_process_exit(bottle, managed)? {
+                return Err(error.into());
+            }
+        }
+        result.map_err(|source| AgentCallError::Rpc {
+            operation: operation.to_string(),
+            native_context,
+            source: Box::new(source),
+        })
+    }
+
+    pub fn capabilities(&mut self, bottle: &BottleId) -> Result<Vec<String>, LifecycleError> {
+        let managed = self.managed.get_mut(bottle).ok_or_else(|| {
+            LifecycleError::new(
+                LifecycleErrorCode::HealthCheckFailed,
+                bottle.as_str(),
+                "no managed agent exists for this bottle; call ensure_agent first",
+            )
+        })?;
+
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error);
+        }
+
+        Ok(managed.client.capabilities.clone())
+    }
+
     pub fn shutdown(
         &mut self,
         bottle: &BottleId,
@@ -391,21 +483,31 @@ impl<R: AgentRuntime> AgentManager<R> {
         let mut client = RpcClient::connect(
             endpoint.address,
             endpoint.token.clone(),
-            vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+            REQUIRED_AGENT_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
             Some(self.native_context.clone()),
             self.config,
         )
         .map_err(|error| handshake_error(bottle, error))?;
-        if !client
-            .capabilities
+        let missing_capabilities = REQUIRED_AGENT_CAPABILITIES
             .iter()
-            .any(|capability| capability == CAPABILITY_AGENT_LIFECYCLE)
-        {
+            .filter(|required| {
+                !client
+                    .capabilities
+                    .iter()
+                    .any(|negotiated| negotiated == **required)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_capabilities.is_empty() {
             return Err(LifecycleError::new(
                 LifecycleErrorCode::MissingCapability,
                 bottle.as_str(),
-                "agent handshake did not negotiate lifecycle capability; replace the agent",
-            ));
+                "agent handshake did not negotiate all required capabilities; replace the agent",
+            )
+            .with_detail("missing_capabilities", missing_capabilities.join(", ")));
         }
         let identity = client.agent.clone().ok_or_else(|| {
             LifecycleError::new(
@@ -904,8 +1006,8 @@ mod tests {
         AgentHealth, AgentHealthRequest, AgentShutdownRequest, AgentShutdownResponse,
         SessionDiagnostics,
     };
-    use deimos_core::rpc::{loopback_address, RpcCall, RpcError, RpcServer};
-    use serde_json::Value;
+    use deimos_core::rpc::{loopback_address, RpcCall, RpcError, RpcErrorCode, RpcServer};
+    use serde_json::{json, Value};
 
     use super::*;
 
@@ -1163,6 +1265,21 @@ mod tests {
     }
 
     fn start_test_agent(version: &str, build_id: &str) -> (AgentEndpoint, Arc<AtomicBool>) {
+        start_test_agent_with_capabilities(
+            version,
+            build_id,
+            REQUIRED_AGENT_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        )
+    }
+
+    fn start_test_agent_with_capabilities(
+        version: &str,
+        build_id: &str,
+        capabilities: Vec<String>,
+    ) -> (AgentEndpoint, Arc<AtomicBool>) {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
         let identity = AgentIdentity {
@@ -1175,7 +1292,7 @@ mod tests {
         let listener = TcpListener::bind(loopback_address(0)).expect("test agent should bind");
         let server = RpcServer::with_agent_identity(
             token.clone(),
-            vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+            capabilities,
             identity.clone(),
             RpcConfig {
                 io_timeout: Duration::from_millis(100),
@@ -1248,6 +1365,24 @@ mod tests {
                     reason: request.reason,
                 })
                 .expect("shutdown should encode"))
+            }
+            "test.context" => Ok(json!({
+                "payload": call.payload.clone(),
+                "native_context": call.native_context.clone(),
+            })),
+            "test.disconnect" => panic!("test agent disconnected during RPC"),
+            "test.protocol_error" => {
+                let mut error = RpcError::new(
+                    RpcErrorCode::MemoryReadFailed,
+                    "test memory read failed",
+                    call.request_id,
+                    call.operation.clone(),
+                    call.native_context.clone(),
+                );
+                error
+                    .details
+                    .insert("address".to_string(), "0x1234".to_string());
+                Err(Box::new(error))
             }
             _ => unreachable!("test lifecycle agent received unexpected operation"),
         }
@@ -1451,6 +1586,171 @@ mod tests {
             Some(&"wine: agent fault".to_string())
         );
         assert!(error.instance_id.is_some());
+    }
+
+    #[test]
+    fn handshake_requires_lifecycle_process_and_memory_capabilities() {
+        let runtime = TestRuntime::new("1.2.3");
+        let (endpoint, shutdown) = start_test_agent_with_capabilities(
+            "1.2.3",
+            "test-build-current",
+            vec![
+                CAPABILITY_AGENT_LIFECYCLE.to_string(),
+                CAPABILITY_PROCESS_READ_ONLY.to_string(),
+            ],
+        );
+        let manager = manager(runtime, "1.2.3");
+
+        let error = match manager.connect_candidate(&bottle(), &endpoint) {
+            Ok(_) => panic!("an agent missing memory capability must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, LifecycleErrorCode::MissingCapability);
+        assert_eq!(
+            error.details.get("missing_capabilities"),
+            Some(&CAPABILITY_MEMORY_READ_ONLY.to_string())
+        );
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn managed_calls_require_ensure_and_carry_native_context() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime, "1.2.3");
+
+        let error = manager
+            .call(&bottle(), "test.context", json!({"value": 7}))
+            .expect_err("calls before ensure_agent must fail");
+        assert!(matches!(
+            error,
+            AgentCallError::Lifecycle(LifecycleError {
+                code: LifecycleErrorCode::HealthCheckFailed,
+                ..
+            })
+        ));
+
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+        let response = manager
+            .call(&bottle(), "test.context", json!({"value": 7}))
+            .expect("managed call should succeed");
+
+        assert_eq!(response["payload"], json!({"value": 7}));
+        assert_eq!(
+            response["native_context"],
+            serde_json::to_value(context()).expect("context should serialize")
+        );
+        assert_eq!(
+            manager
+                .capabilities(&bottle())
+                .expect("capabilities should be available"),
+            REQUIRED_AGENT_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn managed_calls_preserve_structured_protocol_errors() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime, "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+
+        let error = manager
+            .call(&bottle(), "test.protocol_error", Value::Null)
+            .expect_err("test operation should return a protocol error");
+
+        let AgentCallError::Rpc {
+            operation,
+            native_context,
+            source,
+        } = error
+        else {
+            panic!("structured protocol error should remain available");
+        };
+        let RpcClientError::Protocol(error) = *source else {
+            panic!("structured protocol error should remain available");
+        };
+        assert_eq!(operation, "test.protocol_error");
+        assert_eq!(native_context, context());
+        assert_eq!(error.code, RpcErrorCode::MemoryReadFailed);
+        assert_eq!(error.operation, "test.protocol_error");
+        assert_eq!(error.native_context, Some(context()));
+        assert_eq!(error.details.get("address"), Some(&"0x1234".to_string()));
+    }
+
+    #[test]
+    fn managed_calls_poll_process_exit_before_rpc() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime.clone(), "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+        runtime.set_process_exit(AgentExit {
+            code: Some(17),
+            stderr: "agent exited before call".to_string(),
+        });
+
+        let error = manager
+            .call(&bottle(), "test.context", Value::Null)
+            .expect_err("exited agent must be reported before RPC");
+
+        let AgentCallError::Lifecycle(error) = error else {
+            panic!("process exit should remain a lifecycle error");
+        };
+        assert_eq!(error.code, LifecycleErrorCode::AgentExited);
+        assert_eq!(error.details.get("exit_code"), Some(&"17".to_string()));
+    }
+
+    #[test]
+    fn managed_calls_poll_process_exit_again_after_rpc_failure() {
+        struct ExitAfterFirstPoll {
+            polled: bool,
+        }
+
+        impl AgentProcess for ExitAfterFirstPoll {
+            fn try_wait(&mut self) -> io::Result<Option<AgentExit>> {
+                if self.polled {
+                    Ok(Some(AgentExit {
+                        code: Some(19),
+                        stderr: "agent exited during call".to_string(),
+                    }))
+                } else {
+                    self.polled = true;
+                    Ok(None)
+                }
+            }
+        }
+
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime, "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+        manager
+            .managed
+            .get_mut(&bottle())
+            .expect("managed agent should exist")
+            .process = Box::new(ExitAfterFirstPoll { polled: false });
+
+        let error = manager
+            .call(&bottle(), "test.disconnect", Value::Null)
+            .expect_err("disconnecting call should fail");
+
+        let AgentCallError::Lifecycle(error) = error else {
+            panic!("post-failure process exit should remain a lifecycle error");
+        };
+        assert_eq!(error.code, LifecycleErrorCode::AgentExited);
+        assert_eq!(error.details.get("exit_code"), Some(&"19".to_string()));
+        assert_eq!(
+            error.details.get("stderr"),
+            Some(&"agent exited during call".to_string())
+        );
     }
 
     #[test]

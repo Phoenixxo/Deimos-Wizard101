@@ -94,8 +94,10 @@ impl std::error::Error for WineRuntimeError {}
 #[derive(Clone, Debug)]
 pub struct WineRuntimeConfig {
     pub wine_executable: PathBuf,
+    pub wine_loader_override: Option<PathBuf>,
     pub wineserver_executable: Option<PathBuf>,
     pub agent_artifact: PathBuf,
+    pub wine_arguments: Vec<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
     pub startup_timeout: Duration,
     pub poll_interval: Duration,
@@ -105,10 +107,13 @@ pub struct WineRuntimeConfig {
 
 impl WineRuntimeConfig {
     pub fn new(wine_executable: impl Into<PathBuf>, agent_artifact: impl Into<PathBuf>) -> Self {
+        let wine_executable = wine_executable.into();
         Self {
-            wine_executable: wine_executable.into(),
+            wine_loader_override: Some(wine_executable.clone()),
+            wine_executable,
             wineserver_executable: None,
             agent_artifact: agent_artifact.into(),
+            wine_arguments: Vec::new(),
             environment: BTreeMap::new(),
             startup_timeout: Duration::from_secs(10),
             poll_interval: Duration::from_millis(50),
@@ -119,6 +124,31 @@ impl WineRuntimeConfig {
 
     pub fn with_wineserver(mut self, executable: impl Into<PathBuf>) -> Self {
         self.wineserver_executable = Some(executable.into());
+        self
+    }
+
+    pub fn with_wine_loader_override(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.wine_loader_override = Some(executable.into());
+        self
+    }
+
+    pub fn without_wine_loader_override(mut self) -> Self {
+        self.wine_loader_override = None;
+        self
+    }
+
+    pub fn with_wine_argument(mut self, argument: impl Into<OsString>) -> Self {
+        self.wine_arguments.push(argument.into());
+        self
+    }
+
+    pub fn with_wine_arguments<I, S>(mut self, arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.wine_arguments
+            .extend(arguments.into_iter().map(Into::into));
         self
     }
 
@@ -229,6 +259,10 @@ pub struct WineAgentRuntime {
 impl WineAgentRuntime {
     pub fn new(mut config: WineRuntimeConfig) -> Result<Self, WineRuntimeError> {
         config.wine_executable = validate_executable(&config.wine_executable, "Wine executable")?;
+        if let Some(wine_loader) = config.wine_loader_override.take() {
+            config.wine_loader_override =
+                Some(validate_executable(&wine_loader, "Wine loader override")?);
+        }
         if let Some(wineserver) = config.wineserver_executable.take() {
             config.wineserver_executable =
                 Some(validate_executable(&wineserver, "wineserver executable")?);
@@ -385,6 +419,7 @@ impl WineAgentRuntime {
         let diagnostic_file = open_secure_log(&layout.stderr)?;
         let mut command = Command::new(&self.config.wine_executable);
         command
+            .args(&self.config.wine_arguments)
             .arg(&layout.deployed_agent)
             .arg("--token-stdin")
             .arg("--listen-port")
@@ -394,8 +429,12 @@ impl WineAgentRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .envs(&self.config.environment)
-            .env("WINEPREFIX", &layout.bottle)
-            .env("WINELOADER", &self.config.wine_executable);
+            .env("WINEPREFIX", &layout.bottle);
+        if let Some(wine_loader) = &self.config.wine_loader_override {
+            command.env("WINELOADER", wine_loader);
+        } else {
+            command.env_remove("WINELOADER");
+        }
         if let Some(wineserver) = &self.config.wineserver_executable {
             command.env("WINESERVER", wineserver);
         }
@@ -1881,7 +1920,7 @@ done
 capture="$WINEPREFIX/{MANAGED_STATE_DIRECTORY}/test-capture.txt"
 {{
   printf 'prefix=%s\n' "$WINEPREFIX"
-  printf 'loader=%s\n' "$WINELOADER"
+  printf 'loader=%s\n' "${{WINELOADER-unset}}"
   printf 'arguments='
   printf '<%s>' "$@"
   printf '\n'
@@ -2018,7 +2057,15 @@ done
         let capture = fs::read_to_string(layout.state_directory.join("test-capture.txt"))
             .expect("fake Wine should capture launch inputs");
         assert!(capture.contains(&format!("prefix={}", bottle.as_str())));
-        assert!(capture.contains("<--token-stdin>"));
+        assert!(capture.contains(&format!(
+            "loader={}",
+            runtime.config.wine_executable.display()
+        )));
+        assert!(capture.contains(&format!(
+            "arguments=<{}><--token-stdin><--listen-port><{}>",
+            layout.deployed_agent.display(),
+            launch.endpoint.address.port()
+        )));
         assert!(!capture.contains("<--token>"));
         assert!(capture.contains("token_length=64"));
         assert!(!capture.contains(launch.endpoint.token.as_str()));
@@ -2035,6 +2082,46 @@ done
             .expect("agent should retire");
         let _ = wait_for_exit(&mut launch.process);
         assert!(!layout.rendezvous.exists());
+    }
+
+    #[test]
+    fn wrapper_arguments_precede_agent_and_can_leave_wineloader_to_wrapper() {
+        let root = TestDirectory::new("wrapper-arguments");
+        let bottle_path = create_bottle(&root.path, "wizard101");
+        let bottle = WineAgentRuntime::bottle_id(&bottle_path).expect("bottle should be valid");
+        let wine = root.path.join("fake-wrapper");
+        write_executable(&wine, &fake_wine_script());
+        let artifact = root.path.join("deimos-agent.exe");
+        fs::write(&artifact, b"MZportable-test-agent")
+            .expect("test agent artifact should be written");
+        let config = WineRuntimeConfig::new(wine, artifact)
+            .with_wine_argument("--wrapper-option")
+            .with_wine_arguments(["wrapper-value", "--second-option"])
+            .without_wine_loader_override()
+            .with_timing(
+                Duration::from_secs(2),
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+            );
+        let mut runtime = WineAgentRuntime::new(config).expect("wrapper runtime should be valid");
+
+        let mut launch = runtime.launch(&bottle).expect("agent should launch");
+        let layout = BottleLayout::resolve(&bottle).expect("layout should resolve");
+        let capture = fs::read_to_string(layout.state_directory.join("test-capture.txt"))
+            .expect("fake wrapper should capture launch inputs");
+
+        assert!(capture.contains("loader=unset"));
+        assert!(capture.contains(&format!(
+            "arguments=<--wrapper-option><wrapper-value><--second-option><{}><--token-stdin><--listen-port><{}>",
+            layout.deployed_agent.display(),
+            launch.endpoint.address.port()
+        )));
+
+        runtime
+            .retire(&bottle, &launch.endpoint, "test complete")
+            .expect("agent should retire");
+        let _ = wait_for_exit(&mut launch.process);
     }
 
     #[test]
