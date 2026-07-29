@@ -8,6 +8,7 @@ pub mod process;
 pub mod rpc;
 
 pub const PROTOCOL_SCHEMA_VERSION: u32 = 1;
+pub const BUILD_ID: &str = env!("DEIMOS_BUILD_ID_EMBEDDED");
 pub const DEFAULT_TARGET_PROCESS: &str = "WizardGraphicalClient.exe";
 pub const PROCESS_READ_ACCESS: &str = "PROCESS_QUERY_INFORMATION | PROCESS_VM_READ";
 pub const WINDOWS_AGENT_TARGET: &str = "x86_64-pc-windows-msvc";

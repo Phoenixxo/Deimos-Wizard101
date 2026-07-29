@@ -1,6 +1,14 @@
 use std::io;
 
-pub const AGENT_MUTEX_NAME: &str = r"Local\DeimosWizard101Agent";
+/// The GUID prevents accidental collision with unrelated Windows software.
+///
+/// This named object is duplicate suppression, not an authentication boundary:
+/// another process owned by the same user in the same Wine prefix can pre-create
+/// it and deny agent startup. We intentionally rely on the process default DACL
+/// instead of custom Windows security attributes because Wine implementations
+/// vary; the authenticated loopback token still prevents agent impersonation.
+pub const AGENT_MUTEX_NAME: &str =
+    r"Local\DeimosWizard101Agent-{D8A6F2B7-6D30-4B12-9ED5-9B709A7C8F41}";
 
 #[cfg(windows)]
 mod platform {
@@ -62,9 +70,13 @@ mod tests {
 
     #[test]
     fn instance_mutex_is_stable_and_does_not_contain_a_path() {
-        assert_eq!(AGENT_MUTEX_NAME, r"Local\DeimosWizard101Agent");
+        assert_eq!(
+            AGENT_MUTEX_NAME,
+            r"Local\DeimosWizard101Agent-{D8A6F2B7-6D30-4B12-9ED5-9B709A7C8F41}"
+        );
         assert!(!AGENT_MUTEX_NAME.contains(':'));
         assert!(!AGENT_MUTEX_NAME.contains('/'));
+        assert!(AGENT_MUTEX_NAME.contains('{'));
     }
 
     #[cfg(windows)]

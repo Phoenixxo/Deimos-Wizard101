@@ -36,7 +36,7 @@ pub struct NativeContext {
     pub launch_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthToken(String);
 
 impl AuthToken {
@@ -64,6 +64,12 @@ impl AuthToken {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for AuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthToken([REDACTED])")
     }
 }
 
@@ -163,7 +169,6 @@ pub enum RpcErrorCode {
     ProcessAccessDenied,
     ProcessExited,
     SessionNotFound,
-    AgentShuttingDown,
     MemoryInvalidAddress,
     MemoryReadFailed,
     MemoryRequiredMatchNotFound,
@@ -358,6 +363,19 @@ impl RpcServer {
     where
         F: Fn(&RpcCall) -> Result<Value, Box<RpcError>>,
     {
+        self.serve_connection_with_after_response(stream, handler, |_, _| false)
+    }
+
+    pub fn serve_connection_with_after_response<F, A>(
+        &self,
+        stream: TcpStream,
+        handler: F,
+        after_response: A,
+    ) -> io::Result<()>
+    where
+        F: Fn(&RpcCall) -> Result<Value, Box<RpcError>>,
+        A: Fn(&str, bool) -> bool,
+    {
         stream.set_read_timeout(Some(self.config.io_timeout))?;
         stream.set_write_timeout(Some(self.config.io_timeout))?;
 
@@ -505,6 +523,7 @@ impl RpcServer {
                 continue;
             }
 
+            let operation = call.operation.clone();
             let response = match handler(&call) {
                 Ok(payload) => RpcResponse::Result(RpcResult {
                     request_id: call.request_id,
@@ -520,7 +539,12 @@ impl RpcServer {
                     RpcResponse::Error { error }
                 }
             };
-            write_message(&mut stream, &response, self.config.max_message_size)?;
+            let write_result = write_message(&mut stream, &response, self.config.max_message_size);
+            let close_connection = after_response(&operation, write_result.is_ok());
+            write_result?;
+            if close_connection {
+                return Ok(());
+            }
         }
     }
 
@@ -611,7 +635,6 @@ impl fmt::Display for RpcErrorCode {
             Self::ProcessAccessDenied => "process_access_denied",
             Self::ProcessExited => "process_exited",
             Self::SessionNotFound => "session_not_found",
-            Self::AgentShuttingDown => "agent_shutting_down",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
             Self::MemoryRequiredMatchNotFound => "memory_required_match_not_found",
@@ -794,6 +817,7 @@ fn response_error(response: RpcResponse, request_id: u64, operation: &str) -> Rp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use std::thread;
 
     fn context() -> NativeContext {
@@ -803,6 +827,17 @@ mod tests {
             native_pid: Some(42),
             launch_id: Some("launch-test".to_string()),
         }
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum ProtocolV1ErrorCode {
+        InvalidRequest,
+    }
+
+    #[derive(Deserialize)]
+    struct ProtocolV1Error {
+        code: ProtocolV1ErrorCode,
     }
 
     fn start_server<F>(
@@ -866,6 +901,36 @@ mod tests {
             .join()
             .expect("server should not panic")
             .expect("server should finish");
+    }
+
+    #[test]
+    fn authentication_tokens_are_redacted_from_debug_output() {
+        let token = AuthToken::from_string("debug-secret-token").expect("token should be valid");
+        let debug = format!("{token:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains(token.as_str()));
+    }
+
+    #[test]
+    fn shutting_down_error_remains_decodable_by_protocol_1_0_clients() {
+        let response = RpcResponse::Error {
+            error: RpcError::new(
+                RpcErrorCode::InvalidRequest,
+                "agent is shutting down",
+                2,
+                "probe",
+                None,
+            ),
+        };
+        let value = serde_json::to_value(response).expect("response should serialize");
+        let legacy: ProtocolV1Error = serde_json::from_value(
+            value
+                .get("error")
+                .cloned()
+                .expect("response should contain an error"),
+        )
+        .expect("protocol 1.0 client should decode the error code");
+        assert_eq!(legacy.code, ProtocolV1ErrorCode::InvalidRequest);
     }
 
     #[test]

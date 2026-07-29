@@ -1,8 +1,9 @@
 use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
@@ -28,6 +29,9 @@ use serde_json::Value;
 use deimos_core::WINDOWS_AGENT_TARGET;
 
 pub const CAPABILITY_PROBE: &str = "probe";
+pub const MAX_AGENT_CONNECTIONS: usize = 16;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod instance;
 pub mod memory;
@@ -77,15 +81,28 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
         config,
     ));
     listener.set_nonblocking(true)?;
-    let mut workers = Vec::new();
-    while !service.is_shutting_down() {
+    let shutdown_acknowledged = Arc::new(AtomicBool::new(false));
+    let mut workers: Vec<ConnectionWorker> = Vec::new();
+    while !shutdown_acknowledged.load(Ordering::Acquire) {
+        reap_finished_workers(&mut workers)?;
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false)?;
+                if service.is_shutting_down() || workers.len() >= MAX_AGENT_CONNECTIONS {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let control = stream.try_clone()?;
                 let server = Arc::clone(&server);
                 let service = Arc::clone(&service);
-                workers.push(std::thread::spawn(move || {
-                    if let Err(error) = serve_connection_with_service(&server, stream, &service) {
+                let shutdown_acknowledged = Arc::clone(&shutdown_acknowledged);
+                let handle = std::thread::spawn(move || {
+                    if let Err(error) = serve_connection_with_service_and_shutdown(
+                        &server,
+                        stream,
+                        &service,
+                        &shutdown_acknowledged,
+                    ) {
                         eprintln!(
                             "{}",
                             serde_json::json!({
@@ -96,10 +113,11 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
                             })
                         );
                     }
-                }));
+                });
+                workers.push(ConnectionWorker { control, handle });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
             }
             Err(error) => {
                 return Err(io::Error::new(
@@ -110,12 +128,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
         }
     }
     drop(listener);
-    for worker in workers {
-        worker
-            .join()
-            .map_err(|_| io::Error::other("agent connection worker panicked"))?;
-    }
-    Ok(())
+    stop_and_join_workers(&mut workers)
 }
 
 pub fn serve_connection(server: &RpcServer, stream: TcpStream) -> io::Result<()> {
@@ -128,7 +141,74 @@ fn serve_connection_with_service<B: MemoryBackend>(
     stream: TcpStream,
     service: &AgentService<B>,
 ) -> io::Result<()> {
-    server.serve_connection(stream, |call| service.handle_call(call))
+    let shutdown_acknowledged = AtomicBool::new(false);
+    serve_connection_with_service_and_shutdown(server, stream, service, &shutdown_acknowledged)
+}
+
+fn serve_connection_with_service_and_shutdown<B: MemoryBackend>(
+    server: &RpcServer,
+    stream: TcpStream,
+    service: &AgentService<B>,
+    shutdown_acknowledged: &AtomicBool,
+) -> io::Result<()> {
+    server.serve_connection_with_after_response(
+        stream,
+        |call| service.handle_call(call),
+        |operation, _response_written| {
+            let shutting_down = service.is_shutting_down();
+            if shutting_down && operation == OP_AGENT_SHUTDOWN {
+                shutdown_acknowledged.store(true, Ordering::Release);
+            }
+            shutting_down
+        },
+    )
+}
+
+struct ConnectionWorker {
+    control: TcpStream,
+    handle: JoinHandle<()>,
+}
+
+fn reap_finished_workers(workers: &mut Vec<ConnectionWorker>) -> io::Result<()> {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].handle.is_finished() {
+            let worker = workers.swap_remove(index);
+            worker
+                .handle
+                .join()
+                .map_err(|_| io::Error::other("agent connection worker panicked"))?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn stop_and_join_workers(workers: &mut Vec<ConnectionWorker>) -> io::Result<()> {
+    for worker in workers.iter() {
+        let _ = worker.control.shutdown(Shutdown::Both);
+    }
+
+    let deadline = Instant::now() + SHUTDOWN_WORKER_TIMEOUT;
+    while !workers.is_empty() && Instant::now() < deadline {
+        reap_finished_workers(workers)?;
+        if !workers.is_empty() {
+            std::thread::sleep(ACCEPT_POLL_INTERVAL);
+        }
+    }
+    reap_finished_workers(workers)?;
+    if workers.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{} agent connection worker(s) did not stop after shutdown",
+                workers.len()
+            ),
+        ))
+    }
 }
 
 pub struct AgentService<B: MemoryBackend> {
@@ -146,6 +226,7 @@ impl<B: MemoryBackend> AgentService<B> {
             AgentIdentity {
                 instance_id,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                build_id: deimos_core::BUILD_ID.to_string(),
                 process_id: std::process::id(),
             },
         ))
@@ -173,7 +254,7 @@ impl<B: MemoryBackend> AgentService<B> {
             && !matches!(call.operation.as_str(), OP_AGENT_HEALTH | OP_AGENT_SHUTDOWN)
         {
             return Err(Box::new(RpcError::new(
-                RpcErrorCode::AgentShuttingDown,
+                RpcErrorCode::InvalidRequest,
                 "agent is shutting down; reconnect after the host starts a replacement",
                 call.request_id,
                 call.operation.clone(),
@@ -378,6 +459,7 @@ fn encode_payload<T: Serialize>(call: &RpcCall, value: T) -> Result<Value, Box<R
 mod tests {
     use super::{
         serve, serve_connection, serve_connection_with_service, AgentService, CAPABILITY_PROBE,
+        MAX_AGENT_CONNECTIONS,
     };
     use crate::process::{
         MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
@@ -397,7 +479,9 @@ mod tests {
     };
     use deimos_core::{ProbeRequest, PROTOCOL_SCHEMA_VERSION};
     use serde_json::to_value;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
 
@@ -405,8 +489,23 @@ mod tests {
         AgentIdentity {
             instance_id: "agent-lifecycle-test".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build_id: deimos_core::BUILD_ID.to_string(),
             process_id: std::process::id(),
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn standalone_probe_contract_remains_unchanged() {
+        let request = ProbeRequest::default();
+        let report = super::run(&request);
+        assert_eq!(report.schema_version, PROTOCOL_SCHEMA_VERSION);
+        assert_eq!(report.target_process, request.target_process);
+        assert!(!report.success);
+        assert_eq!(
+            report.build_target.as_deref(),
+            Some(deimos_core::WINDOWS_AGENT_TARGET)
+        );
     }
 
     #[test]
@@ -713,9 +812,12 @@ mod tests {
             .local_addr()
             .expect("listener should have an address");
         let server_token = token.clone();
+        let config = RpcConfig {
+            io_timeout: std::time::Duration::from_millis(200),
+            ..RpcConfig::default()
+        };
         let server_thread = thread::spawn(move || {
-            serve(listener, server_token, RpcConfig::default())
-                .expect("agent should stop gracefully");
+            serve(listener, server_token, config).expect("agent should stop gracefully");
         });
 
         let first_identity = {
@@ -734,12 +836,12 @@ mod tests {
             client.agent.expect("handshake should identify the agent")
         };
 
-        let mut reconnected = RpcClient::connect(
+        let reconnected = RpcClient::connect(
             address,
-            token,
+            token.clone(),
             vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
             None,
-            RpcConfig::default(),
+            config,
         )
         .expect("host should reconnect after disconnect");
         assert_eq!(
@@ -747,19 +849,50 @@ mod tests {
             Some(&first_identity),
             "disconnect must not replace the agent"
         );
-        let health: AgentHealth = serde_json::from_value(
-            reconnected
-                .call(
+        let health_calls = Arc::new(AtomicUsize::new(0));
+        let stop_spam = Arc::new(AtomicBool::new(false));
+        let (spam_done_tx, spam_done_rx) = std::sync::mpsc::channel();
+        let spam_health_calls = Arc::clone(&health_calls);
+        let spam_stop = Arc::clone(&stop_spam);
+        let spam_thread = thread::spawn(move || {
+            let mut client = reconnected;
+            while !spam_stop.load(Ordering::Acquire) {
+                match client.call(
                     OP_AGENT_HEALTH,
                     to_value(AgentHealthRequest::default()).expect("health should serialize"),
                     None,
-                )
-                .expect("reconnected agent should be healthy"),
-        )
-        .expect("health should deserialize");
-        assert_eq!(health.state, AgentState::Ready);
+                ) {
+                    Ok(payload) => {
+                        let health: AgentHealth =
+                            serde_json::from_value(payload).expect("health should deserialize");
+                        assert_eq!(health.identity, first_identity);
+                        spam_health_calls.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = spam_done_tx.send(());
+        });
+        let spam_start_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while health_calls.load(Ordering::Relaxed) < 3
+            && std::time::Instant::now() < spam_start_deadline
+        {
+            thread::yield_now();
+        }
+        assert!(
+            health_calls.load(Ordering::Relaxed) >= 3,
+            "health spam client should make progress before shutdown"
+        );
 
-        let shutdown = reconnected
+        let mut shutdown_client = RpcClient::connect(
+            address,
+            token,
+            vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+            None,
+            config,
+        )
+        .expect("shutdown client should connect");
+        let shutdown = shutdown_client
             .call(
                 OP_AGENT_SHUTDOWN,
                 to_value(AgentShutdownRequest {
@@ -773,7 +906,92 @@ mod tests {
             shutdown.get("state").and_then(serde_json::Value::as_str),
             Some("shutting_down")
         );
-        drop(reconnected);
+        let spam_stopped = spam_done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        if spam_stopped.is_err() {
+            stop_spam.store(true, Ordering::Release);
+        }
+        drop(shutdown_client);
+        spam_thread
+            .join()
+            .expect("health spam client should not panic");
+        server_thread.join().expect("agent server should not panic");
+        spam_stopped.expect(
+            "shutdown acknowledgement must close an authenticated client that keeps sending health",
+        );
+    }
+
+    #[test]
+    fn half_open_connections_are_bounded_and_finished_workers_are_reaped() {
+        let token = AuthToken::generate().expect("token generation should work");
+        let listener = std::net::TcpListener::bind(deimos_core::rpc::loopback_address(0))
+            .expect("agent should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let config = RpcConfig {
+            io_timeout: std::time::Duration::from_millis(500),
+            ..RpcConfig::default()
+        };
+        let server_token = token.clone();
+        let server_thread = thread::spawn(move || {
+            serve(listener, server_token, config).expect("agent should stop gracefully");
+        });
+
+        let half_open = (0..MAX_AGENT_CONNECTIONS)
+            .map(|_| {
+                let stream = TcpStream::connect(address).expect("half-open client should connect");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+                    .expect("read timeout should apply");
+                stream
+            })
+            .collect::<Vec<_>>();
+        thread::sleep(std::time::Duration::from_millis(50));
+        let mut overflow = (0..4)
+            .map(|_| {
+                let stream = TcpStream::connect(address).expect("overflow client should connect");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+                    .expect("read timeout should apply");
+                stream
+            })
+            .collect::<Vec<_>>();
+        thread::sleep(std::time::Duration::from_millis(20));
+        let mut rejected = 0;
+        for stream in &mut overflow {
+            let mut byte = [0u8; 1];
+            if !matches!(
+                stream.read(&mut byte),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut
+                    || error.kind() == std::io::ErrorKind::WouldBlock
+            ) {
+                rejected += 1;
+            }
+        }
+        assert!(rejected > 0, "connections beyond the bound must be closed");
+        drop(half_open);
+        drop(overflow);
+        thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut client = RpcClient::connect(
+            address,
+            token,
+            vec![CAPABILITY_AGENT_LIFECYCLE.to_string()],
+            None,
+            config,
+        )
+        .expect("capacity should recover after timed-out workers are reaped");
+        client
+            .call(
+                OP_AGENT_SHUTDOWN,
+                to_value(AgentShutdownRequest {
+                    reason: "resource-bound test complete".to_string(),
+                })
+                .expect("shutdown should serialize"),
+                None,
+            )
+            .expect("shutdown should be acknowledged");
+        drop(client);
         server_thread.join().expect("agent server should not panic");
     }
 
@@ -826,5 +1044,34 @@ mod tests {
             .state,
             AgentState::Ready
         );
+    }
+
+    #[test]
+    fn shutting_down_rejects_new_work_with_protocol_1_0_error_code() {
+        let backend = RpcTestBackend {
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        let service = AgentService::with_identity(backend, test_identity());
+        service
+            .handle_call(&RpcCall {
+                request_id: 1,
+                operation: OP_AGENT_SHUTDOWN.to_string(),
+                payload: to_value(AgentShutdownRequest {
+                    reason: "compatibility test".to_string(),
+                })
+                .expect("shutdown should serialize"),
+                native_context: None,
+            })
+            .expect("shutdown should be accepted");
+
+        let error = service
+            .handle_call(&RpcCall {
+                request_id: 2,
+                operation: CAPABILITY_PROBE.to_string(),
+                payload: to_value(ProbeRequest::default()).expect("probe should serialize"),
+                native_context: None,
+            })
+            .expect_err("new work should be rejected during shutdown");
+        assert_eq!(error.code, RpcErrorCode::InvalidRequest);
     }
 }
