@@ -7,12 +7,14 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "scripts/check-wine-agent-imports.ps1"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "scripts/check-wine-agent-imports.ps1"
       - ".github/workflows/deimos-rust.yml"
 
 env:
@@ -93,6 +95,14 @@ jobs:
         env:
           PYO3_PYTHON: python
         run: rustup run ${{ matrix.toolchain }} cargo build --locked --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
+
+      - name: Reject unsupported Wine agent imports
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/check-wine-agent-imports.ps1
+          -AgentPath ./target/${{ matrix.target }}/release/deimos-agent.exe
+          -Toolchain ${{ matrix.toolchain }}
 
       - name: Run deterministic memory fixture integration test
         if: runner.os == 'Windows'
