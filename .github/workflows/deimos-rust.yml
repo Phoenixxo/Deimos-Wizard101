@@ -13,6 +13,11 @@ on:
       - "crates/**"
       - ".github/workflows/deimos-rust.yml"
 
+env:
+  # All CI host/agent artifacts from this workflow revision must share one ID.
+  # DMS-023 release packaging may replace this with its artifact identity.
+  DEIMOS_BUILD_ID: git-${{ github.sha }}
+
 jobs:
   portable:
     runs-on: ubuntu-latest
