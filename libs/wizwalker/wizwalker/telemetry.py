@@ -23,11 +23,27 @@ ROOT_CLIENT_OBJECT_OFFSET_PATTERN = (
     rb"\x00\x00\x90\x48\x8B\x7C\x24\x30\x48\x85\xFF\x74\x2E\xBE"
     rb"\xFF\xFF\xFF\xFF\x8B\xC6\xF0\x0F\xC1\x47\x08"
 )
+CURRENT_ROOT_CLIENT_OBJECT_OFFSET_PATTERN = (
+    rb"\x48\x8B\x8D....\xE8....\x84\xC0\x74."
+    rb"\x48\x8B\x5C\x24\x40"
+)
 DUEL_MANAGER_PATTERN = (
     rb".......\xE8....\x90.......\x48\x85\xC9\x74.\x0F\x28\x45"
 )
 GAME_MODULE = "WizardGraphicalClient.exe"
 
+_LEGACY_PLAYER_GID_OFFSET = 0x214C0
+_CURRENT_PLAYER_GID_OFFSET = 0x213A8
+_CLIENT_TREE_SELECTORS = (
+    (
+        ROOT_CLIENT_OBJECT_OFFSET_PATTERN,
+        _LEGACY_PLAYER_GID_OFFSET,
+    ),
+    (
+        CURRENT_ROOT_CLIENT_OBJECT_OFFSET_PATTERN,
+        _CURRENT_PLAYER_GID_OFFSET,
+    ),
+)
 _MAX_STRING_LENGTH = 5_000
 _MAX_BEHAVIORS = 1_000
 _MAX_CHILDREN_PER_OBJECT = 1_000
@@ -260,13 +276,31 @@ class _TelemetryReadContext:
 
         return await self._cached("game_client", locate)
 
+    async def _client_tree_selector(self) -> tuple[int, int]:
+        async def locate() -> tuple[int, int]:
+            last_error: PatternFailed | None = None
+            for pattern, player_gid_offset in _CLIENT_TREE_SELECTORS:
+                try:
+                    instruction = await self._pattern(pattern)
+                except PatternFailed as error:
+                    last_error = error
+                    continue
+                root_offset = await self._read(
+                    instruction + 3,
+                    Primitive.uint32,
+                )
+                return root_offset, player_gid_offset
+
+            if last_error is not None:
+                raise last_error
+            raise PatternFailed(ROOT_CLIENT_OBJECT_OFFSET_PATTERN)
+
+        return await self._cached("client_tree_selector", locate)
+
     async def client_tree_root(self) -> int:
         async def locate() -> int:
             game_client = await self.game_client()
-            instruction = await self._pattern(
-                ROOT_CLIENT_OBJECT_OFFSET_PATTERN
-            )
-            offset = await self._read(instruction + 3, Primitive.uint32)
+            offset, _ = await self._client_tree_selector()
             base_address = await self._read(
                 game_client + offset,
                 Primitive.uint64,
@@ -282,8 +316,9 @@ class _TelemetryReadContext:
     async def root_client_object(self) -> int:
         async def locate() -> int:
             game_client = await self.game_client()
+            _, player_gid_offset = await self._client_tree_selector()
             player_id = await self._read(
-                game_client + 0x214C0,
+                game_client + player_gid_offset,
                 Primitive.uint64,
             )
             if player_id == 0:
@@ -379,9 +414,10 @@ class _TelemetryReadContext:
     async def character_identity(self) -> dict[str, Any]:
         game_client = await self.game_client()
         root = await self.root_client_object()
+        _, player_gid_offset = await self._client_tree_selector()
         return {
             "player_gid": await self._read(
-                game_client + 0x214C0,
+                game_client + player_gid_offset,
                 Primitive.uint64,
             ),
             "character_id": await self._read(root + 448, Primitive.uint64),

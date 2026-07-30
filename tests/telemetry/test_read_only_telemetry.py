@@ -30,6 +30,7 @@ from wizwalker import (  # noqa: E402
     ReadOnlyTelemetryReader,
 )
 from wizwalker.telemetry import (  # noqa: E402
+    CURRENT_ROOT_CLIENT_OBJECT_OFFSET_PATTERN,
     DUEL_MANAGER_PATTERN,
     GAME_CLIENT_PATTERN,
     ROOT_CLIENT_OBJECT_OFFSET_PATTERN,
@@ -90,19 +91,32 @@ class TelemetryFixture:
     PARTICIPANT_VECTOR = 0x440000
     PARTICIPANT = 0x450000
     ROOT_OFFSET = 0x212A0
+    CURRENT_ROOT_OFFSET = 0x21378
 
     def __init__(
         self,
         *,
         character_id: int = 123456,
+        current_selector: bool = False,
         player_gid: int = 987654,
         zone_name: str = "WizardCity/WC_Hub",
     ):
         self.memory = SparseMemory()
         self.pattern_scan_calls = 0
+        root_pattern = (
+            CURRENT_ROOT_CLIENT_OBJECT_OFFSET_PATTERN
+            if current_selector
+            else ROOT_CLIENT_OBJECT_OFFSET_PATTERN
+        )
+        root_offset = (
+            self.CURRENT_ROOT_OFFSET
+            if current_selector
+            else self.ROOT_OFFSET
+        )
+        player_gid_offset = 0x213A8 if current_selector else 0x214C0
         self.scan_addresses = {
             GAME_CLIENT_PATTERN: self.GAME_CLIENT_INSTRUCTION,
-            ROOT_CLIENT_OBJECT_OFFSET_PATTERN: self.ROOT_OFFSET_INSTRUCTION,
+            root_pattern: self.ROOT_OFFSET_INSTRUCTION,
             DUEL_MANAGER_PATTERN: self.DUEL_MANAGER_INSTRUCTION,
         }
 
@@ -122,15 +136,15 @@ class TelemetryFixture:
         self.memory.pack(
             self.ROOT_OFFSET_INSTRUCTION + 3,
             "<I",
-            self.ROOT_OFFSET,
+            root_offset,
         )
         self.memory.pack(
-            self.GAME_CLIENT + self.ROOT_OFFSET,
+            self.GAME_CLIENT + root_offset,
             "<Q",
             self.TREE_ROOT,
         )
         self.memory.pack(
-            self.GAME_CLIENT + 0x214C0,
+            self.GAME_CLIENT + player_gid_offset,
             "<Q",
             player_gid,
         )
@@ -475,6 +489,22 @@ class ReadOnlyTelemetryParityTests(unittest.IsolatedAsyncioTestCase):
         for field_name in ("loading", "dialog", "root_ui"):
             error = pymem_snapshot.fields[field_name].error
             self.assertEqual(error.code, "hook_required")
+
+    async def test_current_client_selector_returns_the_same_snapshot(self):
+        fixture = TelemetryFixture(current_selector=True)
+        reader, process = telemetry_reader(fixture, "pymem")
+
+        snapshot = await reader.snapshot()
+
+        self.assertEqual(
+            snapshot.fields["character_identity"].value,
+            {"player_gid": 987654, "character_id": 123456},
+        )
+        self.assertEqual(
+            snapshot.fields["position"].value,
+            {"x": 10.5, "y": -20.25, "z": 30.75},
+        )
+        self.assertEqual(process.write_attempts, 0)
 
     async def test_signature_addresses_are_reused_across_snapshots(self):
         fixture = TelemetryFixture()
