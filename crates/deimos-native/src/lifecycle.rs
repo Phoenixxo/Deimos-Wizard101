@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use deimos_core::client::CAPABILITY_CLIENT_DISCOVERY;
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -19,8 +20,9 @@ const MAX_STDERR_DIAGNOSTIC_BYTES: usize = 4096;
 const MAX_STDERR_INPUT_BYTES: usize = MAX_STDERR_DIAGNOSTIC_BYTES * 2;
 const REDACTION_MARKER: &str = "[REDACTED]";
 const TRUNCATION_MARKER: &str = "[TRUNCATED]";
-const REQUIRED_AGENT_CAPABILITIES: [&str; 3] = [
+const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_AGENT_LIFECYCLE,
+    CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
 ];
@@ -1589,13 +1591,14 @@ mod tests {
     }
 
     #[test]
-    fn handshake_requires_lifecycle_process_and_memory_capabilities() {
+    fn handshake_requires_lifecycle_discovery_process_and_memory_capabilities() {
         let runtime = TestRuntime::new("1.2.3");
         let (endpoint, shutdown) = start_test_agent_with_capabilities(
             "1.2.3",
             "test-build-current",
             vec![
                 CAPABILITY_AGENT_LIFECYCLE.to_string(),
+                CAPABILITY_CLIENT_DISCOVERY.to_string(),
                 CAPABILITY_PROCESS_READ_ONLY.to_string(),
             ],
         );
@@ -1610,6 +1613,33 @@ mod tests {
         assert_eq!(
             error.details.get("missing_capabilities"),
             Some(&CAPABILITY_MEMORY_READ_ONLY.to_string())
+        );
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn handshake_requires_client_discovery_capability() {
+        let runtime = TestRuntime::new("1.2.3");
+        let (endpoint, shutdown) = start_test_agent_with_capabilities(
+            "1.2.3",
+            "test-build-current",
+            vec![
+                CAPABILITY_AGENT_LIFECYCLE.to_string(),
+                CAPABILITY_PROCESS_READ_ONLY.to_string(),
+                CAPABILITY_MEMORY_READ_ONLY.to_string(),
+            ],
+        );
+        let manager = manager(runtime, "1.2.3");
+
+        let error = match manager.connect_candidate(&bottle(), &endpoint) {
+            Ok(_) => panic!("an agent missing client discovery must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, LifecycleErrorCode::MissingCapability);
+        assert_eq!(
+            error.details.get("missing_capabilities"),
+            Some(&CAPABILITY_CLIENT_DISCOVERY.to_string())
         );
         shutdown.store(true, Ordering::Release);
     }
