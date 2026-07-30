@@ -22,6 +22,17 @@ class ClientClosedError(WizWalkerError):
         super().__init__("Client must be running to preform this action.")
 
 
+class UnsupportedClientOperation(WizWalkerError):
+    """Raised when native discovery does not support a legacy window action."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(
+            f"Native client discovery does not support {operation} yet. "
+            "Use the legacy Windows client until native window and input support is available."
+        )
+
+
 class HookNotActive(WizWalkerError):
     """
     Raised when doing something that requires a hook to be active,

@@ -1,11 +1,12 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-
+pub mod client;
 pub mod lifecycle;
 pub mod memory;
 pub mod process;
 pub mod rpc;
+
+use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_SCHEMA_VERSION: u32 = 1;
 pub const BUILD_ID: &str = env!("DEIMOS_BUILD_ID_EMBEDDED");
