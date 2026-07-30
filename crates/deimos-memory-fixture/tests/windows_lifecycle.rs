@@ -28,7 +28,7 @@ use deimos_memory_fixture::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
@@ -697,10 +697,7 @@ fn fixture_validates_controlled_mutation_primitives_and_cleanup() {
     );
 
     let modified_protection_before = query_protection(&process, modified_page_address);
-    assert_eq!(
-        modified_protection_before,
-        (PAGE_READWRITE | PAGE_NOCACHE).0
-    );
+    assert_eq!(modified_protection_before, (PAGE_READWRITE | PAGE_GUARD).0);
     let modified_protection = deimos_agent::mutation::protect(
         &mut sessions,
         &backend,

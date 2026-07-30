@@ -8,7 +8,7 @@ use deimos_memory_fixture::{
     PointerChainMetadata, PrimitiveMetadata, FIXTURE_SCHEMA_VERSION, MUTATION_ENABLED,
 };
 use windows::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOCACHE,
+    VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD,
     PAGE_READONLY, PAGE_READWRITE,
 };
 
@@ -186,7 +186,7 @@ impl FixtureMemory {
         boundary.protect_range(
             ALLOCATION_SIZE * 2,
             ALLOCATION_SIZE,
-            PAGE_READWRITE | PAGE_NOCACHE,
+            PAGE_READWRITE | PAGE_GUARD,
         )?;
 
         let metadata = metadata(
