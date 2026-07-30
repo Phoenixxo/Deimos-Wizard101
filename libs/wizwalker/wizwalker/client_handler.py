@@ -38,6 +38,7 @@ class ClientHandler:
 
         self._managed_handles = []
         self._managed_client_ids = []
+        self._retired_clients: List[Any] = []
         self.clients: List[Any] = []
 
     @property
@@ -173,6 +174,7 @@ class ClientHandler:
             if not client.is_running():
                 dead_clients.append(client)
                 self.clients.remove(client)
+                self._retired_clients.append(client)
         return dead_clients
 
     def get_ordered_clients(self) -> List[Any]:
@@ -202,5 +204,7 @@ class ClientHandler:
 
     async def close(self):
         """Release resources owned by all managed clients."""
-        for client in self.clients:
+        clients = [*self.clients, *self._retired_clients]
+        self._retired_clients.clear()
+        for client in clients:
             await client.close()

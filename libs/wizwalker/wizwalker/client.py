@@ -268,6 +268,14 @@ class Client:
         await self._unpatch_movement_update()
         await self.hook_handler.close()
 
+    async def telemetry_snapshot(self):
+        """Capture hook-free telemetry through the shared read-only contract."""
+        from .memory import MemoryReader
+        from .telemetry import ReadOnlyTelemetryReader
+
+        reader = ReadOnlyTelemetryReader(MemoryReader(self._pymem))
+        return await reader.snapshot(process_id=self.process_id)
+
     async def get_template_ids(self) -> dict:
         """
         Get a dict of template ids mapped to their value

@@ -25,3 +25,10 @@ else:
     from .client_handler import ClientHandler
     from .discovered_client import DiscoveredClient
     from .memory import DeimosNativeMemoryBackend, MemoryBackend, MemoryReader
+
+from .telemetry import (
+    ReadOnlyTelemetryReader,
+    ReadOnlyTelemetrySnapshot,
+    TelemetryDiagnostic,
+    TelemetryField,
+)

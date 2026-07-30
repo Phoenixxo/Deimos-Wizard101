@@ -465,7 +465,7 @@ class MemoryReader:
         address_or_message: int | str,
     ) -> Exception | None:
         if self._backend.is_closed_process_error(error):
-            return ClientClosedError()
+            return self._copy_native_error_context(ClientClosedError(), error)
 
         if not (
             self._backend.is_process_error(error)
@@ -475,9 +475,16 @@ class MemoryReader:
             return None
 
         if await self._is_running_after_error() is False:
-            return ClientClosedError()
+            return self._copy_native_error_context(ClientClosedError(), error)
 
         mapped = MemoryReadError(address_or_message)
+        return self._copy_native_error_context(mapped, error)
+
+    @staticmethod
+    def _copy_native_error_context(
+        mapped: Exception,
+        error: BaseException,
+    ) -> Exception:
         for attribute in (
             "code",
             "details",
