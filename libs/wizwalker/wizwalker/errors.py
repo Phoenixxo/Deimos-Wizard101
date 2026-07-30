@@ -104,6 +104,17 @@ class MemoryWriteError(WizWalkerMemoryError):
         super().__init__(f"Unable to write memory at address {address}.")
 
 
+class UnsupportedMemoryOperation(WizWalkerMemoryError):
+    """Raised when a selected memory backend does not support a mutation."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(
+            f"The selected memory backend does not support {operation}. "
+            "Use the Pymem backend until Rust mutation support is available."
+        )
+
+
 class ReadingEnumFailed(WizWalkerMemoryError):
     """
     Raised when the value passed to an enum is not valid
