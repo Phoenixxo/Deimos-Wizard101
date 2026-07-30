@@ -11,7 +11,10 @@ on:
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
+      - "scripts/test-deimos-telemetry-live.py"
+      - "tests/client_discovery/**"
       - "tests/memory_adapter/**"
+      - "tests/telemetry/**"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
@@ -22,7 +25,10 @@ on:
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
+      - "scripts/test-deimos-telemetry-live.py"
+      - "tests/client_discovery/**"
       - "tests/memory_adapter/**"
+      - "tests/telemetry/**"
       - ".github/workflows/deimos-rust.yml"
 
 env:
@@ -51,7 +57,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check live Python acceptance script
-        run: python -m py_compile scripts/test-deimos-native-live.py
+        run: >-
+          python -m py_compile
+          scripts/test-deimos-native-live.py
+          scripts/test-deimos-telemetry-live.py
+
+      - name: Run portable WizWalker tests
+        run: |
+          python -m unittest discover -s tests/client_discovery -p "test_*.py" -v
+          python -m unittest discover -s tests/telemetry -p "test_*.py" -v
 
       - name: Run portable tests
         env:
@@ -129,10 +143,13 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP" python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager')"
           echo "PYTHONPATH=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      - name: Run WizWalker memory adapter tests
+      - name: Run WizWalker compatibility tests
         env:
           DEIMOS_TEST_REAL_NATIVE: "1"
-        run: python -m unittest discover -s tests/memory_adapter -p "test_*.py" -v
+        run: |
+          python -m unittest discover -s tests/client_discovery -p "test_*.py" -v
+          python -m unittest discover -s tests/memory_adapter -p "test_*.py" -v
+          python -m unittest discover -s tests/telemetry -p "test_*.py" -v
 
       - name: Reject unsupported Wine agent imports
         if: runner.os == 'Windows'
