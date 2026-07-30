@@ -999,6 +999,7 @@ mod tests {
                 &OpenProcessRequest {
                     pid: 336,
                     expected_identity: None,
+                    access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
                 },
             )
             .expect("mock process should open");
@@ -1025,6 +1026,7 @@ mod tests {
                 &OpenProcessRequest {
                     pid: 336,
                     expected_identity: None,
+                    access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
                 },
             )
             .expect("mock process should open");

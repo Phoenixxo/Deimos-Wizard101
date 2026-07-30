@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY_PROCESS_READ_ONLY: &str = "process.read_only.v1";
+pub const CAPABILITY_PROCESS_MUTATION: &str = "process.mutation.v1";
 pub const OP_PROCESS_LIST: &str = "process.list";
 pub const OP_PROCESS_OPEN: &str = "process.open";
 pub const OP_PROCESS_CLOSE: &str = "process.close";
@@ -70,6 +71,14 @@ pub enum ProcessSessionState {
     Exited,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessAccessMode {
+    #[default]
+    ReadOnly,
+    Mutation,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ListProcessesRequest {
     /// Optional case-insensitive executable-name filter. An empty list returns
@@ -90,12 +99,18 @@ pub struct OpenProcessRequest {
     /// reused or the executable changed between list and open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_identity: Option<ProcessIdentity>,
+    /// Mutation access is opt-in and also requires the negotiated mutation
+    /// capabilities. Existing callers remain read-only by default.
+    #[serde(default)]
+    pub access_mode: ProcessAccessMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessSessionResponse {
     pub session_id: ProcessSessionId,
     pub state: ProcessSessionState,
+    #[serde(default)]
+    pub access_mode: ProcessAccessMode,
     pub process: ProcessDescriptor,
 }
 
@@ -114,7 +129,8 @@ pub struct ListModulesResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_process, ProcessIdentity, ProcessKind, MEMORY_FIXTURE_EXECUTABLE,
+        classify_process, OpenProcessRequest, ProcessAccessMode, ProcessIdentity, ProcessKind,
+        ProcessSessionResponse, ProcessSessionState, MEMORY_FIXTURE_EXECUTABLE,
         WIZARD101_EXECUTABLE,
     };
 
@@ -145,5 +161,30 @@ mod tests {
             serde_json::from_str::<ProcessIdentity>(&json).expect("identity should deserialize"),
             identity
         );
+    }
+
+    #[test]
+    fn legacy_open_requests_remain_read_only_by_default() {
+        let request: OpenProcessRequest =
+            serde_json::from_str(r#"{"pid":336}"#).expect("legacy request should deserialize");
+        assert_eq!(request.access_mode, ProcessAccessMode::ReadOnly);
+    }
+
+    #[test]
+    fn legacy_session_responses_remain_read_only_by_default() {
+        let response: ProcessSessionResponse = serde_json::from_str(
+            r#"{
+                "session_id":"legacy-1",
+                "state":"open",
+                "process":{
+                    "pid":336,
+                    "name":"WizardGraphicalClient.exe",
+                    "kind":"wizard101"
+                }
+            }"#,
+        )
+        .expect("legacy session response should deserialize");
+        assert_eq!(response.state, ProcessSessionState::Open);
+        assert_eq!(response.access_mode, ProcessAccessMode::ReadOnly);
     }
 }

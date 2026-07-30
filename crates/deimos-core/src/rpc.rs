@@ -171,6 +171,11 @@ pub enum RpcErrorCode {
     SessionNotFound,
     MemoryInvalidAddress,
     MemoryReadFailed,
+    MemoryWriteFailed,
+    MemoryAllocationFailed,
+    MemoryProtectionFailed,
+    RemoteThreadFailed,
+    CapabilityRequired,
     MemoryRequiredMatchNotFound,
     MemoryAmbiguousMatch,
     MemoryLimitExceeded,
@@ -376,6 +381,23 @@ impl RpcServer {
         F: Fn(&RpcCall) -> Result<Value, Box<RpcError>>,
         A: Fn(&str, bool) -> bool,
     {
+        self.serve_connection_with_capabilities_and_after_response(
+            stream,
+            |call, _| handler(call),
+            after_response,
+        )
+    }
+
+    pub fn serve_connection_with_capabilities_and_after_response<F, A>(
+        &self,
+        stream: TcpStream,
+        handler: F,
+        after_response: A,
+    ) -> io::Result<()>
+    where
+        F: Fn(&RpcCall, &[String]) -> Result<Value, Box<RpcError>>,
+        A: Fn(&str, bool) -> bool,
+    {
         stream.set_read_timeout(Some(self.config.io_timeout))?;
         stream.set_write_timeout(Some(self.config.io_timeout))?;
 
@@ -453,7 +475,7 @@ impl RpcServer {
             }
         };
 
-        let capabilities = self
+        let capabilities: Vec<String> = self
             .capabilities
             .iter()
             .filter(|capability| hello.capabilities.contains(capability))
@@ -464,7 +486,7 @@ impl RpcServer {
             &RpcResponse::Hello(HelloResponse {
                 request_id: hello.request_id,
                 protocol,
-                capabilities,
+                capabilities: capabilities.clone(),
                 agent: self.agent.clone(),
             }),
             self.config.max_message_size,
@@ -524,7 +546,7 @@ impl RpcServer {
             }
 
             let operation = call.operation.clone();
-            let response = match handler(&call) {
+            let response = match handler(&call, &capabilities) {
                 Ok(payload) => RpcResponse::Result(RpcResult {
                     request_id: call.request_id,
                     operation: call.operation,
@@ -637,6 +659,11 @@ impl fmt::Display for RpcErrorCode {
             Self::SessionNotFound => "session_not_found",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
+            Self::MemoryWriteFailed => "memory_write_failed",
+            Self::MemoryAllocationFailed => "memory_allocation_failed",
+            Self::MemoryProtectionFailed => "memory_protection_failed",
+            Self::RemoteThreadFailed => "remote_thread_failed",
+            Self::CapabilityRequired => "capability_required",
             Self::MemoryRequiredMatchNotFound => "memory_required_match_not_found",
             Self::MemoryAmbiguousMatch => "memory_ambiguous_match",
             Self::MemoryLimitExceeded => "memory_limit_exceeded",
