@@ -3,12 +3,19 @@ use serde::{Deserialize, Serialize};
 use crate::process::ProcessSessionId;
 
 pub const CAPABILITY_MEMORY_READ_ONLY: &str = "memory.read_only.v1";
+pub const CAPABILITY_MEMORY_MUTATION: &str = "memory.mutation.v1";
+pub const CAPABILITY_REMOTE_THREAD: &str = "thread.remote.v1";
 pub const OP_MEMORY_REGIONS: &str = "memory.regions";
 pub const OP_MEMORY_READ: &str = "memory.read";
 pub const OP_MEMORY_READ_BATCH: &str = "memory.read_batch";
 pub const OP_MEMORY_READ_TYPED: &str = "memory.read_typed";
 pub const OP_MEMORY_POINTER_CHAIN: &str = "memory.pointer_chain";
 pub const OP_MEMORY_SCAN: &str = "memory.scan";
+pub const OP_MEMORY_WRITE: &str = "memory.write";
+pub const OP_MEMORY_ALLOCATE: &str = "memory.allocate";
+pub const OP_MEMORY_FREE: &str = "memory.free";
+pub const OP_MEMORY_PROTECT: &str = "memory.protect";
+pub const OP_THREAD_START: &str = "thread.start";
 
 pub const DEFAULT_SCAN_MAX_MATCHES: usize = 256;
 // These limits keep Vec<u8>-encoded JSON results comfortably below the 1 MiB
@@ -21,6 +28,11 @@ pub const MAX_POINTER_OFFSETS: usize = 64;
 pub const MAX_SCAN_MATCHES: usize = 4096;
 pub const MAX_SCAN_REGIONS: usize = 4096;
 pub const MAX_SCAN_ERRORS: usize = 256;
+pub const MAX_MEMORY_WRITE_BYTES: usize = 64 * 1024;
+pub const MAX_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
+// Keep one second of headroom under the default five-second RPC I/O timeout
+// for validation, serialization, and transport.
+pub const MAX_REMOTE_THREAD_WAIT_MS: u32 = 4_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +105,86 @@ pub struct MemoryReadResponse {
     pub session_id: ProcessSessionId,
     pub address: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteRequest {
+    pub session_id: ProcessSessionId,
+    pub address: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteResponse {
+    pub session_id: ProcessSessionId,
+    pub address: String,
+    pub bytes_written: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryAllocateRequest {
+    pub session_id: ProcessSessionId,
+    pub size: usize,
+    pub protection: MemoryProtection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryAllocationResponse {
+    pub session_id: ProcessSessionId,
+    pub allocation_id: String,
+    pub address: String,
+    pub size: usize,
+    pub protection: MemoryProtection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryFreeRequest {
+    pub session_id: ProcessSessionId,
+    pub allocation_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryFreeResponse {
+    pub session_id: ProcessSessionId,
+    pub allocation_id: String,
+    pub address: String,
+    pub size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryProtectRequest {
+    pub session_id: ProcessSessionId,
+    pub address: String,
+    pub size: usize,
+    pub protection: MemoryProtection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryProtectResponse {
+    pub session_id: ProcessSessionId,
+    pub address: String,
+    pub size: usize,
+    pub previous_protection: MemoryProtection,
+    pub protection: MemoryProtection,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemoteThreadStartRequest {
+    pub session_id: ProcessSessionId,
+    pub start_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<String>,
+    #[serde(default)]
+    pub wait_timeout_ms: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemoteThreadStartResponse {
+    pub session_id: ProcessSessionId,
+    pub thread_id: u32,
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

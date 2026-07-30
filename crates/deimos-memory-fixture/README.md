@@ -25,7 +25,8 @@ Successful metadata parsing is the readiness signal. Send a line containing
 `shutdown` on stdin to stop the fixture; closing stdin also stops it. A
 successful process exit is the authoritative shutdown signal.
 
-The read/write region exists so future mutation scenarios can use the same
-fixture, but metadata declares `mutation_enabled: false`. Tests open the process
-with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` only. Write behavior remains
-out of scope until DMS-014.
+The read/write region and read-only region are controlled targets for mutation
+tests, and metadata declares `mutation_enabled: true`. Read-only tests still
+open the process with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`; mutation
+tests explicitly request a separate mutation session and never target
+Wizard101.

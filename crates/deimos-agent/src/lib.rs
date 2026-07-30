@@ -11,14 +11,18 @@ use deimos_core::lifecycle::{
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
 use deimos_core::memory::{
-    MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadRequest, MemoryScanRequest,
-    MemorySessionRequest, TypedMemoryReadRequest, CAPABILITY_MEMORY_READ_ONLY,
-    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
-    OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
+    MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest,
+    MemoryProtectRequest, MemoryReadRequest, MemoryScanRequest, MemorySessionRequest,
+    MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
+    CAPABILITY_MEMORY_MUTATION, CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD,
+    OP_MEMORY_ALLOCATE, OP_MEMORY_FREE, OP_MEMORY_POINTER_CHAIN, OP_MEMORY_PROTECT, OP_MEMORY_READ,
+    OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
+    OP_THREAD_START,
 };
 use deimos_core::process::{
-    ListProcessesRequest, OpenProcessRequest, SessionRequest, CAPABILITY_PROCESS_READ_ONLY,
-    OP_MODULE_LIST, OP_PROCESS_CLOSE, OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
+    ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, SessionRequest,
+    CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY, OP_MODULE_LIST, OP_PROCESS_CLOSE,
+    OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
 };
 use deimos_core::rpc::{AuthToken, RpcCall, RpcConfig, RpcError, RpcErrorCode, RpcServer};
 use deimos_core::{ProbeReport, ProbeRequest};
@@ -36,6 +40,7 @@ const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod instance;
 pub mod memory;
+pub mod mutation;
 pub mod process;
 
 #[cfg(windows)]
@@ -50,7 +55,7 @@ use windows_process::WindowsProcessBackend as PlatformProcessBackend;
 #[cfg(not(windows))]
 use process::UnsupportedProcessBackend as PlatformProcessBackend;
 
-use process::{ClientRegistry, MemoryBackend, ProcessSessionRegistry};
+use process::{ClientRegistry, MutationBackend, ProcessSessionRegistry};
 
 #[cfg(windows)]
 pub fn run(request: &ProbeRequest) -> ProbeReport {
@@ -78,6 +83,9 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_CLIENT_DISCOVERY.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
+            CAPABILITY_PROCESS_MUTATION.to_string(),
+            CAPABILITY_MEMORY_MUTATION.to_string(),
+            CAPABILITY_REMOTE_THREAD.to_string(),
         ],
         service.identity().clone(),
         config,
@@ -138,7 +146,7 @@ pub fn serve_connection(server: &RpcServer, stream: TcpStream) -> io::Result<()>
     serve_connection_with_service(server, stream, &service)
 }
 
-fn serve_connection_with_service<B: MemoryBackend>(
+fn serve_connection_with_service<B: MutationBackend>(
     server: &RpcServer,
     stream: TcpStream,
     service: &AgentService<B>,
@@ -147,21 +155,21 @@ fn serve_connection_with_service<B: MemoryBackend>(
     serve_connection_with_service_and_shutdown(server, stream, service, &shutdown_acknowledged)
 }
 
-fn serve_connection_with_service_and_shutdown<B: MemoryBackend>(
+fn serve_connection_with_service_and_shutdown<B: MutationBackend>(
     server: &RpcServer,
     stream: TcpStream,
     service: &AgentService<B>,
     shutdown_acknowledged: &AtomicBool,
 ) -> io::Result<()> {
-    server.serve_connection_with_after_response(
+    server.serve_connection_with_capabilities_and_after_response(
         stream,
-        |call| service.handle_call(call),
+        |call, capabilities| service.handle_call_with_capabilities(call, capabilities),
         |operation, _response_written| {
-            let shutting_down = service.is_shutting_down();
-            if shutting_down && operation == OP_AGENT_SHUTDOWN {
+            let shutdown_complete = service.is_shutdown_complete();
+            if shutdown_complete && operation == OP_AGENT_SHUTDOWN {
                 shutdown_acknowledged.store(true, Ordering::Release);
             }
-            shutting_down
+            shutdown_complete
         },
     )
 }
@@ -213,15 +221,18 @@ fn stop_and_join_workers(workers: &mut Vec<ConnectionWorker>) -> io::Result<()> 
     }
 }
 
-pub struct AgentService<B: MemoryBackend> {
+pub struct AgentService<B: MutationBackend> {
     backend: B,
     identity: AgentIdentity,
     clients: Mutex<ClientRegistry>,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
+    mutations: Mutex<mutation::MutationState<B::ThreadHandle>>,
+    mutation_gate: Mutex<()>,
     shutting_down: AtomicBool,
+    shutdown_complete: AtomicBool,
 }
 
-impl<B: MemoryBackend> AgentService<B> {
+impl<B: MutationBackend> AgentService<B> {
     pub fn try_new(backend: B) -> io::Result<Self> {
         let instance_id = AuthToken::generate()?.as_str().to_string();
         Ok(Self::with_identity(
@@ -241,7 +252,10 @@ impl<B: MemoryBackend> AgentService<B> {
             identity,
             clients: Mutex::new(ClientRegistry::new()),
             sessions: Mutex::new(ProcessSessionRegistry::new()),
+            mutations: Mutex::new(mutation::MutationState::new()),
+            mutation_gate: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
         }
     }
 
@@ -253,7 +267,19 @@ impl<B: MemoryBackend> AgentService<B> {
         self.shutting_down.load(Ordering::Acquire)
     }
 
+    pub fn is_shutdown_complete(&self) -> bool {
+        self.shutdown_complete.load(Ordering::Acquire)
+    }
+
     pub fn handle_call(&self, call: &RpcCall) -> Result<Value, Box<RpcError>> {
+        self.handle_call_with_capabilities(call, &[])
+    }
+
+    pub fn handle_call_with_capabilities(
+        &self,
+        call: &RpcCall,
+        capabilities: &[String],
+    ) -> Result<Value, Box<RpcError>> {
         if self.is_shutting_down()
             && !matches!(call.operation.as_str(), OP_AGENT_HEALTH | OP_AGENT_SHUTDOWN)
         {
@@ -295,7 +321,17 @@ impl<B: MemoryBackend> AgentService<B> {
                         call.native_context.clone(),
                     )));
                 }
+                // Close mutation admission before waiting for in-flight work.
+                // Operations already holding the gate finish before cleanup;
+                // operations waiting behind shutdown recheck and fail closed.
                 self.shutting_down.store(true, Ordering::Release);
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                mutation::cleanup_all(&mut sessions, &self.backend, &mut mutations).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                self.shutdown_complete.store(true, Ordering::Release);
                 encode_payload(
                     call,
                     AgentShutdownResponse {
@@ -372,6 +408,96 @@ impl<B: MemoryBackend> AgentService<B> {
                     })?;
                 encode_payload(call, response)
             }
+            OP_MEMORY_WRITE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[CAPABILITY_PROCESS_MUTATION, CAPABILITY_MEMORY_MUTATION],
+                )?;
+                let request: MemoryWriteRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    mutation::write(&mut sessions, &self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_ALLOCATE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[CAPABILITY_PROCESS_MUTATION, CAPABILITY_MEMORY_MUTATION],
+                )?;
+                let request: MemoryAllocateRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response =
+                    mutation::allocate(&mut sessions, &self.backend, &mut mutations, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_FREE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[CAPABILITY_PROCESS_MUTATION, CAPABILITY_MEMORY_MUTATION],
+                )?;
+                let request: MemoryFreeRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response =
+                    mutation::free(&mut sessions, &self.backend, &mut mutations, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
+            OP_MEMORY_PROTECT => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[CAPABILITY_PROCESS_MUTATION, CAPABILITY_MEMORY_MUTATION],
+                )?;
+                let request: MemoryProtectRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    mutation::protect(&mut sessions, &self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_THREAD_START => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_REMOTE_THREAD,
+                    ],
+                )?;
+                let request: RemoteThreadStartRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response =
+                    mutation::start_thread(&mut sessions, &self.backend, &mut mutations, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
             OP_PROCESS_LIST => {
                 let request: ListProcessesRequest = decode_payload(call)?;
                 let sessions = self.lock_sessions(call)?;
@@ -382,24 +508,53 @@ impl<B: MemoryBackend> AgentService<B> {
             }
             OP_PROCESS_OPEN => {
                 let request: OpenProcessRequest = decode_payload(call)?;
+                if request.access_mode == ProcessAccessMode::Mutation {
+                    require_capabilities(
+                        call,
+                        capabilities,
+                        &[CAPABILITY_PROCESS_MUTATION, CAPABILITY_MEMORY_MUTATION],
+                    )?;
+                    let _gate = self.lock_mutation_gate(call)?;
+                    self.ensure_mutation_admission(call)?;
+                    let mut sessions = self.lock_sessions(call)?;
+                    let response = sessions.open(&self.backend, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                    return encode_payload(call, response);
+                }
                 let mut sessions = self.lock_sessions(call)?;
                 let response = sessions.open(&self.backend, &request).map_err(|error| {
                     Box::new(error.into_rpc_error(call.request_id, &call.operation))
                 })?;
                 encode_payload(call, response)
             }
-            OP_PROCESS_CLOSE | OP_PROCESS_STATUS | OP_MODULE_LIST => {
+            OP_PROCESS_CLOSE => {
+                let request: SessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                mutation::cleanup_session(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &request.session_id,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(
+                    call,
+                    sessions
+                        .close(&self.backend, &request.session_id)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?,
+                )
+            }
+            OP_PROCESS_STATUS | OP_MODULE_LIST => {
                 let request: SessionRequest = decode_payload(call)?;
                 let mut sessions = self.lock_sessions(call)?;
                 let response = match call.operation.as_str() {
-                    OP_PROCESS_CLOSE => encode_payload(
-                        call,
-                        sessions
-                            .close(&self.backend, &request.session_id)
-                            .map_err(|error| {
-                                Box::new(error.into_rpc_error(call.request_id, &call.operation))
-                            })?,
-                    ),
                     OP_PROCESS_STATUS => encode_payload(
                         call,
                         sessions
@@ -459,6 +614,59 @@ impl<B: MemoryBackend> AgentService<B> {
             ))
         })
     }
+
+    fn lock_mutations(
+        &self,
+        call: &RpcCall,
+    ) -> Result<std::sync::MutexGuard<'_, mutation::MutationState<B::ThreadHandle>>, Box<RpcError>>
+    {
+        self.mutations.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "mutation resource registry lock was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })
+    }
+
+    fn lock_mutation_gate(
+        &self,
+        call: &RpcCall,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, Box<RpcError>> {
+        self.mutation_gate.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "mutation admission lock was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })
+    }
+
+    fn ensure_mutation_admission(&self, call: &RpcCall) -> Result<(), Box<RpcError>> {
+        if self.is_shutting_down() {
+            Err(Box::new(RpcError::new(
+                RpcErrorCode::InvalidRequest,
+                "agent shutdown has started; no new mutation can be admitted",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<B: MutationBackend> Drop for AgentService<B> {
+    fn drop(&mut self) {
+        if let (Ok(sessions), Ok(mutations)) = (self.sessions.get_mut(), self.mutations.get_mut()) {
+            let _ = mutation::cleanup_all(sessions, &self.backend, mutations);
+        }
+    }
 }
 
 fn decode_payload<T: DeserializeOwned>(call: &RpcCall) -> Result<T, Box<RpcError>> {
@@ -471,6 +679,36 @@ fn decode_payload<T: DeserializeOwned>(call: &RpcCall) -> Result<T, Box<RpcError
             call.native_context.clone(),
         ))
     })
+}
+
+fn require_capabilities(
+    call: &RpcCall,
+    negotiated: &[String],
+    required: &[&str],
+) -> Result<(), Box<RpcError>> {
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|required| !negotiated.iter().any(|capability| capability == required))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut error = RpcError::new(
+        RpcErrorCode::CapabilityRequired,
+        format!(
+            "{} requires negotiated capabilities: {}",
+            call.operation,
+            missing.join(", ")
+        ),
+        call.request_id,
+        call.operation.clone(),
+        call.native_context.clone(),
+    );
+    error
+        .details
+        .insert("missing_capabilities".to_string(), missing.join(","));
+    Err(Box::new(error))
 }
 
 fn encode_payload<T: Serialize>(call: &RpcCall, value: T) -> Result<Value, Box<RpcError>> {
@@ -492,19 +730,21 @@ mod tests {
         MAX_AGENT_CONNECTIONS,
     };
     use crate::process::{
-        ClientWindowCandidate, MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError,
-        ProcessBackendErrorKind,
+        ClientWindowCandidate, MemoryBackend, MutationBackend, OpenedProcess, ProcessBackend,
+        ProcessBackendError, ProcessBackendErrorKind, RemoteThreadPoll, StartedRemoteThread,
     };
     use deimos_core::client::{ListClientsRequest, ListClientsResponse, OP_CLIENT_LIST};
     use deimos_core::lifecycle::{
         AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentState,
         CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
     };
-    use deimos_core::memory::MemoryRegionDescriptor;
+    use deimos_core::memory::{
+        MemoryRegionDescriptor, MemoryWriteRequest, CAPABILITY_MEMORY_MUTATION, OP_MEMORY_WRITE,
+    };
     use deimos_core::process::{
         classify_process, ModuleDescriptor, OpenProcessRequest, ProcessDescriptor, ProcessIdentity,
-        ProcessSessionResponse, SessionRequest, CAPABILITY_PROCESS_READ_ONLY, OP_PROCESS_OPEN,
-        OP_PROCESS_STATUS, WIZARD101_EXECUTABLE,
+        ProcessSessionResponse, SessionRequest, CAPABILITY_PROCESS_MUTATION,
+        CAPABILITY_PROCESS_READ_ONLY, OP_PROCESS_OPEN, OP_PROCESS_STATUS, WIZARD101_EXECUTABLE,
     };
     use deimos_core::rpc::{
         AuthToken, NativeContext, RpcCall, RpcClient, RpcClientError, RpcConfig, RpcErrorCode,
@@ -737,6 +977,79 @@ mod tests {
         }
     }
 
+    impl MutationBackend for RpcTestBackend {
+        type ThreadHandle = ();
+
+        fn write_memory(
+            &self,
+            _handle: &Self::Handle,
+            _address: usize,
+            _bytes: &[u8],
+        ) -> Result<(), ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn allocate_memory(
+            &self,
+            _handle: &Self::Handle,
+            _size: usize,
+            _protection: deimos_core::memory::MemoryProtection,
+        ) -> Result<usize, ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn free_memory(
+            &self,
+            _handle: &Self::Handle,
+            _address: usize,
+        ) -> Result<(), ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn protect_memory(
+            &self,
+            _handle: &Self::Handle,
+            _address: usize,
+            _size: usize,
+            _protection: deimos_core::memory::MemoryProtection,
+        ) -> Result<deimos_core::memory::MemoryProtection, ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn start_remote_thread(
+            &self,
+            _handle: &Self::Handle,
+            _start_address: usize,
+            _parameter: Option<usize>,
+        ) -> Result<StartedRemoteThread<Self::ThreadHandle>, ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn poll_remote_thread(
+            &self,
+            _thread: &Self::ThreadHandle,
+            _wait_timeout_ms: u32,
+        ) -> Result<RemoteThreadPoll, ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn flush_instruction_cache(
+            &self,
+            _handle: &Self::Handle,
+            _address: usize,
+            _size: usize,
+        ) -> Result<(), ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+    }
+
+    fn rpc_test_mutation_error() -> ProcessBackendError {
+        ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "RPC test backend does not execute mutations",
+        )
+    }
+
     fn rpc_test_process() -> ProcessDescriptor {
         let path = format!(r"C:\Wizard101\{WIZARD101_EXECUTABLE}");
         ProcessDescriptor {
@@ -838,6 +1151,7 @@ mod tests {
         let request = to_value(OpenProcessRequest {
             pid: 336,
             expected_identity: None,
+            access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
         })
         .expect("request should serialize");
         let first_session: ProcessSessionResponse = serde_json::from_value(
@@ -878,6 +1192,70 @@ mod tests {
         drop(first);
         drop(second);
         server_thread.join().expect("server should not panic");
+    }
+
+    #[test]
+    fn mutation_operations_require_negotiated_capabilities_and_mutation_sessions() {
+        let service = AgentService::with_identity(
+            RpcTestBackend {
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            test_identity(),
+        );
+        let open = RpcCall {
+            request_id: 1,
+            operation: OP_PROCESS_OPEN.to_string(),
+            payload: to_value(OpenProcessRequest {
+                pid: 336,
+                expected_identity: None,
+                access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
+            })
+            .expect("open request should serialize"),
+            native_context: None,
+        };
+        let session: ProcessSessionResponse = serde_json::from_value(
+            service
+                .handle_call(&open)
+                .expect("read-only open should remain available"),
+        )
+        .expect("session response should deserialize");
+        let write_call = RpcCall {
+            request_id: 2,
+            operation: OP_MEMORY_WRITE.to_string(),
+            payload: to_value(MemoryWriteRequest {
+                session_id: session.session_id,
+                address: "0x1000".to_string(),
+                bytes: vec![1],
+            })
+            .expect("write request should serialize"),
+            native_context: None,
+        };
+
+        let error = service
+            .handle_call_with_capabilities(&write_call, &[])
+            .expect_err("unnegotiated mutation must fail");
+        assert_eq!(error.code, RpcErrorCode::CapabilityRequired);
+        assert_eq!(
+            error.details.get("missing_capabilities"),
+            Some(&format!(
+                "{CAPABILITY_PROCESS_MUTATION},{CAPABILITY_MEMORY_MUTATION}"
+            ))
+        );
+
+        let error = service
+            .handle_call_with_capabilities(
+                &write_call,
+                &[
+                    CAPABILITY_PROCESS_MUTATION.to_string(),
+                    CAPABILITY_MEMORY_MUTATION.to_string(),
+                ],
+            )
+            .expect_err("read-only sessions must remain non-mutating");
+        assert_eq!(error.code, RpcErrorCode::CapabilityRequired);
+        assert_eq!(
+            error.details.get("required_access_mode"),
+            Some(&"mutation".to_string())
+        );
     }
 
     #[test]
@@ -1084,6 +1462,7 @@ mod tests {
             payload: to_value(OpenProcessRequest {
                 pid: 336,
                 expected_identity: None,
+                access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
             })
             .expect("open request should serialize"),
             native_context: None,

@@ -402,6 +402,21 @@ fn protocol_user_message(code: &RpcErrorCode) -> &'static str {
         RpcErrorCode::MemoryReadFailed => {
             "Deimos could not read that part of Wizard101 memory. Refresh the game state and try again."
         }
+        RpcErrorCode::MemoryWriteFailed => {
+            "Deimos could not update that part of Wizard101 memory. Reconnect to the game and try again."
+        }
+        RpcErrorCode::MemoryAllocationFailed => {
+            "Deimos could not reserve or release helper memory in Wizard101. Reconnect to the game and try again."
+        }
+        RpcErrorCode::MemoryProtectionFailed => {
+            "Deimos could not change memory access safely. Reconnect to the game and try again."
+        }
+        RpcErrorCode::RemoteThreadFailed => {
+            "Deimos could not start the requested helper operation inside Wizard101. Reconnect to the game and try again."
+        }
+        RpcErrorCode::CapabilityRequired => {
+            "This connection is read-only or is missing a required capability. Reconnect with mutation support enabled."
+        }
         RpcErrorCode::MemoryRequiredMatchNotFound => {
             "Deimos could not find the required memory pattern. The game may have updated; refresh signatures before trying again."
         }
@@ -752,6 +767,7 @@ impl PyAgentManager {
             OpenProcessRequest {
                 pid,
                 expected_identity,
+                access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
             },
         )
         .map_err(|error| error.into_pyerr(py))?;

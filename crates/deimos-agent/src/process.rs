@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use deimos_core::client::{ClientDescriptor, ClientId, ListClientsResponse};
 use deimos_core::lifecycle::SessionDiagnostics;
-use deimos_core::memory::MemoryRegionDescriptor;
+use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     ListModulesResponse, ListProcessesRequest, ListProcessesResponse, ModuleDescriptor,
-    OpenProcessRequest, ProcessDescriptor, ProcessIdentity, ProcessSessionId,
+    OpenProcessRequest, ProcessAccessMode, ProcessDescriptor, ProcessIdentity, ProcessSessionId,
     ProcessSessionResponse, ProcessSessionState,
 };
 use deimos_core::rpc::{RpcError, RpcErrorCode};
@@ -81,6 +81,20 @@ pub trait ProcessBackend: Send + Sync + 'static {
     }
 
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError>;
+
+    fn open_process_for_access(
+        &self,
+        pid: u32,
+        access_mode: ProcessAccessMode,
+    ) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError> {
+        match access_mode {
+            ProcessAccessMode::ReadOnly => self.open_process(pid),
+            ProcessAccessMode::Mutation => Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::AccessDenied,
+                "this process backend does not support mutation sessions",
+            )),
+        }
+    }
 
     fn validate_process(
         &self,
@@ -233,6 +247,75 @@ pub trait MemoryBackend: ProcessBackend {
     ) -> Result<Vec<u8>, ProcessBackendError>;
 }
 
+pub struct StartedRemoteThread<T> {
+    pub thread_id: u32,
+    pub handle: T,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteThreadPoll {
+    pub completed: bool,
+    pub exit_code: Option<u32>,
+}
+
+pub struct MutationExecution<T> {
+    pub value: T,
+    pub validation_error: Option<ProcessApiError>,
+}
+
+/// Mutation methods are isolated from the read-only backend contract so a
+/// caller must opt into both a mutation session and mutation capabilities.
+pub trait MutationBackend: MemoryBackend {
+    type ThreadHandle: Send + 'static;
+
+    fn write_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        bytes: &[u8],
+    ) -> Result<(), ProcessBackendError>;
+
+    fn allocate_memory(
+        &self,
+        handle: &Self::Handle,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<usize, ProcessBackendError>;
+
+    fn free_memory(&self, handle: &Self::Handle, address: usize)
+        -> Result<(), ProcessBackendError>;
+
+    fn protect_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<MemoryProtection, ProcessBackendError>;
+
+    fn start_remote_thread(
+        &self,
+        handle: &Self::Handle,
+        start_address: usize,
+        parameter: Option<usize>,
+    ) -> Result<StartedRemoteThread<Self::ThreadHandle>, ProcessBackendError>;
+
+    fn poll_remote_thread(
+        &self,
+        thread: &Self::ThreadHandle,
+        wait_timeout_ms: u32,
+    ) -> Result<RemoteThreadPoll, ProcessBackendError>;
+
+    /// Flush a concrete written range, or the entire target process when both
+    /// `address` and `size` are zero.
+    fn flush_instruction_cache(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+    ) -> Result<(), ProcessBackendError>;
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn enumerate_modules_with_revalidation<B, F>(
     backend: &B,
@@ -324,6 +407,81 @@ impl MemoryBackend for UnsupportedProcessBackend {
     }
 }
 
+#[cfg(not(windows))]
+impl MutationBackend for UnsupportedProcessBackend {
+    type ThreadHandle = ();
+
+    fn write_memory(
+        &self,
+        _handle: &Self::Handle,
+        _address: usize,
+        _bytes: &[u8],
+    ) -> Result<(), ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn allocate_memory(
+        &self,
+        _handle: &Self::Handle,
+        _size: usize,
+        _protection: MemoryProtection,
+    ) -> Result<usize, ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn free_memory(
+        &self,
+        _handle: &Self::Handle,
+        _address: usize,
+    ) -> Result<(), ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn protect_memory(
+        &self,
+        _handle: &Self::Handle,
+        _address: usize,
+        _size: usize,
+        _protection: MemoryProtection,
+    ) -> Result<MemoryProtection, ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn start_remote_thread(
+        &self,
+        _handle: &Self::Handle,
+        _start_address: usize,
+        _parameter: Option<usize>,
+    ) -> Result<StartedRemoteThread<Self::ThreadHandle>, ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn poll_remote_thread(
+        &self,
+        _thread: &Self::ThreadHandle,
+        _wait_timeout_ms: u32,
+    ) -> Result<RemoteThreadPoll, ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn flush_instruction_cache(
+        &self,
+        _handle: &Self::Handle,
+        _address: usize,
+        _size: usize,
+    ) -> Result<(), ProcessBackendError> {
+        unsupported_mutation()
+    }
+}
+
+#[cfg(not(windows))]
+fn unsupported_mutation<T>() -> Result<T, ProcessBackendError> {
+    Err(ProcessBackendError::new(
+        ProcessBackendErrorKind::Native,
+        "mutation APIs require the Windows agent running natively or inside Wine/CrossOver",
+    ))
+}
+
 #[derive(Debug)]
 pub struct ProcessApiError {
     code: RpcErrorCode,
@@ -394,11 +552,25 @@ impl ProcessApiError {
         error.details = self.details;
         error
     }
+
+    pub(crate) fn is_process_exited(&self) -> bool {
+        self.code == RpcErrorCode::ProcessExited
+    }
+
+    pub(crate) fn with_detail(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.details.insert(name.to_string(), value.into());
+        self
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 struct ProcessSession<H> {
     process: ProcessDescriptor,
     state: ProcessSessionState,
+    access_mode: ProcessAccessMode,
     handle: Option<H>,
 }
 
@@ -505,7 +677,7 @@ impl<H> ProcessSessionRegistry<H> {
         request: &OpenProcessRequest,
     ) -> Result<ProcessSessionResponse, ProcessApiError> {
         let opened = backend
-            .open_process(request.pid)
+            .open_process_for_access(request.pid, request.access_mode)
             .map_err(|error| ProcessApiError::from_backend(error, Some(request.pid), None))?;
         let actual_identity = opened.process.identity.as_ref().ok_or_else(|| {
             ProcessApiError::from_backend(
@@ -540,6 +712,7 @@ impl<H> ProcessSessionRegistry<H> {
         let response = ProcessSessionResponse {
             session_id: session_id.clone(),
             state: ProcessSessionState::Open,
+            access_mode: request.access_mode,
             process: opened.process.clone(),
         };
         self.sessions.insert(
@@ -547,6 +720,7 @@ impl<H> ProcessSessionRegistry<H> {
             ProcessSession {
                 process: opened.process,
                 state: ProcessSessionState::Open,
+                access_mode: request.access_mode,
                 handle: Some(opened.handle),
             },
         );
@@ -597,30 +771,32 @@ impl<H> ProcessSessionRegistry<H> {
                 .as_ref()
                 .expect("open sessions always contain an identity"),
         );
-        let session = self
-            .sessions
-            .get_mut(session_id)
-            .expect("session must still exist");
-        session.handle.take();
-        session.state = if validation.as_ref().is_err_and(|error| {
-            matches!(
+        if let Err(error) = validation {
+            if matches!(
                 error.kind,
                 ProcessBackendErrorKind::NotFound
                     | ProcessBackendErrorKind::Exited
                     | ProcessBackendErrorKind::IdentityMismatch
-            )
-        }) {
-            ProcessSessionState::Exited
-        } else {
-            ProcessSessionState::Closed
-        };
-        if let Err(error) = validation {
+            ) {
+                let session = self
+                    .sessions
+                    .get_mut(session_id)
+                    .expect("session must still exist");
+                session.handle.take();
+                session.state = ProcessSessionState::Exited;
+            }
             return Err(ProcessApiError::from_backend(
                 error,
                 Some(pid),
                 Some(session_id),
             ));
         }
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .expect("session must still exist");
+        session.handle.take();
+        session.state = ProcessSessionState::Closed;
         Ok(session_response(session_id, session))
     }
 
@@ -754,6 +930,120 @@ impl<H> ProcessSessionRegistry<H> {
         result
     }
 
+    pub fn with_live_mutation_session<B, F, R, E>(
+        &mut self,
+        backend: &B,
+        session_id: &ProcessSessionId,
+        operation: F,
+    ) -> Result<R, E>
+    where
+        B: ProcessBackend<Handle = H>,
+        F: FnOnce(&B, &H, &ProcessDescriptor) -> Result<R, E>,
+        E: From<ProcessApiError> + From<ProcessBackendError>,
+    {
+        let execution = self.with_mutation_session_effect(backend, session_id, operation)?;
+        if let Some(error) = execution.validation_error {
+            return Err(E::from(error));
+        }
+        Ok(execution.value)
+    }
+
+    /// Execute a side effect after pre-validating a mutation session, then
+    /// report post-operation identity validation separately. This lets the
+    /// caller register ownership of a successful allocation or thread before
+    /// surfacing a validation error.
+    pub fn with_mutation_session_effect<B, F, R, E>(
+        &mut self,
+        backend: &B,
+        session_id: &ProcessSessionId,
+        operation: F,
+    ) -> Result<MutationExecution<R>, E>
+    where
+        B: ProcessBackend<Handle = H>,
+        F: FnOnce(&B, &H, &ProcessDescriptor) -> Result<R, E>,
+        E: From<ProcessApiError> + From<ProcessBackendError>,
+    {
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.access_mode != ProcessAccessMode::Mutation)
+        {
+            return Err(E::from(ProcessApiError {
+                code: RpcErrorCode::CapabilityRequired,
+                message: format!(
+                    "process session {} is read-only; open a mutation session explicitly",
+                    session_id.0
+                ),
+                details: BTreeMap::from([
+                    ("session_id".to_string(), session_id.0.clone()),
+                    ("required_access_mode".to_string(), "mutation".to_string()),
+                ]),
+            }));
+        }
+        self.ensure_live(backend, session_id).map_err(E::from)?;
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| session.state == ProcessSessionState::Closed)
+        {
+            return Err(E::from(ProcessApiError::session_closed(session_id)));
+        }
+        let value = {
+            let session = self
+                .sessions
+                .get(session_id)
+                .expect("validated mutation session must exist");
+            operation(
+                backend,
+                session
+                    .handle
+                    .as_ref()
+                    .expect("open sessions always contain a handle"),
+                &session.process,
+            )?
+        };
+        let validation_error = {
+            let session = self
+                .sessions
+                .get(session_id)
+                .expect("mutation session must exist during revalidation");
+            backend
+                .validate_process(
+                    session
+                        .handle
+                        .as_ref()
+                        .expect("open sessions always contain a handle"),
+                    session
+                        .process
+                        .identity
+                        .as_ref()
+                        .expect("open sessions always contain an identity"),
+                )
+                .err()
+        };
+        let validation_error = validation_error.map(|error| {
+            let pid = self
+                .sessions
+                .get(session_id)
+                .expect("mutation session must exist after validation")
+                .process
+                .pid;
+            if matches!(
+                error.kind,
+                ProcessBackendErrorKind::NotFound
+                    | ProcessBackendErrorKind::Exited
+                    | ProcessBackendErrorKind::IdentityMismatch
+            ) {
+                self.mark_exited(session_id);
+            }
+            ProcessApiError::from_backend(error, Some(pid), Some(session_id))
+        });
+        Ok(MutationExecution {
+            value,
+            validation_error,
+        })
+    }
+
     fn ensure_live<B: ProcessBackend<Handle = H>>(
         &mut self,
         backend: &B,
@@ -836,6 +1126,7 @@ fn session_response<H>(
     ProcessSessionResponse {
         session_id: session_id.clone(),
         state: session.state,
+        access_mode: session.access_mode,
         process: session.process.clone(),
     }
 }
@@ -863,6 +1154,7 @@ mod tests {
         state: Arc<Mutex<HashMap<u32, MockProcess>>>,
         windows: Arc<Mutex<Vec<ClientWindowCandidate>>>,
         dropped_handles: Arc<AtomicUsize>,
+        validation_failure: Arc<Mutex<Option<ProcessBackendErrorKind>>>,
     }
 
     #[derive(Clone)]
@@ -910,6 +1202,7 @@ mod tests {
                 state: Arc::new(Mutex::new(processes)),
                 windows: Arc::new(Mutex::new(Vec::new())),
                 dropped_handles: Arc::new(AtomicUsize::new(0)),
+                validation_failure: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -941,6 +1234,13 @@ mod tests {
                 .get_mut(&pid)
                 .expect("mock process should exist")
                 .creation = "replacement".to_string();
+        }
+
+        fn set_validation_failure(&self, failure: Option<ProcessBackendErrorKind>) {
+            *self
+                .validation_failure
+                .lock()
+                .expect("mock validation failure should lock") = failure;
         }
 
         fn descriptor(pid: u32, process: &MockProcess) -> ProcessDescriptor {
@@ -1009,6 +1309,16 @@ mod tests {
             handle: &Self::Handle,
             expected: &ProcessIdentity,
         ) -> Result<(), ProcessBackendError> {
+            if let Some(kind) = *self
+                .validation_failure
+                .lock()
+                .expect("mock validation failure should lock")
+            {
+                return Err(ProcessBackendError::new(
+                    kind,
+                    "process identity could not be verified",
+                ));
+            }
             let state = self.state.lock().expect("mock state should lock");
             let process = state.get(&handle.pid).ok_or_else(|| {
                 ProcessBackendError::new(ProcessBackendErrorKind::NotFound, "missing process")
@@ -1054,6 +1364,7 @@ mod tests {
         OpenProcessRequest {
             pid,
             expected_identity: None,
+            access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
         }
     }
 
@@ -1286,6 +1597,33 @@ mod tests {
     }
 
     #[test]
+    fn native_revalidation_failure_retains_the_open_session_handle() {
+        let backend = MockBackend::new();
+        let mut registry = ProcessSessionRegistry::with_id_prefix("agent");
+        let session = registry
+            .open(&backend, &open_request(336))
+            .expect("session should open");
+        backend.set_validation_failure(Some(ProcessBackendErrorKind::Native));
+
+        let error = registry
+            .close(&backend, &session.session_id)
+            .expect_err("unverified live process must not be closed");
+        assert_eq!(error.code, RpcErrorCode::Internal);
+        assert_eq!(
+            backend.dropped_handles.load(Ordering::SeqCst),
+            0,
+            "native revalidation failure must retain the process handle"
+        );
+
+        backend.set_validation_failure(None);
+        let closed = registry
+            .close(&backend, &session.session_id)
+            .expect("close should remain retryable after verification recovers");
+        assert_eq!(closed.state, ProcessSessionState::Closed);
+        assert_eq!(backend.dropped_handles.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn stale_and_reused_process_sessions_return_process_exited_and_close_handles() {
         let backend = MockBackend::new();
         let mut registry = ProcessSessionRegistry::with_id_prefix("agent");
@@ -1335,6 +1673,7 @@ mod tests {
                 &OpenProcessRequest {
                     pid: 336,
                     expected_identity: listed.identity,
+                    access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
                 },
             )
             .expect_err("changed identity should fail open");

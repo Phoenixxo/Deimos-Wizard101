@@ -3,35 +3,40 @@ use std::mem::size_of;
 
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
-    classify_process, ModuleDescriptor, ProcessDescriptor, ProcessIdentity,
+    classify_process, ModuleDescriptor, ProcessAccessMode, ProcessDescriptor, ProcessIdentity,
 };
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND, LPARAM, RECT,
-    STILL_ACTIVE,
+    STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Diagnostics::Debug::{
+    FlushInstructionCache, ReadProcessMemory, WriteProcessMemory,
+};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
     MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+    VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, GetProcessTimes, OpenProcess,
+    QueryFullProcessImageNameW, WaitForSingleObject, LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD,
     PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_READ,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
 };
 
 use crate::process::{
-    enumerate_modules_with_revalidation, ClientWindowCandidate, MemoryBackend, OpenedProcess,
-    ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
+    enumerate_modules_with_revalidation, ClientWindowCandidate, MemoryBackend, MutationBackend,
+    OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind, RemoteThreadPoll,
+    StartedRemoteThread,
 };
 
 const MAX_EXECUTABLE_PATH: usize = 32_768;
@@ -53,6 +58,8 @@ impl Drop for OwnedHandle {
 }
 
 pub struct WindowsProcessHandle(OwnedHandle);
+
+pub struct WindowsThreadHandle(OwnedHandle);
 
 impl WindowsProcessHandle {
     pub(crate) fn raw(&self) -> HANDLE {
@@ -111,10 +118,27 @@ impl ProcessBackend for WindowsProcessBackend {
     }
 
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError> {
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
-                .map(OwnedHandle)
-                .map_err(|error| open_error(pid, error))?;
+        self.open_process_for_access(pid, ProcessAccessMode::ReadOnly)
+    }
+
+    fn open_process_for_access(
+        &self,
+        pid: u32,
+        access_mode: ProcessAccessMode,
+    ) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError> {
+        let access = match access_mode {
+            ProcessAccessMode::ReadOnly => PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            ProcessAccessMode::Mutation => {
+                PROCESS_CREATE_THREAD
+                    | PROCESS_QUERY_INFORMATION
+                    | PROCESS_VM_OPERATION
+                    | PROCESS_VM_READ
+                    | PROCESS_VM_WRITE
+            }
+        };
+        let handle = unsafe { OpenProcess(access, false, pid) }
+            .map(OwnedHandle)
+            .map_err(|error| open_error(pid, error))?;
         let identity = process_identity(handle.0, pid)?;
         let name = executable_name(&identity.executable_path);
         let process = ProcessDescriptor {
@@ -150,17 +174,15 @@ impl ProcessBackend for WindowsProcessBackend {
         }
 
         let actual = process_identity(handle.raw(), expected.pid).map_err(|error| {
-            if error.kind == ProcessBackendErrorKind::Native {
-                ProcessBackendError::new(
-                    ProcessBackendErrorKind::Exited,
-                    format!(
-                        "process {} could not be re-identified: {}",
-                        expected.pid, error.message
-                    ),
-                )
-            } else {
-                error
-            }
+            let mut contextual = ProcessBackendError::new(
+                error.kind,
+                format!(
+                    "active process {} could not be re-identified: {}",
+                    expected.pid, error.message
+                ),
+            );
+            contextual.native_code = error.native_code;
+            contextual
         })?;
         if actual.creation_time_100ns != expected.creation_time_100ns
             || !actual
@@ -168,9 +190,9 @@ impl ProcessBackend for WindowsProcessBackend {
                 .eq_ignore_ascii_case(&expected.executable_path)
         {
             return Err(ProcessBackendError::new(
-                ProcessBackendErrorKind::IdentityMismatch,
+                ProcessBackendErrorKind::Native,
                 format!(
-                    "process {} no longer matches the identity captured when the session opened",
+                    "active process {} could not be verified against the identity captured when the session opened",
                     expected.pid
                 ),
             ));
@@ -342,15 +364,272 @@ impl MemoryBackend for WindowsProcessBackend {
     }
 }
 
+impl MutationBackend for WindowsProcessBackend {
+    type ThreadHandle = WindowsThreadHandle;
+
+    fn write_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        bytes: &[u8],
+    ) -> Result<(), ProcessBackendError> {
+        validate_write_range(handle.raw(), address, bytes.len())?;
+        let mut bytes_written = 0usize;
+        unsafe {
+            WriteProcessMemory(
+                handle.raw(),
+                address as *const c_void,
+                bytes.as_ptr().cast::<c_void>(),
+                bytes.len(),
+                Some(&mut bytes_written),
+            )
+        }
+        .map_err(|error| {
+            native_error(
+                format!(
+                    "WriteProcessMemory at {address:#x} wrote {bytes_written} of {} bytes",
+                    bytes.len()
+                ),
+                error,
+            )
+        })?;
+        if bytes_written != bytes.len() {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "WriteProcessMemory at {address:#x} returned {bytes_written} of {} bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+        flush_remote_instruction_cache(handle.raw(), address, bytes.len())
+    }
+
+    fn allocate_memory(
+        &self,
+        handle: &Self::Handle,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<usize, ProcessBackendError> {
+        let pointer = unsafe {
+            VirtualAllocEx(
+                handle.raw(),
+                None,
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                native_protection(protection),
+            )
+        };
+        if pointer.is_null() {
+            return Err(last_error(format!(
+                "VirtualAllocEx could not allocate {size} bytes"
+            )));
+        }
+        Ok(pointer as usize)
+    }
+
+    fn free_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+    ) -> Result<(), ProcessBackendError> {
+        unsafe { VirtualFreeEx(handle.raw(), address as *mut c_void, 0, MEM_RELEASE) }
+            .map_err(|error| native_error(format!("VirtualFreeEx failed at {address:#x}"), error))
+    }
+
+    fn protect_memory(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<MemoryProtection, ProcessBackendError> {
+        let (expected_previous, expected_previous_raw) =
+            validate_protection_range(handle.raw(), address, size)?;
+        let mut previous = PAGE_NOACCESS;
+        unsafe {
+            VirtualProtectEx(
+                handle.raw(),
+                address as *const c_void,
+                size,
+                native_protection(protection),
+                &mut previous,
+            )
+        }
+        .map_err(|error| {
+            native_error(
+                format!(
+                    "VirtualProtectEx failed for {address:#x}..{:#x}",
+                    address + size
+                ),
+                error,
+            )
+        })?;
+        let actual_previous = exact_protection(previous.0);
+        if previous.0 != expected_previous_raw.0 || actual_previous.is_none() {
+            let mut changed_protection = PAGE_NOACCESS;
+            let rollback = unsafe {
+                VirtualProtectEx(
+                    handle.raw(),
+                    address as *const c_void,
+                    size,
+                    previous,
+                    &mut changed_protection,
+                )
+            };
+            return match rollback {
+                Ok(()) => Err(ProcessBackendError::new(
+                    ProcessBackendErrorKind::Native,
+                    format!(
+                        "VirtualProtectEx changed {address:#x}..{:#x}, but raw previous flags {:#x} did not match the prevalidated flags {:#x}; rollback succeeded and restored the raw previous flags",
+                        address + size,
+                        previous.0,
+                        expected_previous_raw.0
+                    ),
+                )),
+                Err(error) => Err(native_error(
+                    format!(
+                        "VirtualProtectEx changed {address:#x}..{:#x}, but raw previous flags {:#x} did not match the prevalidated flags {:#x}; rollback failed and the requested protection may remain active",
+                        address + size,
+                        previous.0,
+                        expected_previous_raw.0
+                    ),
+                    error,
+                )),
+            };
+        }
+        Ok(expected_previous)
+    }
+
+    fn start_remote_thread(
+        &self,
+        handle: &Self::Handle,
+        start_address: usize,
+        parameter: Option<usize>,
+    ) -> Result<StartedRemoteThread<Self::ThreadHandle>, ProcessBackendError> {
+        validate_executable_address(handle.raw(), start_address)?;
+        let routine: LPTHREAD_START_ROUTINE = Some(unsafe {
+            std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(
+                start_address,
+            )
+        });
+        let mut thread_id = 0u32;
+        let thread = unsafe {
+            CreateRemoteThread(
+                handle.raw(),
+                None,
+                0,
+                routine,
+                parameter.map(|value| value as *const c_void),
+                0,
+                Some(&mut thread_id),
+            )
+        }
+        .map(OwnedHandle)
+        .map_err(|error| {
+            native_error(
+                format!("CreateRemoteThread failed at {start_address:#x}"),
+                error,
+            )
+        })?;
+        Ok(StartedRemoteThread {
+            thread_id,
+            handle: WindowsThreadHandle(thread),
+        })
+    }
+
+    fn poll_remote_thread(
+        &self,
+        thread: &Self::ThreadHandle,
+        wait_timeout_ms: u32,
+    ) -> Result<RemoteThreadPoll, ProcessBackendError> {
+        let wait = unsafe { WaitForSingleObject(thread.0 .0, wait_timeout_ms) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(RemoteThreadPoll {
+                completed: false,
+                exit_code: None,
+            });
+        }
+        if wait == WAIT_FAILED {
+            return Err(last_error("WaitForSingleObject failed for remote thread"));
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "remote thread returned unexpected wait status {:#x}",
+                    wait.0
+                ),
+            ));
+        }
+        let mut exit_code = 0u32;
+        unsafe { GetExitCodeThread(thread.0 .0, &mut exit_code) }
+            .map_err(|error| native_error("GetExitCodeThread failed for remote thread", error))?;
+        Ok(RemoteThreadPoll {
+            completed: true,
+            exit_code: Some(exit_code),
+        })
+    }
+
+    fn flush_instruction_cache(
+        &self,
+        handle: &Self::Handle,
+        address: usize,
+        size: usize,
+    ) -> Result<(), ProcessBackendError> {
+        flush_remote_instruction_cache(handle.raw(), address, size)
+    }
+}
+
 fn validate_read_range(
     handle: HANDLE,
     address: usize,
     size: usize,
 ) -> Result<(), ProcessBackendError> {
+    validate_range_with(
+        handle,
+        address,
+        size,
+        |protection| readable_protection(protection).is_some(),
+        "readable",
+    )
+}
+
+fn validate_write_range(
+    handle: HANDLE,
+    address: usize,
+    size: usize,
+) -> Result<(), ProcessBackendError> {
+    validate_range_with(
+        handle,
+        address,
+        size,
+        |protection| {
+            protection & PAGE_GUARD.0 == 0
+                && matches!(
+                    protection & 0xff,
+                    value
+                        if value == PAGE_READWRITE.0
+                            || value == PAGE_EXECUTE_READWRITE.0
+                            || value == PAGE_WRITECOPY.0
+                            || value == PAGE_EXECUTE_WRITECOPY.0
+                )
+        },
+        "writable",
+    )
+}
+
+fn validate_range_with(
+    handle: HANDLE,
+    address: usize,
+    size: usize,
+    accepts_protection: impl Fn(u32) -> bool,
+    requirement: &str,
+) -> Result<(), ProcessBackendError> {
     let end = address.checked_add(size).ok_or_else(|| {
         ProcessBackendError::new(
             ProcessBackendErrorKind::Native,
-            "ReadProcessMemory address plus size overflowed",
+            "memory address plus size overflowed",
         )
     })?;
     let mut cursor = address;
@@ -367,7 +646,7 @@ fn validate_read_range(
         if result == 0 || information.RegionSize == 0 {
             return Err(ProcessBackendError::new(
                 ProcessBackendErrorKind::Native,
-                format!("VirtualQueryEx could not validate read address {cursor:#x}"),
+                format!("VirtualQueryEx could not validate address {cursor:#x}"),
             ));
         }
         let base = information.BaseAddress as usize;
@@ -380,16 +659,116 @@ fn validate_read_range(
         if cursor < base
             || region_end <= cursor
             || information.State != MEM_COMMIT
-            || readable_protection(information.Protect.0).is_none()
+            || !accepts_protection(information.Protect.0)
         {
             return Err(ProcessBackendError::new(
                 ProcessBackendErrorKind::Native,
-                format!("memory range at {cursor:#x} is not readable and committed"),
+                format!("memory range at {cursor:#x} is not {requirement}"),
             ));
         }
         cursor = end.min(region_end);
     }
     Ok(())
+}
+
+fn validate_executable_address(handle: HANDLE, address: usize) -> Result<(), ProcessBackendError> {
+    validate_range_with(
+        handle,
+        address,
+        1,
+        |protection| {
+            protection & PAGE_GUARD.0 == 0
+                && matches!(
+                    protection & 0xff,
+                    value
+                        if value == PAGE_EXECUTE_READ.0
+                            || value == PAGE_EXECUTE_READWRITE.0
+                            || value == PAGE_EXECUTE_WRITECOPY.0
+                )
+        },
+        "executable and committed",
+    )
+}
+
+fn validate_protection_range(
+    handle: HANDLE,
+    address: usize,
+    size: usize,
+) -> Result<(MemoryProtection, PAGE_PROTECTION_FLAGS), ProcessBackendError> {
+    let end = address.checked_add(size).ok_or_else(|| {
+        ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "memory protection range overflowed",
+        )
+    })?;
+    let mut information = MEMORY_BASIC_INFORMATION::default();
+    let result = unsafe {
+        VirtualQueryEx(
+            handle,
+            Some(address as *const c_void),
+            &mut information,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    let base = information.BaseAddress as usize;
+    let region_end = base.checked_add(information.RegionSize).ok_or_else(|| {
+        ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            "VirtualQueryEx protection region overflowed",
+        )
+    })?;
+    if result == 0
+        || information.RegionSize == 0
+        || information.State != MEM_COMMIT
+        || address < base
+        || end > region_end
+    {
+        return Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::Native,
+            format!(
+                "VirtualProtectEx requires one homogeneous committed region for {address:#x}..{end:#x}"
+            ),
+        ));
+    }
+    exact_protection(information.Protect.0)
+        .map(|protection| (protection, information.Protect))
+        .ok_or_else(|| {
+            ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "memory at {address:#x} has unsupported or modified protection {:#x}",
+                    information.Protect.0
+                ),
+            )
+        })
+}
+
+fn flush_remote_instruction_cache(
+    handle: HANDLE,
+    address: usize,
+    size: usize,
+) -> Result<(), ProcessBackendError> {
+    let base_address = (size != 0).then_some(address as *const c_void);
+    unsafe { FlushInstructionCache(handle, base_address, size) }.map_err(|error| {
+        let range = if size == 0 {
+            "the entire target process".to_string()
+        } else {
+            format!("{address:#x}..{:#x}", address + size)
+        };
+        native_error(format!("FlushInstructionCache failed for {range}"), error)
+    })
+}
+
+fn exact_protection(protection: u32) -> Option<MemoryProtection> {
+    match protection {
+        value if value == PAGE_READONLY.0 => Some(MemoryProtection::ReadOnly),
+        value if value == PAGE_READWRITE.0 => Some(MemoryProtection::ReadWrite),
+        value if value == PAGE_EXECUTE_READ.0 => Some(MemoryProtection::ExecuteRead),
+        value if value == PAGE_EXECUTE_READWRITE.0 => Some(MemoryProtection::ExecuteReadWrite),
+        value if value == PAGE_WRITECOPY.0 => Some(MemoryProtection::CopyOnWrite),
+        value if value == PAGE_EXECUTE_WRITECOPY.0 => Some(MemoryProtection::ExecuteCopyOnWrite),
+        _ => None,
+    }
 }
 
 fn readable_protection(protection: u32) -> Option<MemoryProtection> {
@@ -405,6 +784,17 @@ fn readable_protection(protection: u32) -> Option<MemoryProtection> {
         value if value == PAGE_EXECUTE_WRITECOPY.0 => Some(MemoryProtection::ExecuteCopyOnWrite),
         value if value == PAGE_NOACCESS.0 => None,
         _ => None,
+    }
+}
+
+fn native_protection(protection: MemoryProtection) -> PAGE_PROTECTION_FLAGS {
+    match protection {
+        MemoryProtection::ReadOnly => PAGE_READONLY,
+        MemoryProtection::ReadWrite => PAGE_READWRITE,
+        MemoryProtection::ExecuteRead => PAGE_EXECUTE_READ,
+        MemoryProtection::ExecuteReadWrite => PAGE_EXECUTE_READWRITE,
+        MemoryProtection::CopyOnWrite => PAGE_WRITECOPY,
+        MemoryProtection::ExecuteCopyOnWrite => PAGE_EXECUTE_WRITECOPY,
     }
 }
 
@@ -511,6 +901,10 @@ fn native_error(context: impl AsRef<str>, error: windows::core::Error) -> Proces
         format!("{}: {error}", context.as_ref()),
     )
     .with_native_code(error.code().0)
+}
+
+fn last_error(context: impl AsRef<str>) -> ProcessBackendError {
+    native_error(context, windows::core::Error::from_win32())
 }
 
 fn wide_string<const N: usize>(buffer: &[u16; N]) -> String {

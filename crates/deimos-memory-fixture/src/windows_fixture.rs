@@ -8,13 +8,18 @@ use deimos_memory_fixture::{
     PointerChainMetadata, PrimitiveMetadata, FIXTURE_SCHEMA_VERSION, MUTATION_ENABLED,
 };
 use windows::Win32::System::Memory::{
-    VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY,
-    PAGE_READWRITE,
+    VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD,
+    PAGE_READONLY, PAGE_READWRITE,
 };
 
 const ALLOCATION_SIZE: usize = 4096;
+const BOUNDARY_ALLOCATION_SIZE: usize = ALLOCATION_SIZE * 3;
+const BOUNDARY_WRITE_SIZE: usize = 16;
+const BOUNDARY_BYTE: u8 = 0x5a;
 const READ_ONLY_REGION: &str = "read_only_values";
 const READ_WRITE_REGION: &str = "read_write_values";
+const BOUNDARY_READ_WRITE_REGION: &str = "boundary_read_write";
+const BOUNDARY_READ_ONLY_REGION: &str = "boundary_read_only";
 const EXACT_PATTERN_NAME: &str = "exact_anchor";
 const EXACT_PATTERN_SEED: u64 = 0x4d53_5f45_5841_4354;
 const WILDCARD_PATTERN_SEED: u64 = 0x4d53_5f57_494c_4443;
@@ -68,14 +73,11 @@ struct Allocation {
 
 impl Allocation {
     fn read_write() -> io::Result<Self> {
-        let pointer = unsafe {
-            VirtualAlloc(
-                None,
-                ALLOCATION_SIZE,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        };
+        Self::read_write_size(ALLOCATION_SIZE)
+    }
+
+    fn read_write_size(size: usize) -> io::Result<Self> {
+        let pointer = unsafe { VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         let pointer = NonNull::new(pointer).ok_or_else(io::Error::last_os_error)?;
         Ok(Self { pointer })
     }
@@ -92,12 +94,25 @@ impl Allocation {
     }
 
     fn make_read_only(&self) -> io::Result<()> {
+        self.make_range_read_only(0, ALLOCATION_SIZE)
+    }
+
+    fn make_range_read_only(&self, offset: usize, size: usize) -> io::Result<()> {
+        self.protect_range(offset, size, PAGE_READONLY)
+    }
+
+    fn protect_range(
+        &self,
+        offset: usize,
+        size: usize,
+        protection: windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
+    ) -> io::Result<()> {
         let mut previous = PAGE_READWRITE;
         unsafe {
             VirtualProtect(
-                self.pointer.as_ptr(),
-                ALLOCATION_SIZE,
-                PAGE_READONLY,
+                self.pointer.as_ptr().byte_add(offset),
+                size,
+                protection,
                 &mut previous,
             )
         }
@@ -116,6 +131,7 @@ impl Drop for Allocation {
 pub struct FixtureMemory {
     _read_only: Allocation,
     _read_write: Allocation,
+    _boundary: Allocation,
 }
 
 impl FixtureMemory {
@@ -158,9 +174,25 @@ impl FixtureMemory {
         }
         read_only.make_read_only()?;
 
+        let boundary = Allocation::read_write_size(BOUNDARY_ALLOCATION_SIZE)?;
+        unsafe {
+            ptr::write_bytes(
+                boundary.pointer.as_ptr().cast::<u8>(),
+                BOUNDARY_BYTE,
+                BOUNDARY_ALLOCATION_SIZE,
+            );
+        }
+        boundary.make_range_read_only(ALLOCATION_SIZE, ALLOCATION_SIZE)?;
+        boundary.protect_range(
+            ALLOCATION_SIZE * 2,
+            ALLOCATION_SIZE,
+            PAGE_READWRITE | PAGE_GUARD,
+        )?;
+
         let metadata = metadata(
             read_only.address(),
             read_write.address(),
+            boundary.address(),
             &exact_pattern,
             &wildcard_pattern,
         );
@@ -168,6 +200,7 @@ impl FixtureMemory {
             Self {
                 _read_only: read_only,
                 _read_write: read_write,
+                _boundary: boundary,
             },
             metadata,
         ))
@@ -177,6 +210,7 @@ impl FixtureMemory {
 fn metadata(
     read_only_address: usize,
     read_write_address: usize,
+    boundary_address: usize,
     exact_pattern: &[u8; 16],
     wildcard_pattern: &[u8; 16],
 ) -> FixtureMetadata {
@@ -186,6 +220,18 @@ fn metadata(
         architecture: std::env::consts::ARCH.to_string(),
         pointer_width: size_of::<usize>(),
         mutation_enabled: MUTATION_ENABLED,
+        mutation_boundary: Some(deimos_memory_fixture::MutationBoundaryMetadata {
+            write_address: format!(
+                "{:#x}",
+                boundary_address + ALLOCATION_SIZE - (BOUNDARY_WRITE_SIZE / 2)
+            ),
+            write_size: BOUNDARY_WRITE_SIZE,
+            writable_page_address: format!("{boundary_address:#x}"),
+            read_only_page_address: format!("{:#x}", boundary_address + ALLOCATION_SIZE),
+            modified_page_address: format!("{:#x}", boundary_address + ALLOCATION_SIZE * 2),
+            page_size: ALLOCATION_SIZE,
+            expected_byte: BOUNDARY_BYTE,
+        }),
         regions: vec![
             MemoryRegionMetadata {
                 name: READ_ONLY_REGION.to_string(),
@@ -198,6 +244,18 @@ fn metadata(
                 address: format!("{read_write_address:#x}"),
                 size: ALLOCATION_SIZE,
                 protection: MemoryProtection::ReadWrite,
+            },
+            MemoryRegionMetadata {
+                name: BOUNDARY_READ_WRITE_REGION.to_string(),
+                address: format!("{boundary_address:#x}"),
+                size: ALLOCATION_SIZE,
+                protection: MemoryProtection::ReadWrite,
+            },
+            MemoryRegionMetadata {
+                name: BOUNDARY_READ_ONLY_REGION.to_string(),
+                address: format!("{:#x}", boundary_address + ALLOCATION_SIZE),
+                size: ALLOCATION_SIZE,
+                protection: MemoryProtection::ReadOnly,
             },
         ],
         primitives: vec![
