@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use deimos_core::client::{ClientDescriptor, ClientId, ListClientsResponse};
 use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::MemoryRegionDescriptor;
 use deimos_core::process::{
@@ -57,10 +58,27 @@ pub struct OpenedProcess<H> {
     pub process: ProcessDescriptor,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientWindowCandidate {
+    pub(crate) native_window_id: u64,
+    pub pid: u32,
+    /// Identity captured while the candidate still belongs to this HWND. It
+    /// lets the registry reject a PID that was reused before process metadata
+    /// was collected.
+    pub process_identity: ProcessIdentity,
+    pub is_foreground: bool,
+    pub left: i32,
+    pub top: i32,
+}
+
 pub trait ProcessBackend: Send + Sync + 'static {
     type Handle: Send + 'static;
 
     fn list_processes(&self) -> Result<Vec<ProcessDescriptor>, ProcessBackendError>;
+
+    fn list_client_windows(&self) -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
+        Ok(Vec::new())
+    }
 
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError>;
 
@@ -75,6 +93,127 @@ pub trait ProcessBackend: Send + Sync + 'static {
         handle: &Self::Handle,
         expected: &ProcessIdentity,
     ) -> Result<Vec<ModuleDescriptor>, ProcessBackendError>;
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClientRegistryKey {
+    native_window_id: u64,
+    pid: u32,
+    creation_time_100ns: String,
+    // Windows executable paths are case-insensitive. Normalizing the path
+    // keeps an agent-owned client ID stable if the same process is reported
+    // with different path casing on a later discovery pass.
+    executable_path: String,
+}
+
+impl ClientRegistryKey {
+    fn new(native_window_id: u64, process_identity: &ProcessIdentity) -> Self {
+        Self {
+            native_window_id,
+            pid: process_identity.pid,
+            creation_time_100ns: process_identity.creation_time_100ns.clone(),
+            executable_path: process_identity.executable_path.to_ascii_lowercase(),
+        }
+    }
+}
+
+pub struct ClientRegistry {
+    clients: HashMap<ClientRegistryKey, ClientId>,
+    id_prefix: String,
+    next_client: u64,
+}
+
+impl Default for ClientRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientRegistry {
+    pub fn new() -> Self {
+        let registry = NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed);
+        Self {
+            clients: HashMap::new(),
+            id_prefix: format!("client-{registry}"),
+            next_client: 1,
+        }
+    }
+
+    pub fn list<B: ProcessBackend>(
+        &mut self,
+        backend: &B,
+    ) -> Result<ListClientsResponse, ProcessBackendError> {
+        let windows = backend.list_client_windows()?;
+        let processes = backend
+            .list_processes()?
+            .into_iter()
+            .filter(|process| process.kind == deimos_core::process::ProcessKind::Wizard101)
+            .filter_map(|process| process.identity.clone().map(|identity| (identity, process)))
+            .map(|(identity, process)| (process.pid, (identity, process)))
+            .collect::<HashMap<_, _>>();
+
+        let mut seen_keys = HashSet::new();
+        let mut discovered = Vec::new();
+        for (discovery_order, window) in windows.into_iter().enumerate() {
+            let Some((identity, process)) = processes.get(&window.pid) else {
+                continue;
+            };
+            if !same_process_identity(&window.process_identity, identity) {
+                continue;
+            }
+            let key = ClientRegistryKey::new(window.native_window_id, identity);
+            // EnumWindows normally reports every top-level window once, but
+            // a duplicate backend result must not produce duplicate client
+            // descriptors for the same agent-owned identity.
+            if !seen_keys.insert(key.clone()) {
+                continue;
+            }
+            discovered.push((discovery_order, window, key, process.clone()));
+        }
+
+        let mut screen_positions = discovered
+            .iter()
+            .map(|(discovery_order, window, _, _)| (*discovery_order, window.top, window.left))
+            .collect::<Vec<_>>();
+        screen_positions
+            .sort_by_key(|(discovery_order, top, left)| (*top, *left, *discovery_order));
+        let screen_orders = screen_positions
+            .into_iter()
+            .enumerate()
+            .map(|(screen_order, (discovery_order, _, _))| (discovery_order, screen_order))
+            .collect::<HashMap<_, _>>();
+
+        let mut active = HashMap::new();
+        let mut clients = Vec::new();
+        for (discovery_order, window, key, process) in discovered {
+            let client_id = self.clients.get(&key).cloned().unwrap_or_else(|| {
+                let id = ClientId(format!("{}-{}", self.id_prefix, self.next_client));
+                self.next_client += 1;
+                id
+            });
+            active.insert(key, client_id.clone());
+            clients.push(ClientDescriptor {
+                client_id,
+                process,
+                is_foreground: window.is_foreground,
+                screen_order: screen_orders
+                    .get(&discovery_order)
+                    .copied()
+                    .expect("every window has a screen order"),
+            });
+        }
+        self.clients = active;
+
+        Ok(ListClientsResponse { clients })
+    }
+}
+
+fn same_process_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
+    left.pid == right.pid
+        && left.creation_time_100ns == right.creation_time_100ns
+        && left
+            .executable_path
+            .eq_ignore_ascii_case(&right.executable_path)
 }
 
 /// Read-only memory operations are deliberately a separate capability layered
@@ -193,7 +332,7 @@ pub struct ProcessApiError {
 }
 
 impl ProcessApiError {
-    fn from_backend(
+    pub(crate) fn from_backend(
         error: ProcessBackendError,
         pid: Option<u32>,
         session_id: Option<&ProcessSessionId>,
@@ -715,13 +854,14 @@ mod tests {
     use deimos_core::rpc::RpcErrorCode;
 
     use super::{
-        enumerate_modules_with_revalidation, OpenedProcess, ProcessBackend, ProcessBackendError,
-        ProcessBackendErrorKind, ProcessSessionRegistry,
+        enumerate_modules_with_revalidation, ClientRegistry, ClientWindowCandidate, OpenedProcess,
+        ProcessBackend, ProcessBackendError, ProcessBackendErrorKind, ProcessSessionRegistry,
     };
 
     #[derive(Clone)]
     struct MockBackend {
         state: Arc<Mutex<HashMap<u32, MockProcess>>>,
+        windows: Arc<Mutex<Vec<ClientWindowCandidate>>>,
         dropped_handles: Arc<AtomicUsize>,
     }
 
@@ -768,8 +908,21 @@ mod tests {
             ]);
             Self {
                 state: Arc::new(Mutex::new(processes)),
+                windows: Arc::new(Mutex::new(Vec::new())),
                 dropped_handles: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn set_windows(&self, windows: Vec<ClientWindowCandidate>) {
+            *self.windows.lock().expect("mock windows should lock") = windows;
+        }
+
+        fn identity(&self, pid: u32) -> ProcessIdentity {
+            let state = self.state.lock().expect("mock state should lock");
+            let process = state.get(&pid).expect("mock process should exist");
+            Self::descriptor(pid, process)
+                .identity
+                .expect("mock descriptor should have an identity")
         }
 
         fn stop(&self, pid: u32) {
@@ -818,6 +971,14 @@ mod tests {
                 .filter(|(_, process)| process.alive)
                 .map(|(pid, process)| Self::descriptor(*pid, process))
                 .collect())
+        }
+
+        fn list_client_windows(&self) -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
+            Ok(self
+                .windows
+                .lock()
+                .expect("mock windows should lock")
+                .clone())
         }
 
         fn open_process(
@@ -924,6 +1085,156 @@ mod tests {
             336,
             "the agent must return its Wine-internal PID unchanged"
         );
+    }
+
+    #[test]
+    fn client_ids_are_stable_until_the_window_or_process_identity_changes() {
+        let backend = MockBackend::new();
+        backend.set_windows(vec![ClientWindowCandidate {
+            native_window_id: 0xabc,
+            pid: 336,
+            process_identity: backend.identity(336),
+            is_foreground: true,
+            left: 100,
+            top: 50,
+        }]);
+        let mut registry = ClientRegistry::new();
+
+        let first = registry.list(&backend).expect("first listing should work");
+        let second = registry.list(&backend).expect("second listing should work");
+        assert_eq!(first.clients[0].client_id, second.clients[0].client_id);
+
+        backend
+            .state
+            .lock()
+            .expect("mock state should lock")
+            .get_mut(&336)
+            .expect("mock process should exist")
+            .path
+            .make_ascii_uppercase();
+        let case_changed = registry
+            .list(&backend)
+            .expect("path case change should still list");
+        assert_eq!(
+            first.clients[0].client_id,
+            case_changed.clients[0].client_id
+        );
+
+        backend.set_windows(Vec::new());
+        assert!(registry
+            .list(&backend)
+            .expect("closed window should be pruned")
+            .clients
+            .is_empty());
+        backend.replace_identity(336);
+        backend.set_windows(vec![ClientWindowCandidate {
+            native_window_id: 0xabc,
+            pid: 336,
+            process_identity: backend.identity(336),
+            is_foreground: false,
+            left: 100,
+            top: 50,
+        }]);
+        let reused = registry.list(&backend).expect("reused window should list");
+        assert_ne!(first.clients[0].client_id, reused.clients[0].client_id);
+    }
+
+    #[test]
+    fn client_discovery_preserves_native_order_and_reports_visual_order() {
+        let backend = MockBackend::new();
+        {
+            let mut state = backend.state.lock().expect("mock state should lock");
+            state.insert(
+                337,
+                MockProcess {
+                    name: WIZARD101_EXECUTABLE.to_string(),
+                    creation: "1001".to_string(),
+                    path: format!(r"C:\Wizard101-2\{WIZARD101_EXECUTABLE}"),
+                    alive: true,
+                },
+            );
+        }
+        backend.set_windows(vec![
+            ClientWindowCandidate {
+                native_window_id: 20,
+                pid: 336,
+                process_identity: backend.identity(336),
+                is_foreground: false,
+                left: 500,
+                top: 100,
+            },
+            ClientWindowCandidate {
+                native_window_id: 10,
+                pid: 337,
+                process_identity: backend.identity(337),
+                is_foreground: true,
+                left: 50,
+                top: 20,
+            },
+        ]);
+
+        let clients = ClientRegistry::new()
+            .list(&backend)
+            .expect("client listing should work")
+            .clients;
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.process.pid)
+                .collect::<Vec<_>>(),
+            vec![336, 337]
+        );
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.screen_order)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(!clients[0].is_foreground);
+        assert!(clients[1].is_foreground);
+        assert_ne!(clients[0].client_id, clients[1].client_id);
+    }
+
+    #[test]
+    fn client_discovery_deduplicates_repeated_window_candidates() {
+        let backend = MockBackend::new();
+        let candidate = ClientWindowCandidate {
+            native_window_id: 0xabc,
+            pid: 336,
+            process_identity: backend.identity(336),
+            is_foreground: true,
+            left: 100,
+            top: 50,
+        };
+        backend.set_windows(vec![candidate.clone(), candidate]);
+
+        let clients = ClientRegistry::new()
+            .list(&backend)
+            .expect("client listing should work")
+            .clients;
+        assert_eq!(clients.len(), 1);
+    }
+
+    #[test]
+    fn client_discovery_rejects_a_window_when_its_pid_was_reused() {
+        let backend = MockBackend::new();
+        let stale_candidate = ClientWindowCandidate {
+            native_window_id: 0xabc,
+            pid: 336,
+            process_identity: backend.identity(336),
+            is_foreground: true,
+            left: 100,
+            top: 50,
+        };
+        backend.replace_identity(336);
+        backend.set_windows(vec![stale_candidate]);
+
+        assert!(ClientRegistry::new()
+            .list(&backend)
+            .expect("client listing should work")
+            .clients
+            .is_empty());
     }
 
     #[test]

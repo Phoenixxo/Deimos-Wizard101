@@ -7,7 +7,8 @@ use deimos_core::process::{
 };
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, STILL_ACTIVE,
+    CloseHandle, BOOL, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND, LPARAM, RECT,
+    STILL_ACTIVE,
 };
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -24,13 +25,17 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_VM_READ,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+};
 
 use crate::process::{
-    enumerate_modules_with_revalidation, MemoryBackend, OpenedProcess, ProcessBackend,
-    ProcessBackendError, ProcessBackendErrorKind,
+    enumerate_modules_with_revalidation, ClientWindowCandidate, MemoryBackend, OpenedProcess,
+    ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
 };
 
 const MAX_EXECUTABLE_PATH: usize = 32_768;
+const WIZARD_WINDOW_CLASS: &str = "Wizard Graphical Client";
 
 struct OwnedHandle(HANDLE);
 
@@ -99,6 +104,10 @@ impl ProcessBackend for WindowsProcessBackend {
             }
         }
         Ok(processes)
+    }
+
+    fn list_client_windows(&self) -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
+        enumerate_client_windows()
     }
 
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError> {
@@ -178,6 +187,73 @@ impl ProcessBackend for WindowsProcessBackend {
             enumerate_modules(expected.pid)
         })
     }
+}
+
+fn enumerate_client_windows() -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut context = ClientWindowEnumeration {
+        foreground,
+        windows: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(collect_client_window),
+            LPARAM((&mut context as *mut ClientWindowEnumeration) as isize),
+        )
+    }
+    .map_err(|error| native_error("EnumWindows failed during client discovery", error))?;
+    Ok(context.windows)
+}
+
+struct ClientWindowEnumeration {
+    foreground: HWND,
+    windows: Vec<ClientWindowCandidate>,
+}
+
+unsafe extern "system" fn collect_client_window(hwnd: HWND, context: LPARAM) -> BOOL {
+    // `context` is a stack-owned value that remains alive until EnumWindows
+    // returns. Keep the raw pointer confined to this synchronous callback.
+    let Some(context) = (unsafe { (context.0 as *mut ClientWindowEnumeration).as_mut() }) else {
+        return BOOL(1);
+    };
+    let mut class_name = [0u16; 256];
+    let length = GetClassNameW(hwnd, &mut class_name);
+    if length <= 0
+        || !class_name[..length as usize]
+            .iter()
+            .copied()
+            .eq(WIZARD_WINDOW_CLASS.encode_utf16())
+    {
+        return BOOL(1);
+    }
+
+    let mut pid = 0u32;
+    if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 || pid == 0 {
+        return BOOL(1);
+    }
+    let process_identity =
+        match open_query_handle(pid).and_then(|handle| process_identity(handle.0, pid)) {
+            Ok(identity) => identity,
+            Err(_) => return BOOL(1),
+        };
+    let mut confirmed_pid = 0u32;
+    if GetWindowThreadProcessId(hwnd, Some(&mut confirmed_pid)) == 0 || confirmed_pid != pid {
+        return BOOL(1);
+    }
+    let mut rectangle = RECT::default();
+    if GetWindowRect(hwnd, &mut rectangle).is_err() {
+        return BOOL(1);
+    }
+
+    context.windows.push(ClientWindowCandidate {
+        native_window_id: hwnd.0 as usize as u64,
+        pid,
+        process_identity,
+        is_foreground: hwnd == context.foreground,
+        left: rectangle.left,
+        top: rectangle.top,
+    });
+    BOOL(1)
 }
 
 impl MemoryBackend for WindowsProcessBackend {

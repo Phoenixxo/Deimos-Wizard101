@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use deimos_core::client::{ListClientsRequest, CAPABILITY_CLIENT_DISCOVERY, OP_CLIENT_LIST};
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -49,7 +50,7 @@ use windows_process::WindowsProcessBackend as PlatformProcessBackend;
 #[cfg(not(windows))]
 use process::UnsupportedProcessBackend as PlatformProcessBackend;
 
-use process::{MemoryBackend, ProcessSessionRegistry};
+use process::{ClientRegistry, MemoryBackend, ProcessSessionRegistry};
 
 #[cfg(windows)]
 pub fn run(request: &ProbeRequest) -> ProbeReport {
@@ -74,6 +75,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
         vec![
             CAPABILITY_AGENT_LIFECYCLE.to_string(),
             CAPABILITY_PROBE.to_string(),
+            CAPABILITY_CLIENT_DISCOVERY.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
         ],
@@ -214,6 +216,7 @@ fn stop_and_join_workers(workers: &mut Vec<ConnectionWorker>) -> io::Result<()> 
 pub struct AgentService<B: MemoryBackend> {
     backend: B,
     identity: AgentIdentity,
+    clients: Mutex<ClientRegistry>,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
     shutting_down: AtomicBool,
 }
@@ -236,6 +239,7 @@ impl<B: MemoryBackend> AgentService<B> {
         Self {
             backend,
             identity,
+            clients: Mutex::new(ClientRegistry::new()),
             sessions: Mutex::new(ProcessSessionRegistry::new()),
             shutting_down: AtomicBool::new(false),
         }
@@ -304,6 +308,17 @@ impl<B: MemoryBackend> AgentService<B> {
             CAPABILITY_PROBE => {
                 let request: ProbeRequest = decode_payload(call)?;
                 encode_payload(call, run(&request))
+            }
+            OP_CLIENT_LIST => {
+                let _: ListClientsRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response = clients.list(&self.backend).map_err(|error| {
+                    Box::new(
+                        process::ProcessApiError::from_backend(error, None, None)
+                            .into_rpc_error(call.request_id, &call.operation),
+                    )
+                })?;
+                encode_payload(call, response)
             }
             OP_MEMORY_REGIONS => {
                 let request: MemorySessionRequest = decode_payload(call)?;
@@ -429,6 +444,21 @@ impl<B: MemoryBackend> AgentService<B> {
             ))
         })
     }
+
+    fn lock_clients(
+        &self,
+        call: &RpcCall,
+    ) -> Result<std::sync::MutexGuard<'_, ClientRegistry>, Box<RpcError>> {
+        self.clients.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "client discovery registry lock was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })
+    }
 }
 
 fn decode_payload<T: DeserializeOwned>(call: &RpcCall) -> Result<T, Box<RpcError>> {
@@ -462,8 +492,10 @@ mod tests {
         MAX_AGENT_CONNECTIONS,
     };
     use crate::process::{
-        MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
+        ClientWindowCandidate, MemoryBackend, OpenedProcess, ProcessBackend, ProcessBackendError,
+        ProcessBackendErrorKind,
     };
+    use deimos_core::client::{ListClientsRequest, ListClientsResponse, OP_CLIENT_LIST};
     use deimos_core::lifecycle::{
         AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentState,
         CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -623,6 +655,20 @@ mod tests {
             Ok(vec![rpc_test_process()])
         }
 
+        fn list_client_windows(&self) -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
+            let process_identity = rpc_test_process()
+                .identity
+                .expect("RPC test process should have an identity");
+            Ok(vec![ClientWindowCandidate {
+                native_window_id: 0x1234,
+                pid: 336,
+                process_identity,
+                is_foreground: true,
+                left: 20,
+                top: 10,
+            }])
+        }
+
         fn open_process(
             &self,
             pid: u32,
@@ -704,6 +750,37 @@ mod tests {
                 executable_path: path,
             }),
         }
+    }
+
+    #[test]
+    fn client_list_returns_agent_owned_identity_without_a_native_window_handle() {
+        let service = AgentService::with_identity(
+            RpcTestBackend {
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            test_identity(),
+        );
+        let call = RpcCall {
+            request_id: 1,
+            operation: OP_CLIENT_LIST.to_string(),
+            payload: to_value(ListClientsRequest::default())
+                .expect("client request should serialize"),
+            native_context: None,
+        };
+
+        let value = service
+            .handle_call(&call)
+            .expect("client listing should succeed");
+        assert!(value
+            .get("clients")
+            .and_then(|clients| clients.get(0))
+            .and_then(|client| client.get("window_handle"))
+            .is_none());
+        let response: ListClientsResponse =
+            serde_json::from_value(value).expect("client response should deserialize");
+        assert_eq!(response.clients.len(), 1);
+        assert_eq!(response.clients[0].process.pid, 336);
+        assert!(response.clients[0].is_foreground);
     }
 
     #[test]
