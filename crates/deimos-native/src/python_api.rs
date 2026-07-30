@@ -4,6 +4,7 @@ use std::sync::Mutex;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
+use deimos_core::client::{ListClientsRequest, OP_CLIENT_LIST};
 use deimos_core::memory::{
     ByteOrder, MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem,
     MemoryReadRequest, MemoryReadResponse, MemoryScanRequest, MemoryScanScope,
@@ -717,6 +718,12 @@ impl PyAgentManager {
                 .capabilities(bottle)
                 .map_err(BindingError::Lifecycle)
         })
+    }
+
+    fn list_clients(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(OP_CLIENT_LIST, ListClientsRequest::default())
+            .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_LIST, request)
     }
 
     #[pyo3(signature = (names = None))]

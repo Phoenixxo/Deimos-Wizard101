@@ -828,6 +828,7 @@ class ImportIsolationTests(unittest.TestCase):
         self.assertTrue(issubclass(native.ProcessError, native.DeimosNativeError))
         self.assertTrue(issubclass(native.MemoryError, native.DeimosNativeError))
         for method_name in (
+            "list_clients",
             "list_modules",
             "memory_regions",
             "process_status",

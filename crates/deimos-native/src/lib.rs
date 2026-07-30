@@ -80,6 +80,7 @@ mod tests {
                 "status",
                 "stop",
                 "capabilities",
+                "list_clients",
                 "list_processes",
                 "open_process",
                 "process_status",
