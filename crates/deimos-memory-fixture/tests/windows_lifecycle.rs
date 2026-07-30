@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use deimos_agent::process::ProcessSessionRegistry;
 use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
 use deimos_core::memory::{
-    ByteOrder, MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem,
-    MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
-    TypedMemoryReadRequest,
+    ByteOrder, MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest,
+    MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadItem, MemoryReadRequest,
+    MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType, MemoryWriteRequest,
+    RemoteThreadStartRequest, TypedMemoryReadRequest,
 };
 use deimos_core::process::{
-    ListProcessesRequest, OpenProcessRequest, ProcessKind, MEMORY_FIXTURE_EXECUTABLE,
-    OP_PROCESS_STATUS,
+    ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessKind,
+    MEMORY_FIXTURE_EXECUTABLE, OP_PROCESS_STATUS,
 };
 use deimos_core::rpc::RpcErrorCode;
 use deimos_memory_fixture::{
@@ -27,7 +28,7 @@ use deimos_memory_fixture::{
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
-    VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
+    VirtualQueryEx, MEMORY_BASIC_INFORMATION, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
@@ -116,7 +117,7 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
     assert_eq!(metadata.pid, fixture.child.id());
     assert_eq!(metadata.architecture, "x86_64");
     assert_eq!(metadata.pointer_width, 8);
-    assert!(!metadata.mutation_enabled, "DMS-014 owns mutation support");
+    assert!(metadata.mutation_enabled);
 
     let backend = WindowsProcessBackend;
     let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
@@ -146,6 +147,7 @@ fn fixture_publishes_discoverable_read_only_memory_and_stops_cleanly() {
             &OpenProcessRequest {
                 pid: metadata.pid,
                 expected_identity: listed.identity,
+                access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
             },
         )
         .expect("agent should open a read-only fixture session");
@@ -454,6 +456,424 @@ fn fixture_stops_cleanly_when_stdin_closes() {
     );
 }
 
+#[test]
+fn fixture_validates_controlled_mutation_primitives_and_cleanup() {
+    let mut fixture = FixtureProcess::spawn();
+    let metadata = read_metadata(&mut fixture);
+    assert!(metadata.mutation_enabled);
+
+    let backend = WindowsProcessBackend;
+    let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
+    let listed = sessions
+        .list(
+            &backend,
+            &ListProcessesRequest {
+                names: vec![MEMORY_FIXTURE_EXECUTABLE.to_string()],
+            },
+        )
+        .expect("agent should enumerate the fixture")
+        .processes
+        .into_iter()
+        .find(|process| process.pid == metadata.pid)
+        .expect("fixture should be discoverable");
+    let identity = listed
+        .identity
+        .clone()
+        .expect("fixture should have a stable identity");
+
+    let read_only = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: Some(identity.clone()),
+                access_mode: ProcessAccessMode::ReadOnly,
+            },
+        )
+        .expect("read-only fixture session should open");
+    let sentinel = metadata
+        .primitives
+        .iter()
+        .find(|primitive| primitive.name == "writable_sentinel")
+        .expect("fixture should publish a writable sentinel");
+    let writable_region = region(&metadata, &sentinel.region);
+    let sentinel_address = parse_address(&writable_region.address) + sentinel.offset;
+    let original_sentinel = decode_hex(&sentinel.expected_bytes);
+    let read_only_error = deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: read_only.session_id.clone(),
+            address: format!("{sentinel_address:#x}"),
+            bytes: vec![1, 2, 3, 4],
+        },
+    )
+    .expect_err("read-only fixture sessions must not mutate")
+    .into_rpc_error(1, "memory.write");
+    assert_eq!(read_only_error.code, RpcErrorCode::CapabilityRequired);
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: read_only.session_id.clone(),
+                address: format!("{sentinel_address:#x}"),
+                size: original_sentinel.len(),
+            },
+        )
+        .expect("sentinel should remain readable")
+        .bytes,
+        original_sentinel
+    );
+
+    let mutation_session = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: Some(identity),
+                access_mode: ProcessAccessMode::Mutation,
+            },
+        )
+        .expect("mutation fixture session should open");
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false,
+            metadata.pid,
+        )
+    }
+    .map(OwnedHandle)
+    .expect("fixture should allow protection and atomicity inspection");
+    let before = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{sentinel_address:#x}"),
+            size: 12,
+        },
+    )
+    .expect("writable target and guards should be readable")
+    .bytes;
+    let replacement = 0x1234_5678u32.to_le_bytes();
+    deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{sentinel_address:#x}"),
+            bytes: replacement.to_vec(),
+        },
+    )
+    .expect("controlled sentinel write should succeed");
+    let after = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{sentinel_address:#x}"),
+            size: 12,
+        },
+    )
+    .expect("written target and guards should be readable")
+    .bytes;
+    assert_eq!(&after[..replacement.len()], &replacement);
+    assert_eq!(
+        &after[replacement.len()..],
+        &before[replacement.len()..],
+        "a valid write must not alter adjacent memory"
+    );
+
+    let read_only_region = region(&metadata, "read_only_values");
+    let read_only_address = parse_address(&read_only_region.address);
+    let protected_before = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{read_only_address:#x}"),
+            size: 16,
+        },
+    )
+    .expect("protected target should be readable")
+    .bytes;
+    let invalid_write = deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{read_only_address:#x}"),
+            bytes: vec![0xff; 16],
+        },
+    )
+    .expect_err("write to read-only fixture memory must fail")
+    .into_rpc_error(2, "memory.write");
+    assert_eq!(invalid_write.code, RpcErrorCode::MemoryWriteFailed);
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: mutation_session.session_id.clone(),
+                address: format!("{read_only_address:#x}"),
+                size: 16,
+            },
+        )
+        .expect("protected target should remain readable")
+        .bytes,
+        protected_before,
+        "a failed write must not alter the target or adjacent bytes"
+    );
+
+    let boundary = metadata
+        .mutation_boundary
+        .as_ref()
+        .expect("mutation-enabled fixture should publish boundary metadata");
+    let boundary_write_address = parse_address(&boundary.write_address);
+    let writable_page_address = parse_address(&boundary.writable_page_address);
+    let read_only_page_address = parse_address(&boundary.read_only_page_address);
+    let modified_page_address = parse_address(&boundary.modified_page_address);
+    let writable_tail_size = read_only_page_address - boundary_write_address;
+    let read_only_head_size = boundary.write_size - writable_tail_size;
+    let writable_tail_before = read_memory(&process, boundary_write_address, writable_tail_size);
+    let read_only_head_before = read_memory(&process, read_only_page_address, read_only_head_size);
+    assert!(
+        writable_tail_before
+            .iter()
+            .chain(&read_only_head_before)
+            .all(|byte| *byte == boundary.expected_byte),
+        "fixture boundary pages should start with deterministic bytes"
+    );
+    let crossing_write = deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: boundary.write_address.clone(),
+            bytes: vec![0xa5; boundary.write_size],
+        },
+    )
+    .expect_err("write crossing from writable into read-only memory must fail atomically")
+    .into_rpc_error(3, "memory.write");
+    assert_eq!(crossing_write.code, RpcErrorCode::MemoryWriteFailed);
+    assert_eq!(
+        read_memory(&process, boundary_write_address, writable_tail_size),
+        writable_tail_before,
+        "failed crossing write must not change the writable page"
+    );
+    assert_eq!(
+        read_memory(&process, read_only_page_address, read_only_head_size),
+        read_only_head_before,
+        "failed crossing write must not change the read-only page"
+    );
+
+    let writable_protection_before = query_protection(&process, writable_page_address);
+    let read_only_protection_before = query_protection(&process, read_only_page_address);
+    assert_eq!(writable_protection_before, PAGE_READWRITE.0);
+    assert_eq!(read_only_protection_before, PAGE_READONLY.0);
+    let mixed_protection = deimos_agent::mutation::protect(
+        &mut sessions,
+        &backend,
+        &MemoryProtectRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: boundary.write_address.clone(),
+            size: boundary.write_size,
+            protection: deimos_core::memory::MemoryProtection::ReadWrite,
+        },
+    )
+    .expect_err("protection changes spanning mixed regions must be rejected")
+    .into_rpc_error(4, "memory.protect");
+    assert_eq!(mixed_protection.code, RpcErrorCode::MemoryProtectionFailed);
+    assert_eq!(
+        query_protection(&process, writable_page_address),
+        writable_protection_before,
+        "mixed-region rejection must preserve the writable page protection"
+    );
+    assert_eq!(
+        query_protection(&process, read_only_page_address),
+        read_only_protection_before,
+        "mixed-region rejection must preserve the read-only page protection"
+    );
+
+    let modified_protection_before = query_protection(&process, modified_page_address);
+    assert_eq!(
+        modified_protection_before,
+        (PAGE_READWRITE | PAGE_NOCACHE).0
+    );
+    let modified_protection = deimos_agent::mutation::protect(
+        &mut sessions,
+        &backend,
+        &MemoryProtectRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: boundary.modified_page_address.clone(),
+            size: boundary.page_size,
+            protection: deimos_core::memory::MemoryProtection::ReadOnly,
+        },
+    )
+    .expect_err("protection changes must reject unrepresentable modifiers")
+    .into_rpc_error(5, "memory.protect");
+    assert_eq!(
+        modified_protection.code,
+        RpcErrorCode::MemoryProtectionFailed
+    );
+    assert_eq!(
+        query_protection(&process, modified_page_address),
+        modified_protection_before,
+        "modifier rejection must preserve the exact page protection"
+    );
+
+    let changed = deimos_agent::mutation::protect(
+        &mut sessions,
+        &backend,
+        &MemoryProtectRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{read_only_address:#x}"),
+            size: read_only_region.size,
+            protection: deimos_core::memory::MemoryProtection::ReadWrite,
+        },
+    )
+    .expect("fixture protection should become writable");
+    assert_eq!(
+        changed.previous_protection,
+        deimos_core::memory::MemoryProtection::ReadOnly
+    );
+    let restored = deimos_agent::mutation::protect(
+        &mut sessions,
+        &backend,
+        &MemoryProtectRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: format!("{read_only_address:#x}"),
+            size: read_only_region.size,
+            protection: deimos_core::memory::MemoryProtection::ReadOnly,
+        },
+    )
+    .expect("fixture protection should be restored");
+    assert_eq!(
+        restored.previous_protection,
+        deimos_core::memory::MemoryProtection::ReadWrite
+    );
+
+    let mut mutations = deimos_agent::mutation::MutationState::new();
+    let data = deimos_agent::mutation::allocate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &MemoryAllocateRequest {
+            session_id: mutation_session.session_id.clone(),
+            size: 4096,
+            protection: deimos_core::memory::MemoryProtection::ReadWrite,
+        },
+    )
+    .expect("remote data allocation should succeed");
+    let code = deimos_agent::mutation::allocate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &MemoryAllocateRequest {
+            session_id: mutation_session.session_id.clone(),
+            size: 4096,
+            protection: deimos_core::memory::MemoryProtection::ExecuteReadWrite,
+        },
+    )
+    .expect("remote executable allocation should succeed");
+    assert_eq!(mutations.tracked_count(&mutation_session.session_id), 2);
+
+    let remote_code = [
+        0x48, 0x89, 0xc8, // mov rax, rcx
+        0xc7, 0x00, 0x78, 0x56, 0x34, 0x12, // mov dword ptr [rax], 0x12345678
+        0x31, 0xc0, // xor eax, eax
+        0xc3, // ret
+    ];
+    deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: code.address.clone(),
+            bytes: remote_code.to_vec(),
+        },
+    )
+    .expect("remote thread body should be writable");
+    let thread = deimos_agent::mutation::start_thread(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &RemoteThreadStartRequest {
+            session_id: mutation_session.session_id.clone(),
+            start_address: code.address.clone(),
+            parameter: Some(data.address.clone()),
+            wait_timeout_ms: 4_000,
+        },
+    )
+    .expect("controlled remote thread should start");
+    assert!(thread.completed, "controlled remote thread should finish");
+    assert_eq!(thread.exit_code, Some(0));
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: mutation_session.session_id.clone(),
+                address: data.address.clone(),
+                size: 4,
+            },
+        )
+        .expect("remote thread output should be readable")
+        .bytes,
+        replacement
+    );
+
+    deimos_agent::mutation::free(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &MemoryFreeRequest {
+            session_id: mutation_session.session_id.clone(),
+            allocation_id: code.allocation_id,
+        },
+    )
+    .expect("explicit free should release executable memory");
+    assert_eq!(mutations.tracked_count(&mutation_session.session_id), 1);
+    deimos_agent::mutation::cleanup_session(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mutation_session.session_id,
+    )
+    .expect("session cleanup should release remaining allocations");
+    assert_eq!(mutations.tracked_count(&mutation_session.session_id), 0);
+    let freed_read = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: mutation_session.session_id.clone(),
+            address: data.address,
+            size: 4,
+        },
+    )
+    .expect_err("released remote memory must no longer be readable")
+    .into_rpc_error(3, "memory.read");
+    assert_eq!(freed_read.code, RpcErrorCode::MemoryReadFailed);
+
+    sessions
+        .close(&backend, &mutation_session.session_id)
+        .expect("mutation session should close after cleanup");
+    sessions
+        .close(&backend, &read_only.session_id)
+        .expect("read-only session should close");
+
+    let mut stdin = fixture
+        .child
+        .stdin
+        .take()
+        .expect("fixture stdin should be piped");
+    writeln!(stdin, "{SHUTDOWN_COMMAND}").expect("shutdown command should be writable");
+    stdin.flush().expect("shutdown command should flush");
+    drop(stdin);
+    assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}
+
 fn read_metadata(fixture: &mut FixtureProcess) -> FixtureMetadata {
     let stdout = fixture
         .child
@@ -503,7 +923,7 @@ fn startup_failure(fixture: &mut FixtureProcess, message: String) -> ! {
 }
 
 fn verify_region_protections(process: &OwnedHandle, metadata: &FixtureMetadata) {
-    assert_eq!(metadata.regions.len(), 2);
+    assert_eq!(metadata.regions.len(), 4);
     for region in &metadata.regions {
         let mut information = MEMORY_BASIC_INFORMATION::default();
         let result = unsafe {
@@ -531,6 +951,24 @@ fn verify_region_protections(process: &OwnedHandle, metadata: &FixtureMetadata) 
             region.name
         );
     }
+}
+
+fn query_protection(process: &OwnedHandle, address: usize) -> u32 {
+    let mut information = MEMORY_BASIC_INFORMATION::default();
+    let result = unsafe {
+        VirtualQueryEx(
+            process.0,
+            Some(address as *const c_void),
+            &mut information,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    assert_eq!(
+        result,
+        size_of::<MEMORY_BASIC_INFORMATION>(),
+        "VirtualQueryEx should describe {address:#x}"
+    );
+    information.Protect.0
 }
 
 fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
