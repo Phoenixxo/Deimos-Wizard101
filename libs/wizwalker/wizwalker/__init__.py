@@ -23,9 +23,9 @@ if sys.platform == "win32":
 else:
     from . import memory
     from .client_handler import ClientHandler
-    from .discovered_client import DiscoveredClient
     from .memory import DeimosNativeMemoryBackend, MemoryBackend, MemoryReader
 
+from .discovered_client import DiscoveredClient
 from .telemetry import (
     ReadOnlyTelemetryReader,
     ReadOnlyTelemetrySnapshot,
