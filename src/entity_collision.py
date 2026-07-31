@@ -148,8 +148,9 @@ _NON_MOVEMENT_CATEGORIES = {"CT_ClientObject", "CT_Trigger", "CT_Hitscan", "CT_F
 
 def _collision_primitives(data: bytes) -> tuple:
     """Parse a collision file ONCE into ``(prims, n_total, n_nonblock, n_category)`` where ``prims`` is
-    ``[(local_2d_polygon, z_min, z_max), ...]`` — one entry PER movement-blocking primitive, NOT
-    a single convex hull.
+    ``[(local_2d_polygon, z_min, z_max, is_mesh), ...]`` — one entry PER movement-blocking primitive,
+    NOT a single convex hull. ``is_mesh`` marks a convex-hulled MESH primitive so the placer can
+    span-guard it (a concave environment mesh hulls into a floor-spanning blob).
 
     This is the authoritative collision geometry (``m_solidCollisionFilename``). Keeping each
     box/cylinder/sphere separate is the whole point: a forest's collision is 30-odd trunk
@@ -209,12 +210,34 @@ def _collision_primitives(data: bytes) -> tuple:
                 hl = float(el.get("length", 0)) / 2
                 poly = Point(lx, ly).buffer(r, quad_segs=4)
                 zmin, zmax = lz - hl, lz + hl
+            elif ptype == "mesh":
+                # A collision MESH (gate/portcullis/door slab, irregular prop). Project its
+                # transformed vertices to the plane and convex-hull them: a slab -> a thin
+                # blocking rectangle, exactly what the doorway needs. A large *concave*
+                # environment mesh would hull into a floor-spanning blob, but its placed span
+                # is caught by the ``_MAX_STATIC_SPAN`` guard in ``zone_static_objects`` (it
+                # then falls back to the render hull, which is itself span-capped). Verts are in
+                # this primitive's own local frame, so apply its location/rotation like a box.
+                mesh_el = prim.find("mesh")
+                vlist = mesh_el.find("vertexlist") if mesh_el is not None else None
+                if vlist is None:
+                    continue
+                mv = [(float(v.get("x", 0)), float(v.get("y", 0)), float(v.get("z", 0)))
+                      for v in vlist.findall("vert")]
+                if len(mv) < 3:
+                    continue
+                wp = transformCube(mv, (lx, ly, lz), rot)
+                poly = Polygon([(p[0], p[1]) for p in wp]).convex_hull
+                if poly.geom_type != "Polygon":
+                    continue  # collinear projection (zero-thickness vertical sheet): nothing to block
+                mz = [p[2] for p in wp]
+                zmin, zmax = min(mz), max(mz)
             else:
-                continue  # plane/ray/mesh
+                continue  # plane/ray
         except Exception:
             continue
         if poly is not None and poly.is_valid and not poly.is_empty:
-            out.append((poly, zmin, zmax))
+            out.append((poly, zmin, zmax, ptype == "mesh"))
     return out, n_total, n_nonblock, n_category
 
 
@@ -243,11 +266,25 @@ def _footprint_cache_path(revision: str) -> Path:
     return base / "footprint_cache" / (revision.replace(".", "_") + ".json")
 
 
-def _typelist_cache_path(revision: str) -> Path:
-    """Writable, per-revision katsuba TypeList location (alongside Deimos settings)."""
+def _client_version(revision: str) -> str:
+    """The client-version component of a revision string, e.g.
+    ``r803238.Wizard_1_610`` -> ``Wizard_1_610``.
+
+    The property/type tree is compiled into the client executable and only changes on a
+    client-version bump — every ``r80xxxx.Wizard_1_610`` *build* (a content patch) shares one
+    tree. So this, not the build number, is the correct key for the type-list cache: it lets one
+    dump serve every build of a version instead of forcing a fresh (and, when wiztype's signature
+    is stale for the new build, hanging) re-pull on each content patch. Falls back to the whole
+    string if there's no ``build.version`` split."""
+    return revision.split(".", 1)[1] if "." in revision else revision
+
+
+def _typelist_cache_path(key: str) -> Path:
+    """Writable katsuba TypeList location (alongside Deimos settings), keyed by ``key`` (the
+    client version, e.g. ``Wizard_1_610`` — see ``_client_version``)."""
     appdata = os.environ.get("APPDATA", "")
     base = Path(appdata) / "Deimos" if appdata else Path(os.getcwd())
-    return base / "types" / (revision.replace(".", "_") + ".json")
+    return base / "types" / (key.replace(".", "_") + ".json")
 
 
 def _typelist_is_loadable(path: Path) -> bool:
@@ -287,21 +324,6 @@ def _dump_type_list(revision: str, path: Path) -> None:
         f"[entity_collision] type list cached at {path} "
         f"({path.stat().st_size // (1024 * 1024)} MB)"
     )
-
-
-def _ensure_type_list(revision: str, *, force: bool = False) -> Path:
-    """Return a usable cached TypeList for ``revision``.
-
-    Re-pulls from the client when the cache is missing, unreadable, or ``force``d
-    (e.g. the cached dump loaded fine but turned out to be incompatible with the
-    running client). A client patch normally bumps ``revision`` — a new cache key —
-    so the dump auto-refreshes; this also self-heals a corrupt same-revision cache.
-    """
-    path = _typelist_cache_path(revision)
-    if not force and _typelist_is_loadable(path):
-        return path
-    _dump_type_list(revision, path)
-    return path
 
 
 def _extract_nif_asset(template) -> str | None:
@@ -414,23 +436,10 @@ class _Resolver:
             self._gamedata = install / "Data" / "GameData"
             revision = (install / "Bin" / "revision.dat").read_text().strip()
 
-            # The type list is generated on demand by wiztype and cached per revision,
-            # so it's no longer shipped with Deimos. Build the resolver from it; if the
-            # cached dump loads but turns out to be incompatible with the running client,
-            # pull a fresh dump and rebuild once.
-            for force in (False, True):
-                types_path = _ensure_type_list(revision, force=force)
-                self._setup_serializers(types_path)
-                if self._probe_serializer():
-                    break
-                if force:
-                    raise RuntimeError(
-                        "type list still incompatible with the client after a fresh dump"
-                    )
-                logger.warning(
-                    "[entity_collision] cached type list is incompatible with the "
-                    "running client; pulling a fresh dump"
-                )
+            # Set up the serializers from a type list matching the running client, keyed by
+            # CLIENT VERSION (not build) so a content patch reuses an existing dump instead of
+            # re-pulling one — see _resolve_type_list.
+            self._resolve_type_list(revision)
 
             self._cache_file = _footprint_cache_path(revision)
             self._load_footprint_cache()
@@ -447,6 +456,90 @@ class _Resolver:
                 f"entities will use bounding boxes"
             )
             return False
+
+    def _cached_type_lists(self, version: str | None) -> list[Path]:
+        """Existing cached type-list dumps, newest first (by mtime).
+
+        With ``version`` given, only dumps for that client version — the version-keyed name
+        (``Wizard_1_610.json``) or legacy build-keyed dumps (``r802307_Wizard_1_610.json``); every
+        build of a version shares one type tree, so any is a valid source. With ``version=None``,
+        every cached dump regardless of version (the cross-version resilience fallback). Corrupt or
+        half-written files are dropped by the cheap loadable probe."""
+        d = _typelist_cache_path(version or "_").parent
+        try:
+            files = [p for p in d.glob("*.json")
+                     if (version is None
+                         or p.stem == version or p.stem.endswith("_" + version))
+                     and _typelist_is_loadable(p)]
+        except Exception:
+            return []
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return files
+
+    def _try_type_list(self, path: Path) -> bool:
+        """Build the serializers from ``path`` and confirm they match the client. False on error."""
+        try:
+            self._setup_serializers(path)
+            return self._probe_serializer()
+        except Exception:
+            return False
+
+    def _resolve_type_list(self, revision: str) -> None:
+        """Set up the serializers from a type list matching the running client, or raise.
+
+        Every user's install self-serves this from its OWN client — no maintainer-hosted dump, no
+        authoring per patch. The list is keyed by CLIENT VERSION (``Wizard_1_610``), not build
+        (``r803238``): wiztype locates the type tree by a pattern scan of the client, so one dump
+        serves every ``r80xxxx`` build of a version. Resolution, in order:
+
+        1. Reuse a probe-valid cached dump for THIS client version (fast, offline — the usual
+           case, and what makes a content patch a no-op instead of a re-pull that would stall
+           ~30s and die on a partial ``ReadProcessMemory`` when wiztype's scan doesn't fit the
+           new build).
+        2. No same-version dump -> pull a fresh one from the running client (self-serve). Works
+           whenever wiztype's pattern scan matches the client — the normal path on a version bump.
+        3. Couldn't pull (a client recompile shifted the layout wiztype scans for). Most updates
+           don't change the collision types, and any that do change get a NEW property hash we
+           simply skip — so the newest dump from a PRIOR version still deserializes what collision
+           needs. Reuse it rather than dropping to bounding boxes: teleportation keeps working
+           across the update with zero maintainer or user action.
+
+        Only if nothing at all validates do entities fall back to bounding boxes (the caller
+        treats the raised error as "resolver unavailable")."""
+        version = _client_version(revision)
+        # 1) same-version cache.
+        for path in self._cached_type_lists(version):
+            if self._try_type_list(path):
+                logger.info(
+                    f"[entity_collision] reusing cached type list '{path.name}' for revision "
+                    f"{revision} (client version {version}); no re-pull needed"
+                )
+                return
+        # 2) fresh self-serve pull from the running client.
+        fresh = _typelist_cache_path(version)
+        try:
+            _dump_type_list(revision, fresh)
+        except Exception as e:
+            logger.warning(f"[entity_collision] live type-list dump failed ({e})")
+        else:
+            if self._try_type_list(fresh):
+                logger.info(
+                    f"[entity_collision] dumped a fresh type list for {version} from the client"
+                )
+                return
+            logger.warning("[entity_collision] freshly dumped type list did not validate")
+        # 3) cross-version resilience: newest prior dump that still deserializes.
+        for path in self._cached_type_lists(None):
+            if self._try_type_list(path):
+                logger.warning(
+                    f"[entity_collision] no type list for {version}; reusing prior dump "
+                    f"'{path.name}' (this game update likely didn't change collision types)"
+                )
+                return
+        raise RuntimeError(
+            "no usable type list: no cached dump validated and a live wiztype dump was "
+            "unavailable (update wiztype if this persists)"
+        )
 
     def _setup_serializers(self, types_path: Path) -> None:
         """(Re)build the serializers, Root archive, and template index from a type list."""
@@ -657,9 +750,9 @@ class _Resolver:
         return self._coll_data_cache[name]
 
     def collision_primitives_for(self, name: str, zone_name: str | None) -> list:
-        """The object's authoritative collision geometry as ``[(local_2d_polygon, zmin, zmax), …]``
-        — one entry per primitive. Empty if no collision file / unparseable (MESH, read error),
-        in which case the caller falls back to the render-mesh hull."""
+        """The object's authoritative collision geometry as ``[(local_2d_polygon, zmin, zmax, is_mesh), …]``
+        — one entry per primitive (box/sphere/cylinder/mesh). Empty if no collision file /
+        unparseable (read error), in which case the caller falls back to the render-mesh hull."""
         return self._collision_data_for(name, zone_name)[0]
 
     def movement_collidable(self, name: str, zone_name: str | None) -> bool:
@@ -708,7 +801,7 @@ class _Resolver:
                     return hull
             prims = self._collision_data_for(name, zone_name)[0]
             if prims:
-                hull = unary_union([p for p, _, _ in prims]).convex_hull
+                hull = unary_union([p for p, _, _, _ in prims]).convex_hull
                 if hull.geom_type == "Polygon" and not hull.is_empty:
                     return list(hull.exterior.coords)
             return None
@@ -827,14 +920,27 @@ class _Resolver:
                     # one small box, instead of a single zone-spanning convex hull.
                     prims = self.collision_primitives_for(name, zone_name)
                     if prims:
-                        for local_poly, zmin, zmax in prims:
+                        placed_any = False
+                        for local_poly, zmin, zmax, is_mesh in prims:
+                            if is_mesh:
+                                # A convex-hulled MESH: fine for a gate/prop slab, but a large
+                                # concave environment mesh hulls into a floor-spanning blob. If the
+                                # PLACED hull is that big, skip just it; if that leaves the object
+                                # with nothing, fall through to the span-capped render-hull fallback.
+                                pm = affine_transform(local_poly, _mat)
+                                bx = pm.bounds
+                                if max(bx[2] - bx[0], bx[3] - bx[1]) > _MAX_STATIC_SPAN:
+                                    continue
                             _place_local(local_poly, loc.z + (zmin + zmax) / 2 * obj_scale)
-                        precise += 1
-                        continue
+                            placed_any = True
+                        if placed_any:
+                            precise += 1
+                            continue
 
-                    # FALLBACK: no parseable collision file (MESH collision / read error). Use
-                    # the render-mesh hull, then a default disc. The render hull can be a bogus
-                    # zone-spanning blob for sprawling models, so the size cap still guards it here.
+                    # FALLBACK: no collision file / read error, or its only primitives were
+                    # oversized-mesh hulls we dropped above. Use the render-mesh hull, then a
+                    # default disc. The render hull can be a bogus zone-spanning blob for sprawling
+                    # models, so the size cap still guards it here.
                     shape = None
                     points = self.footprint_points(name, zone_name)
                     if points:

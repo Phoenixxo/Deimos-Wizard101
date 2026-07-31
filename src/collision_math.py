@@ -621,15 +621,21 @@ class _ZoneWalkGrid:
         in the plane can be on the *wrong floor* directly below/above the target, so a small
         cross-floor Z penalty steers the pick to the node on the target's actual floor even if
         it's a bit farther in XY. Same-floor nodes have ~zero Z term, so within a floor this is
-        still nearest-XY. The ring prune stays valid because cost >= dxy."""
+        still nearest-XY. The ring prune stays valid because cost >= dxy.
+
+        Each node is evaluated *only* through the ``prefer_z``-aware ``ground_z_at`` — NOT
+        pre-gated on ``node_z`` (which is ``prefer_z``-less). A node on the target's own raised
+        floor sits inside that floor's shell volume (a tower's bounding cylinder), which the
+        ``prefer_z``-less check reads as a wall and rejects — so pre-gating on ``node_z`` threw
+        away the correct-floor candidate and forced a landing a whole floor away (Ravenwood's Ice
+        tower: target off-mesh at z=116, correct platform node 40u out at z=102 skipped, landing
+        355u out on the z=21 ground). Ranking directly on ``ground_z_at(prefer_z)`` keeps it."""
         q0, r0 = self.to_hex(target.x, target.y)
         best, best_cost = None, None
         for k in range(max_rings + 1):
             if best_cost is not None and (k - 1) * self.spacing > best_cost:
                 break  # no node this far out can beat the best cost (cost >= dxy)
             for (q, r) in _hex_ring(q0, r0, k):
-                if self.node_z(q, r) is None:
-                    continue  # node not teleport-valid at all
                 x, y = self.to_world(q, r)
                 z = self.ground_z_at(x, y, prefer_z=target.z)  # goal-appropriate surface here
                 if z is not None:
