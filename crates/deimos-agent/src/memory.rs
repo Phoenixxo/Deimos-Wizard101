@@ -557,7 +557,7 @@ fn module_bounds<B: MemoryBackend>(
     Ok((start, end))
 }
 
-fn parse_signature(value: &str) -> Result<Vec<Option<u8>>, MemoryApiError> {
+pub(crate) fn parse_signature(value: &str) -> Result<Vec<Option<u8>>, MemoryApiError> {
     let tokens: Vec<_> = value.split_whitespace().collect();
     if tokens.is_empty() || tokens.len() > MAX_SIGNATURE_BYTES {
         return Err(MemoryApiError::request(
