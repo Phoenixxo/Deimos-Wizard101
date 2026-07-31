@@ -146,6 +146,8 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         self.process = self
         self._native_module = native_module
 
+    supports_core_hooks = True
+
     def _native(self):
         if self._native_module is None:
             self._native_module = import_module("deimos_native")
@@ -181,6 +183,24 @@ class DeimosNativeMemoryBackend(MemoryBackend):
 
     def start_thread(self, address: int) -> None:
         raise UnsupportedMemoryOperation("remote thread creation")
+
+    def activate_core_hook(self, hook: str) -> dict[str, Any]:
+        return self.manager.activate_core_hook(self.session_id, hook)
+
+    def activate_core_hooks(self) -> dict[str, Any]:
+        return self.manager.activate_core_hooks(self.session_id)
+
+    def deactivate_core_hook(self, hook: str) -> dict[str, Any]:
+        return self.manager.deactivate_core_hook(self.session_id, hook)
+
+    def deactivate_core_hooks(self) -> dict[str, Any]:
+        return self.manager.deactivate_core_hooks(self.session_id)
+
+    def heartbeat_core_hooks(self) -> dict[str, Any]:
+        return self.manager.heartbeat_core_hooks(self.session_id)
+
+    def read_core_hook_base(self, hook: str) -> int:
+        return int(self.manager.read_core_hook_base(self.session_id, hook))
 
     def scan(
         self,

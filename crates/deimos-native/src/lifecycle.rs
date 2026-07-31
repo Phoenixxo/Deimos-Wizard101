@@ -10,8 +10,11 @@ use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
-use deimos_core::memory::CAPABILITY_MEMORY_READ_ONLY;
-use deimos_core::process::CAPABILITY_PROCESS_READ_ONLY;
+use deimos_core::memory::{
+    CAPABILITY_CORE_HOOK, CAPABILITY_MEMORY_HOOK, CAPABILITY_MEMORY_MUTATION,
+    CAPABILITY_MEMORY_READ_ONLY,
+};
+use deimos_core::process::{CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY};
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig};
 use serde::Serialize;
 use serde_json::Value;
@@ -25,6 +28,16 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
+];
+const REQUESTED_AGENT_CAPABILITIES: [&str; 8] = [
+    CAPABILITY_AGENT_LIFECYCLE,
+    CAPABILITY_CLIENT_DISCOVERY,
+    CAPABILITY_PROCESS_READ_ONLY,
+    CAPABILITY_MEMORY_READ_ONLY,
+    CAPABILITY_PROCESS_MUTATION,
+    CAPABILITY_MEMORY_MUTATION,
+    CAPABILITY_MEMORY_HOOK,
+    CAPABILITY_CORE_HOOK,
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -66,8 +79,8 @@ impl fmt::Debug for AgentEndpoint {
 }
 
 pub trait AgentProcess: Send {
-    /// Nonblocking process-status poll. DMS-009 implementations must bound any
-    /// platform I/O and return already-captured diagnostics.
+    /// Nonblocking process-status poll. Implementations must bound platform I/O
+    /// and return already-captured diagnostics.
     fn try_wait(&mut self) -> io::Result<Option<AgentExit>>;
 }
 
@@ -99,7 +112,7 @@ impl fmt::Display for AgentLaunchError {
 
 pub trait AgentRuntime {
     /// Return reconnect metadata previously recorded for this opaque bottle.
-    /// DMS-009 owns how that metadata is discovered and persisted.
+    /// The runtime owns how that metadata is discovered and persisted.
     fn discover(&mut self, bottle: &BottleId) -> Result<Option<AgentEndpoint>, String>;
 
     /// Start the already-selected agent artifact in the already-selected
@@ -107,7 +120,7 @@ pub trait AgentRuntime {
     fn launch(&mut self, bottle: &BottleId) -> Result<AgentLaunch, AgentLaunchError>;
 
     /// Attach a bounded, nonblocking monitor to an agent discovered after host
-    /// restart. DMS-009 owns the Wine/PID-specific implementation.
+    /// restart. The runtime owns the Wine/PID-specific implementation.
     fn reconnect_monitor(
         &mut self,
         bottle: &BottleId,
@@ -485,7 +498,7 @@ impl<R: AgentRuntime> AgentManager<R> {
         let mut client = RpcClient::connect(
             endpoint.address,
             endpoint.token.clone(),
-            REQUIRED_AGENT_CAPABILITIES
+            REQUESTED_AGENT_CAPABILITIES
                 .iter()
                 .map(|capability| (*capability).to_string())
                 .collect(),

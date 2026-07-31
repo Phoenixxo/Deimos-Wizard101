@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use deimos_core::client::{ListClientsRequest, OP_CLIENT_LIST};
 use deimos_core::memory::{
-    ByteOrder, MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem,
-    MemoryReadRequest, MemoryReadResponse, MemoryScanRequest, MemoryScanScope,
-    MemorySessionRequest, MemoryValueType, TypedMemoryReadRequest, DEFAULT_SCAN_MAX_MATCHES,
-    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
-    OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
+    ByteOrder, CoreHook, CoreHookBaseResponse, CoreHookRequest, CoreHookSessionRequest,
+    MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem, MemoryReadRequest,
+    MemoryReadResponse, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
+    TypedMemoryReadRequest, DEFAULT_SCAN_MAX_MATCHES, OP_CORE_HOOK_ACTIVATE,
+    OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
+    OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ,
+    OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessSessionId, SessionRequest,
@@ -595,6 +597,40 @@ fn scan_scope(module_name: Option<String>) -> MemoryScanScope {
     }
 }
 
+fn parse_core_hook(value: &str, operation: &str) -> Result<CoreHook, BindingError> {
+    match value {
+        "client" => Ok(CoreHook::Client),
+        "player" => Ok(CoreHook::Player),
+        "quest" => Ok(CoreHook::Quest),
+        "player_stat" => Ok(CoreHook::PlayerStat),
+        "root_window" => Ok(CoreHook::RootWindow),
+        "render_context" => Ok(CoreHook::RenderContext),
+        _ => Err(BindingError::Configuration {
+            code: "invalid_core_hook",
+            message: format!("{operation} received an unsupported core hook {value:?}"),
+            details: json!({
+                "operation": operation,
+                "supported": [
+                    "client",
+                    "player",
+                    "quest",
+                    "player_stat",
+                    "root_window",
+                    "render_context"
+                ],
+            }),
+        }),
+    }
+}
+
+fn parse_hex_u64(value: &str, operation: &str) -> Result<u64, BindingError> {
+    let digits = value.strip_prefix("0x").ok_or_else(|| {
+        BindingError::serialization(operation, "agent address was not hexadecimal")
+    })?;
+    u64::from_str_radix(digits, 16)
+        .map_err(|_| BindingError::serialization(operation, "agent address exceeded 64 bits"))
+}
+
 #[pyclass(name = "AgentManager")]
 pub struct PyAgentManager {
     manager: Mutex<ManagedRuntime>,
@@ -774,6 +810,28 @@ impl PyAgentManager {
         self.call_as_python(py, OP_PROCESS_OPEN, request)
     }
 
+    /// Opens a mutation-capable process session for core hooks.
+    #[pyo3(signature = (pid, expected_identity_json = None))]
+    fn open_hook_process(
+        &self,
+        py: Python<'_>,
+        pid: u32,
+        expected_identity_json: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let expected_identity =
+            parse_identity(expected_identity_json).map_err(|error| error.into_pyerr(py))?;
+        let request = serialize_request(
+            OP_PROCESS_OPEN,
+            OpenProcessRequest {
+                pid,
+                expected_identity,
+                access_mode: deimos_core::process::ProcessAccessMode::Mutation,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_PROCESS_OPEN, request)
+    }
+
     fn process_status(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
         self.session_call_as_python(py, OP_PROCESS_STATUS, session_id)
     }
@@ -940,9 +998,96 @@ impl PyAgentManager {
         .map_err(|error| error.into_pyerr(py))?;
         self.call_as_python(py, OP_MEMORY_POINTER_CHAIN, request)
     }
+
+    fn activate_core_hook(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        self.core_hook_call(py, OP_CORE_HOOK_ACTIVATE, session_id, hook)
+    }
+
+    fn activate_core_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CORE_HOOK_ACTIVATE_ALL,
+            CoreHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CORE_HOOK_ACTIVATE_ALL, request)
+    }
+
+    fn deactivate_core_hook(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        self.core_hook_call(py, OP_CORE_HOOK_DEACTIVATE, session_id, hook)
+    }
+
+    fn deactivate_core_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CORE_HOOK_DEACTIVATE_ALL,
+            CoreHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CORE_HOOK_DEACTIVATE_ALL, request)
+    }
+
+    fn heartbeat_core_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CORE_HOOK_HEARTBEAT_ALL,
+            CoreHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CORE_HOOK_HEARTBEAT_ALL, request)
+    }
+
+    fn read_core_hook_base(&self, py: Python<'_>, session_id: String, hook: &str) -> PyResult<u64> {
+        let request = serialize_request(
+            OP_CORE_HOOK_READ_BASE,
+            CoreHookRequest {
+                session_id: ProcessSessionId(session_id),
+                hook: parse_core_hook(hook, OP_CORE_HOOK_READ_BASE)
+                    .map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        let response = self.call_value(py, OP_CORE_HOOK_READ_BASE, request)?;
+        let response: CoreHookBaseResponse = serde_json::from_value(response).map_err(|error| {
+            BindingError::serialization(OP_CORE_HOOK_READ_BASE, error).into_pyerr(py)
+        })?;
+        parse_hex_u64(&response.base_address, OP_CORE_HOOK_READ_BASE)
+            .map_err(|error| error.into_pyerr(py))
+    }
 }
 
 impl PyAgentManager {
+    fn core_hook_call(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            operation,
+            CoreHookRequest {
+                session_id: ProcessSessionId(session_id),
+                hook: parse_core_hook(hook, operation).map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, operation, request)
+    }
+
     fn with_manager<T, F>(&self, py: Python<'_>, operation: &str, operation_fn: F) -> PyResult<T>
     where
         T: Send,
