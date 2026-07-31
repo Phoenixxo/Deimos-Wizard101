@@ -10,7 +10,7 @@ use deimos_core::process::ProcessSessionId;
 use deimos_core::rpc::{RpcError, RpcErrorCode};
 
 use crate::process::{
-    MutationBackend, ProcessApiError, ProcessBackendError, ProcessSessionRegistry,
+    MutationBackend, ProcessApiError, ProcessBackendError, ProcessSessionRegistry, SuspendedProcess,
 };
 
 #[derive(Clone, Debug)]
@@ -197,6 +197,23 @@ pub fn flush_instruction_cache<B: MutationBackend>(
     Ok(())
 }
 
+pub(crate) fn suspend_process_threads<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+) -> Result<SuspendedProcess, MutationApiError> {
+    let execution =
+        sessions.with_mutation_session_effect(backend, session_id, |backend, handle, _| {
+            backend.suspend_process_threads(handle).map_err(|error| {
+                MutationApiError::backend(RpcErrorCode::MemoryAllocationFailed, error)
+            })
+        })?;
+    if let Some(error) = execution.validation_error {
+        return Err(MutationApiError::Process(error));
+    }
+    Ok(execution.value)
+}
+
 pub fn allocate<B: MutationBackend>(
     sessions: &mut ProcessSessionRegistry<B::Handle>,
     backend: &B,
@@ -255,6 +272,57 @@ pub fn allocate<B: MutationBackend>(
         address: format_address(execution.value),
         size: request.size,
         protection: request.protection,
+    })
+}
+
+pub(crate) fn allocate_near<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    state: &mut MutationState<B::ThreadHandle>,
+    session_id: &ProcessSessionId,
+    target: usize,
+    size: usize,
+) -> Result<MemoryAllocationResponse, MutationApiError> {
+    if size == 0 || size > MAX_ALLOCATION_BYTES {
+        return Err(MutationApiError::request(
+            RpcErrorCode::MemoryLimitExceeded,
+            format!("allocation size must be between 1 and {MAX_ALLOCATION_BYTES} bytes"),
+        ));
+    }
+    let allocation_id = state.next_allocation_id();
+    let execution =
+        sessions.with_mutation_session_effect(backend, session_id, |backend, handle, _| {
+            backend
+                .allocate_memory_near(handle, target, size, MemoryProtection::ExecuteReadWrite)
+                .map_err(|error| {
+                    MutationApiError::backend(RpcErrorCode::MemoryAllocationFailed, error)
+                })
+        })?;
+    state
+        .allocations
+        .entry(session_id.clone())
+        .or_default()
+        .insert(
+            allocation_id.clone(),
+            TrackedAllocation {
+                address: execution.value,
+                size,
+            },
+        );
+    if let Some(error) = execution.validation_error {
+        return Err(MutationApiError::Process(
+            error
+                .with_detail("allocation_id", allocation_id.clone())
+                .with_detail("allocation_address", format_address(execution.value))
+                .with_detail("allocation_tracked", "true"),
+        ));
+    }
+    Ok(MemoryAllocationResponse {
+        session_id: session_id.clone(),
+        allocation_id,
+        address: format_address(execution.value),
+        size,
+        protection: MemoryProtection::ExecuteReadWrite,
     })
 }
 
@@ -921,6 +989,13 @@ mod tests {
             }
             data.protections.remove(&address);
             Ok(())
+        }
+
+        fn suspend_process_threads(
+            &self,
+            _handle: &Self::Handle,
+        ) -> Result<crate::process::SuspendedProcess, ProcessBackendError> {
+            Ok(crate::process::SuspendedProcess::new(Vec::new(), ()))
         }
 
         fn protect_memory(

@@ -10,6 +10,8 @@ pub const CAPABILITY_MEMORY_MUTATION: &str = "memory.mutation.v1";
 pub const CAPABILITY_MEMORY_HOOK: &str = "memory.hook.v1";
 /// Enables the built-in WizWalker core hooks.
 pub const CAPABILITY_CORE_HOOK: &str = "memory.core_hook.v1";
+/// Enables built-in hooks used by movement, chat, and Deimos automation.
+pub const CAPABILITY_FEATURE_HOOK: &str = "memory.feature_hook.v1";
 pub const CAPABILITY_REMOTE_THREAD: &str = "thread.remote.v1";
 pub const OP_MEMORY_REGIONS: &str = "memory.regions";
 pub const OP_MEMORY_READ: &str = "memory.read";
@@ -31,6 +33,14 @@ pub const OP_CORE_HOOK_DEACTIVATE: &str = "core_hook.deactivate";
 pub const OP_CORE_HOOK_DEACTIVATE_ALL: &str = "core_hook.deactivate_all";
 pub const OP_CORE_HOOK_HEARTBEAT_ALL: &str = "core_hook.heartbeat_all";
 pub const OP_CORE_HOOK_READ_BASE: &str = "core_hook.read_base";
+pub const OP_FEATURE_HOOK_ACTIVATE: &str = "feature_hook.activate";
+pub const OP_FEATURE_HOOK_DEACTIVATE: &str = "feature_hook.deactivate";
+pub const OP_FEATURE_HOOK_HEARTBEAT_ALL: &str = "feature_hook.heartbeat_all";
+pub const OP_FEATURE_HOOK_READ_EXPORT: &str = "feature_hook.read_export";
+pub const OP_FEATURE_TELEPORT: &str = "feature.teleport";
+pub const OP_FEATURE_MOUSE_POSITION: &str = "feature.mouse_position";
+pub const OP_FEATURE_CHAT_SEND: &str = "feature.chat_send";
+pub const OP_FEATURE_BUDDY_ADD: &str = "feature.buddy_add";
 
 pub const DEFAULT_SCAN_MAX_MATCHES: usize = 256;
 // These limits keep Vec<u8>-encoded JSON results comfortably below the 1 MiB
@@ -315,6 +325,127 @@ pub struct CoreHookBaseResponse {
     /// Hexadecimal text preserves the target's native pointer width across
     /// JSON and Python boundaries.
     pub base_address: String,
+}
+
+/// Hooks used by interactive and Deimos-specific automation features.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureHook {
+    MovementTeleport,
+    MouselessCursor,
+    Chat,
+    ChatSend,
+    DanceGameMoves,
+}
+
+impl FeatureHook {
+    pub const ALL: [Self; 5] = [
+        Self::MovementTeleport,
+        Self::MouselessCursor,
+        Self::Chat,
+        Self::ChatSend,
+        Self::DanceGameMoves,
+    ];
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeatureHookExport {
+    TeleportHelper,
+    MousePosition,
+    ChatOwner,
+    ReceiveSourceGid,
+    ReceiveMessageBuffer,
+    ReceiveMessageLength,
+    ReceiveCounter,
+    SendTrigger,
+    SendStruct,
+    BuddyTrigger,
+    BuddyObject,
+    DanceGameMoves,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookRequest {
+    pub session_id: ProcessSessionId,
+    pub hook: FeatureHook,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookSessionRequest {
+    pub session_id: ProcessSessionId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookExportRequest {
+    pub session_id: ProcessSessionId,
+    pub export: FeatureHookExport,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookResponse {
+    pub session_id: ProcessSessionId,
+    pub hook: FeatureHook,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookDeactivateResponse {
+    pub session_id: ProcessSessionId,
+    pub hook: FeatureHook,
+    pub deactivated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHooksResponse {
+    pub session_id: ProcessSessionId,
+    pub hooks: Vec<FeatureHookResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookExportResponse {
+    pub session_id: ProcessSessionId,
+    pub export: FeatureHookExport,
+    /// Hexadecimal text preserves the target's native pointer width across
+    /// JSON and Python boundaries.
+    pub address: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FeatureTeleportRequest {
+    pub session_id: ProcessSessionId,
+    pub object_address: String,
+    pub position: [f32; 3],
+    pub wait_on_inuse: bool,
+    pub wait_timeout_ms: u32,
+    pub purge_after_timeout: bool,
+    pub purge_timeout_ms: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureActionResponse {
+    pub session_id: ProcessSessionId,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureMousePositionRequest {
+    pub session_id: ProcessSessionId,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureChatSendRequest {
+    pub session_id: ProcessSessionId,
+    pub message: String,
+    pub target_gid: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureBuddyAddRequest {
+    pub session_id: ProcessSessionId,
+    pub target_gid: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

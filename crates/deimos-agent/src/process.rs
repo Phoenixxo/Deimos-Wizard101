@@ -263,6 +263,64 @@ pub struct MutationExecution<T> {
     pub validation_error: Option<ProcessApiError>,
 }
 
+pub struct SuspendedProcess {
+    instruction_pointers: Vec<usize>,
+    resume_guard: Option<Box<dyn ProcessThreadResume>>,
+}
+
+pub(crate) trait ProcessThreadResume: Send {
+    fn resume(&mut self) -> Result<(), ProcessBackendError>;
+}
+
+#[cfg(test)]
+impl ProcessThreadResume for () {
+    fn resume(&mut self) -> Result<(), ProcessBackendError> {
+        Ok(())
+    }
+}
+
+impl SuspendedProcess {
+    #[cfg(any(windows, test))]
+    pub(crate) fn new(
+        instruction_pointers: Vec<usize>,
+        resume_guard: impl ProcessThreadResume + 'static,
+    ) -> Self {
+        Self {
+            instruction_pointers,
+            resume_guard: Some(Box::new(resume_guard)),
+        }
+    }
+
+    pub(crate) fn executes_range(&self, address: usize, size: usize) -> bool {
+        let Some(end) = address.checked_add(size) else {
+            return true;
+        };
+        self.instruction_pointers.iter().any(|instruction_pointer| {
+            address <= *instruction_pointer && *instruction_pointer < end
+        })
+    }
+
+    pub(crate) fn resume(mut self) -> Result<(), ProcessBackendError> {
+        let result = self
+            .resume_guard
+            .as_mut()
+            .expect("suspended process retains its resume guard")
+            .resume();
+        if result.is_ok() {
+            self.resume_guard = None;
+        }
+        result
+    }
+}
+
+impl Drop for SuspendedProcess {
+    fn drop(&mut self) {
+        if let Some(guard) = &mut self.resume_guard {
+            let _ = guard.resume();
+        }
+    }
+}
+
 /// Mutation methods are isolated from the read-only backend contract so a
 /// caller must opt into both a mutation session and mutation capabilities.
 pub trait MutationBackend: MemoryBackend {
@@ -282,8 +340,26 @@ pub trait MutationBackend: MemoryBackend {
         protection: MemoryProtection,
     ) -> Result<usize, ProcessBackendError>;
 
+    /// Allocate within rel32 reach of a hook site. Backends that cannot honor
+    /// the placement hint may fall back to a normal allocation; callers still
+    /// verify the final displacement before modifying the target.
+    fn allocate_memory_near(
+        &self,
+        handle: &Self::Handle,
+        _target: usize,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<usize, ProcessBackendError> {
+        self.allocate_memory(handle, size, protection)
+    }
+
     fn free_memory(&self, handle: &Self::Handle, address: usize)
         -> Result<(), ProcessBackendError>;
+
+    fn suspend_process_threads(
+        &self,
+        handle: &Self::Handle,
+    ) -> Result<SuspendedProcess, ProcessBackendError>;
 
     fn protect_memory(
         &self,
@@ -434,6 +510,13 @@ impl MutationBackend for UnsupportedProcessBackend {
         _handle: &Self::Handle,
         _address: usize,
     ) -> Result<(), ProcessBackendError> {
+        unsupported_mutation()
+    }
+
+    fn suspend_process_threads(
+        &self,
+        _handle: &Self::Handle,
+    ) -> Result<SuspendedProcess, ProcessBackendError> {
         unsupported_mutation()
     }
 

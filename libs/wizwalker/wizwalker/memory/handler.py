@@ -53,6 +53,7 @@ class HookHandler(MemoryReader):
         # TODO: Is this signature correct?
         self._active_hooks: dict[type, MemoryHook] = {}
         self._base_addrs = {}
+        self._agent_feature_exports = {}
 
         self._hook_cache = {}
         self._core_hook_heartbeat_task = None
@@ -117,11 +118,36 @@ class HookHandler(MemoryReader):
 
     async def close(self):
         if self._uses_agent_core_hooks():
+            feature_names = {
+                "movement_teleport",
+                "mouseless_cursor",
+                "chat",
+                "chat_send",
+                "dance_game_moves",
+            }
+            first_error = None
+            for hook_type, hook_name in list(self._active_hooks.items()):
+                if hook_name in feature_names:
+                    try:
+                        await self.run_in_executor(
+                            self._backend.deactivate_feature_hook, hook_name
+                        )
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = error
+            if any(hook_name not in feature_names for hook_name in self._active_hooks.values()):
+                try:
+                    await self.run_in_executor(self._backend.deactivate_core_hooks)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                self._ensure_core_hook_heartbeat()
+                raise first_error
             await self._stop_core_hook_heartbeat()
-            if self._active_hooks:
-                await self.run_in_executor(self._backend.deactivate_core_hooks)
             self._active_hooks = {}
             self._base_addrs = {}
+            self._agent_feature_exports = {}
             return
         for hook in self._active_hooks.values():
             await hook.unhook()
@@ -149,6 +175,43 @@ class HookHandler(MemoryReader):
 
     def _uses_agent_core_hooks(self) -> bool:
         return bool(getattr(self._backend, "supports_core_hooks", False))
+
+    def _uses_agent_feature_hooks(self) -> bool:
+        return bool(getattr(self._backend, "supports_feature_hooks", False))
+
+    async def _activate_agent_feature_hook(self, hook_type, hook_name: str, exports):
+        await self.run_in_executor(self._backend.activate_feature_hook, hook_name)
+        resolved = {}
+        try:
+            for addr_name, export_name in exports.items():
+                resolved[addr_name] = await self.run_in_executor(
+                    self._backend.read_feature_hook_export, export_name
+                )
+        except Exception:
+            await self.run_in_executor(
+                self._backend.deactivate_feature_hook, hook_name
+            )
+            raise
+        self._active_hooks[hook_type] = hook_name
+        for addr_name, export_name in exports.items():
+            self._base_addrs[addr_name] = resolved[addr_name]
+            self._agent_feature_exports[addr_name] = export_name
+        self._ensure_core_hook_heartbeat()
+
+    async def _deactivate_agent_feature_hook(self, hook_type, hook_name: str, exports):
+        await self.run_in_executor(self._backend.deactivate_feature_hook, hook_name)
+        self._active_hooks.pop(hook_type)
+        for addr_name in exports:
+            self._base_addrs.pop(addr_name, None)
+            self._agent_feature_exports.pop(addr_name, None)
+        if not self._active_hooks:
+            await self._stop_core_hook_heartbeat()
+
+    async def _read_feature_hook_export(self, addr_name: str, hook_name: str):
+        address = self._base_addrs.get(addr_name)
+        if address is None or addr_name not in self._agent_feature_exports:
+            raise HookNotActive(hook_name)
+        return address
 
     async def _activate_agent_core_hook(
         self,
@@ -189,7 +252,10 @@ class HookHandler(MemoryReader):
 
     async def _heartbeat_core_hooks_once(self):
         try:
-            await self.run_in_executor(self._backend.heartbeat_core_hooks)
+            if self._uses_agent_core_hooks():
+                await self.run_in_executor(self._backend.heartbeat_core_hooks)
+            if self._uses_agent_feature_hooks():
+                await self.run_in_executor(self._backend.heartbeat_feature_hooks)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -292,23 +358,49 @@ class HookHandler(MemoryReader):
                 (RootWindowHook, "root_window", "current_root_window"),
                 (RenderContextHook, "render_context", "current_render_context"),
             )
-            for hook_type, hook_name, addr_name in mappings:
-                self._active_hooks[hook_type] = hook_name
-                self._base_addrs[addr_name] = hook_name
-            self._ensure_core_hook_heartbeat()
-            if wait_for_ready:
-                await asyncio.gather(
-                    *(
-                        self._wait_for_core_hook(hook_name, timeout)
-                        for hook_name in (
-                            "player",
-                            "player_stat",
-                            "client",
-                            "root_window",
-                            "render_context",
+            try:
+                for hook_type, hook_name, addr_name in mappings:
+                    self._active_hooks[hook_type] = hook_name
+                    self._base_addrs[addr_name] = hook_name
+                if self._uses_agent_feature_hooks():
+                    await self._activate_agent_feature_hook(
+                        MovementTeleportHook,
+                        "movement_teleport",
+                        {"teleport_helper": "teleport_helper"},
+                    )
+                self._ensure_core_hook_heartbeat()
+                if wait_for_ready:
+                    await asyncio.gather(
+                        *(
+                            self._wait_for_core_hook(hook_name, timeout)
+                            for hook_name in (
+                                "player",
+                                "player_stat",
+                                "client",
+                                "root_window",
+                                "render_context",
+                            )
                         )
                     )
-                )
+            except Exception:
+                if MovementTeleportHook in self._active_hooks:
+                    try:
+                        await self.run_in_executor(
+                            self._backend.deactivate_feature_hook,
+                            "movement_teleport",
+                        )
+                    finally:
+                        self._active_hooks.pop(MovementTeleportHook, None)
+                        self._base_addrs.pop("teleport_helper", None)
+                        self._agent_feature_exports.pop("teleport_helper", None)
+                try:
+                    await self.run_in_executor(self._backend.deactivate_core_hooks)
+                finally:
+                    self._active_hooks = {}
+                    self._base_addrs = {}
+                    self._agent_feature_exports = {}
+                    await self._stop_core_hook_heartbeat()
+                raise
             return
         await self.activate_player_hook(wait_for_ready=False)
         # quest hook is not written if the quest arrow is off
@@ -701,6 +793,12 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(MovementTeleportHook):
             raise HookAlreadyActivated("Movement teleport")
+        if self._uses_agent_feature_hooks():
+            return await self._activate_agent_feature_hook(
+                MovementTeleportHook,
+                "movement_teleport",
+                {"teleport_helper": "teleport_helper"},
+            )
 
         await self._check_for_autobot()
 
@@ -718,6 +816,12 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(MovementTeleportHook):
             raise HookNotActive("Movement teleport")
+        if self._uses_agent_feature_hooks():
+            return await self._deactivate_agent_feature_hook(
+                MovementTeleportHook,
+                "movement_teleport",
+                ("teleport_helper",),
+            )
 
         hook = self._active_hooks.pop(MovementTeleportHook)
         await hook.unhook()
@@ -735,6 +839,11 @@ class HookHandler(MemoryReader):
         if addr is None:
             raise HookNotActive("Movement teleport")
 
+        if self._uses_agent_feature_hooks():
+            return await self._read_feature_hook_export(
+                "teleport_helper", "Movement teleport"
+            )
+
         return addr
 
     # nothing to wait for in this hook
@@ -744,6 +853,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(MouselessCursorMoveHook):
             raise HookAlreadyActivated("Mouseless cursor")
+        if self._uses_agent_feature_hooks():
+            await self._activate_agent_feature_hook(
+                MouselessCursorMoveHook,
+                "mouseless_cursor",
+                {"mouse_position": "mouse_position"},
+            )
+            await self.write_mouse_position(0, 0)
+            return
 
         await self._check_for_autobot()
 
@@ -761,6 +878,12 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(MouselessCursorMoveHook):
             raise HookNotActive("Mouseless cursor")
+        if self._uses_agent_feature_hooks():
+            return await self._deactivate_agent_feature_hook(
+                MouselessCursorMoveHook,
+                "mouseless_cursor",
+                ("mouse_position",),
+            )
 
         hook = self._active_hooks.pop(MouselessCursorMoveHook)
         await hook.unhook()
@@ -780,6 +903,12 @@ class HookHandler(MemoryReader):
         if addr is None:
             raise HookNotActive("Mouseless cursor")
 
+        if self._uses_agent_feature_hooks():
+            await self.run_in_executor(
+                self._backend.set_feature_mouse_position, x, y
+            )
+            return
+
         packed_position = struct.pack("<ii", x, y)
 
         await self.write_bytes(addr, packed_position)
@@ -798,6 +927,24 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(ChatHook):
             raise HookAlreadyActivated("Chat")
+        if self._uses_agent_feature_hooks():
+            await self._activate_agent_feature_hook(
+                ChatHook,
+                "chat",
+                {
+                    "chat_owner": "chat_owner",
+                    "recv_source_gid": "recv_source_gid",
+                    "recv_message_buf": "recv_message_buf",
+                    "recv_message_len": "recv_message_len",
+                    "recv_counter": "recv_counter",
+                },
+            )
+            if wait_for_ready:
+                await self._wait_for_value(
+                    await self._read_feature_hook_export("recv_counter", "Chat"),
+                    timeout,
+                )
+            return
 
         await self._check_for_autobot()
 
@@ -818,6 +965,18 @@ class HookHandler(MemoryReader):
         """Deactivate the chat hook."""
         if not self._check_if_hook_active(ChatHook):
             raise HookNotActive("Chat")
+        if self._uses_agent_feature_hooks():
+            return await self._deactivate_agent_feature_hook(
+                ChatHook,
+                "chat",
+                (
+                    "chat_owner",
+                    "recv_source_gid",
+                    "recv_message_buf",
+                    "recv_message_len",
+                    "recv_counter",
+                ),
+            )
 
         hook = self._active_hooks.pop(ChatHook)
         await hook.unhook()
@@ -834,6 +993,8 @@ class HookHandler(MemoryReader):
         Returns:
             The chat module base address
         """
+        if self._uses_agent_feature_hooks():
+            return await self._read_feature_hook_export("chat_owner", "Chat")
         return await self._read_hook_base_addr("chat_owner", "Chat")
 
     async def activate_chat_send_hook(self):
@@ -844,6 +1005,17 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(ChatSendHook):
             raise HookAlreadyActivated("Chat send")
+        if self._uses_agent_feature_hooks():
+            return await self._activate_agent_feature_hook(
+                ChatSendHook,
+                "chat_send",
+                {
+                    "send_trigger": "send_trigger",
+                    "send_struct": "send_struct",
+                    "buddy_trigger": "buddy_trigger",
+                    "buddy_obj": "buddy_obj",
+                },
+            )
 
         await self._check_for_autobot()
 
@@ -860,6 +1032,12 @@ class HookHandler(MemoryReader):
         """Deactivate the chat send hook."""
         if not self._check_if_hook_active(ChatSendHook):
             raise HookNotActive("Chat send")
+        if self._uses_agent_feature_hooks():
+            return await self._deactivate_agent_feature_hook(
+                ChatSendHook,
+                "chat_send",
+                ("send_trigger", "send_struct", "buddy_trigger", "buddy_obj"),
+            )
 
         hook = self._active_hooks.pop(ChatSendHook)
         await hook.unhook()

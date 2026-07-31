@@ -2,7 +2,15 @@ import asyncio
 import threading
 import unittest
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+WIZWALKER_ROOT = REPOSITORY_ROOT / "libs" / "wizwalker"
+for import_root in (REPOSITORY_ROOT, WIZWALKER_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 
 sys.modules.setdefault(

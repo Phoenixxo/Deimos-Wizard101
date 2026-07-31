@@ -11,8 +11,8 @@ use deimos_core::lifecycle::{
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
 use deimos_core::memory::{
-    CAPABILITY_CORE_HOOK, CAPABILITY_MEMORY_HOOK, CAPABILITY_MEMORY_MUTATION,
-    CAPABILITY_MEMORY_READ_ONLY,
+    CAPABILITY_CORE_HOOK, CAPABILITY_FEATURE_HOOK, CAPABILITY_MEMORY_HOOK,
+    CAPABILITY_MEMORY_MUTATION, CAPABILITY_MEMORY_READ_ONLY,
 };
 use deimos_core::process::{CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY};
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig};
@@ -29,7 +29,7 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
 ];
-const REQUESTED_AGENT_CAPABILITIES: [&str; 8] = [
+const REQUESTED_AGENT_CAPABILITIES: [&str; 9] = [
     CAPABILITY_AGENT_LIFECYCLE,
     CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
@@ -38,6 +38,7 @@ const REQUESTED_AGENT_CAPABILITIES: [&str; 8] = [
     CAPABILITY_MEMORY_MUTATION,
     CAPABILITY_MEMORY_HOOK,
     CAPABILITY_CORE_HOOK,
+    CAPABILITY_FEATURE_HOOK,
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1654,6 +1655,33 @@ mod tests {
             error.details.get("missing_capabilities"),
             Some(&CAPABILITY_CLIENT_DISCOVERY.to_string())
         );
+        shutdown.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn handshake_negotiates_feature_hook_capability() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut capabilities = REQUIRED_AGENT_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect::<Vec<_>>();
+        capabilities.push(CAPABILITY_FEATURE_HOOK.to_string());
+        let (endpoint, shutdown) =
+            start_test_agent_with_capabilities("1.2.3", "test-build-current", capabilities);
+        let manager = manager(runtime, "1.2.3");
+
+        let candidate = manager
+            .connect_candidate(&bottle(), &endpoint)
+            .expect("agent with feature hooks should connect");
+        let client = match candidate {
+            Candidate::Ready { client, .. } => client,
+            Candidate::VersionMismatch { .. } => panic!("matching agent should be ready"),
+        };
+
+        assert!(client
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_FEATURE_HOOK));
         shutdown.store(true, Ordering::Release);
     }
 

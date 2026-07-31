@@ -2,6 +2,7 @@
 //! created them and retain their allocation until original bytes are restored.
 
 use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use deimos_core::memory::{
@@ -19,6 +20,7 @@ use crate::process::{MutationBackend, ProcessSessionRegistry};
 
 pub const HOOK_LEASE: Duration = Duration::from_secs(30);
 const ABSOLUTE_JUMP_BYTES: usize = 14;
+const RELATIVE_JUMP_BYTES: usize = 5;
 const MAX_HOOK_KEY_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,19 +30,47 @@ struct HookSpec {
     payload: Vec<u8>,
     target_offset: usize,
     overwrite_size: Option<usize>,
+    metadata: HookMetadata,
+    replay_original: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HookMetadata {
+    pub exports: BTreeMap<String, (usize, usize)>,
+    pub patch_indices: BTreeMap<String, usize>,
+    pub quiescence: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
 struct HookRecord {
     spec: HookSpec,
-    target_address: usize,
-    original_bytes: Vec<u8>,
+    target: PatchRecord,
+    auxiliary_patches: Vec<PatchRecord>,
     allocation_id: String,
     allocation_address: usize,
-    original_protection: Option<MemoryProtection>,
-    target_may_be_modified: bool,
+    allocation_size: usize,
     activation_complete: bool,
     lease_deadline: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HookPatch {
+    pub address: usize,
+    pub expected_bytes: Vec<u8>,
+    pub replacement_bytes: Vec<u8>,
+    pub apply_on_activation: bool,
+    pub keep_writable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PatchRecord {
+    address: usize,
+    original_bytes: Vec<u8>,
+    replacement_bytes: Vec<u8>,
+    original_protection: Option<MemoryProtection>,
+    may_be_modified: bool,
+    apply_on_activation: bool,
+    keep_writable: bool,
 }
 
 #[derive(Default)]
@@ -81,6 +111,48 @@ impl HookState {
         self.get(session_id, hook_key)
             .filter(|record| record.activation_complete)
             .map(|record| record.allocation_address)
+    }
+
+    pub(crate) fn export_address(
+        &self,
+        session_id: &ProcessSessionId,
+        hook_key: &str,
+        export: &str,
+    ) -> Option<(usize, usize)> {
+        let record = self.get(session_id, hook_key)?;
+        if !record.activation_complete {
+            return None;
+        }
+        let (offset, size) = *record.spec.metadata.exports.get(export)?;
+        record
+            .allocation_address
+            .checked_add(offset)
+            .map(|address| (address, size))
+    }
+
+    pub(crate) fn patch_index(
+        &self,
+        session_id: &ProcessSessionId,
+        hook_key: &str,
+        patch: &str,
+    ) -> Option<usize> {
+        self.get(session_id, hook_key)?
+            .spec
+            .metadata
+            .patch_indices
+            .get(patch)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quiescence_address(
+        &self,
+        session_id: &ProcessSessionId,
+        hook_key: &str,
+    ) -> Option<usize> {
+        let record = self.get(session_id, hook_key)?;
+        let (offset, _) = record.spec.metadata.quiescence?;
+        record.allocation_address.checked_add(offset)
     }
 }
 
@@ -153,6 +225,74 @@ pub(crate) fn activate_template<B: MutationBackend>(
     overwrite_size: Option<usize>,
     now: Instant,
 ) -> Result<HookActivateResponse, HookApiError> {
+    activate_transactional_template(
+        sessions,
+        backend,
+        mutations,
+        hooks,
+        request,
+        target_offset,
+        overwrite_size,
+        None,
+        Vec::new(),
+        HookMetadata::default(),
+        true,
+        None,
+        now,
+    )
+}
+
+/// Installs a built-in hook whose payload depends on its remote allocation and
+/// whose auxiliary patches share the detour's rollback and lease ownership.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_feature_template<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    mutations: &mut MutationState<B::ThreadHandle>,
+    hooks: &mut HookState,
+    request: &HookActivateRequest,
+    target_offset: usize,
+    overwrite_size: usize,
+    resolved_target: Option<usize>,
+    auxiliary_patches: Vec<HookPatch>,
+    metadata: HookMetadata,
+    replay_original: bool,
+    payload_builder: &dyn Fn(usize) -> Result<Vec<u8>, HookApiError>,
+    now: Instant,
+) -> Result<HookActivateResponse, HookApiError> {
+    activate_transactional_template(
+        sessions,
+        backend,
+        mutations,
+        hooks,
+        request,
+        target_offset,
+        Some(overwrite_size),
+        resolved_target,
+        auxiliary_patches,
+        metadata,
+        replay_original,
+        Some(payload_builder),
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_transactional_template<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    mutations: &mut MutationState<B::ThreadHandle>,
+    hooks: &mut HookState,
+    request: &HookActivateRequest,
+    target_offset: usize,
+    overwrite_size: Option<usize>,
+    resolved_target: Option<usize>,
+    auxiliary_patches: Vec<HookPatch>,
+    metadata: HookMetadata,
+    replay_original: bool,
+    payload_builder: Option<&dyn Fn(usize) -> Result<Vec<u8>, HookApiError>>,
+    now: Instant,
+) -> Result<HookActivateResponse, HookApiError> {
     validate_hook_key(&request.hook_key)?;
     let signature = memory::parse_signature(&request.signature)?;
     if signature.len() < MIN_HOOK_SIGNATURE_BYTES {
@@ -175,6 +315,8 @@ pub(crate) fn activate_template<B: MutationBackend>(
         payload: request.payload.clone(),
         target_offset,
         overwrite_size,
+        metadata,
+        replay_original,
     };
     if let Some(existing) = hooks.get(&request.session_id, &request.hook_key) {
         if existing.spec != spec {
@@ -202,30 +344,42 @@ pub(crate) fn activate_template<B: MutationBackend>(
         return Ok(response);
     }
 
-    // Scan and read are completed before allocation or protection changes.
-    let scan = memory::scan(
-        sessions,
-        backend,
-        &MemoryScanRequest {
-            session_id: request.session_id.clone(),
-            signature: request.signature.clone(),
-            required: true,
-            unique: true,
-            max_matches: 2,
-            scope: request.scope.clone(),
-        },
-    )?;
-    let match_address = parse_address(
-        scan.matches
-            .first()
-            .expect("required unique scan must return one address"),
-    )?;
-    let target_address = match_address.checked_add(target_offset).ok_or_else(|| {
-        HookApiError::request(
-            RpcErrorCode::MemoryInvalidAddress,
-            "core hook target offset overflowed the agent address width",
-        )
-    })?;
+    // Every target is resolved and verified before allocation or protection changes.
+    let target_address = if let Some(target) = resolved_target {
+        target
+    } else {
+        let scan = memory::scan(
+            sessions,
+            backend,
+            &MemoryScanRequest {
+                session_id: request.session_id.clone(),
+                signature: request.signature.clone(),
+                required: true,
+                unique: true,
+                max_matches: 2,
+                scope: request.scope.clone(),
+            },
+        )?;
+        let match_address = parse_address(
+            scan.matches
+                .first()
+                .expect("required unique scan must return one address"),
+        )?;
+        match_address.checked_add(target_offset).ok_or_else(|| {
+            HookApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "hook target offset overflowed the agent address width",
+            )
+        })?
+    };
+    target_address
+        .checked_add(overwrite_size.unwrap_or(signature.len()))
+        .ok_or_else(|| {
+            HookApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "hook target range overflowed the agent address width",
+            )
+        })?;
     let available_size = signature.len().checked_sub(target_offset).ok_or_else(|| {
         HookApiError::request(
             RpcErrorCode::InvalidRequest,
@@ -250,15 +404,15 @@ pub(crate) fn activate_template<B: MutationBackend>(
                     "hook signature changed after scanning and before mutation",
                 ));
             }
-            relocatable_prefix_len(&candidate, ABSOLUTE_JUMP_BYTES)?
+            relocatable_prefix_len(&candidate, RELATIVE_JUMP_BYTES)?
         }
         Some(size) => size,
         None => signature.len(),
     };
-    if overwrite_size < ABSOLUTE_JUMP_BYTES {
+    if overwrite_size < RELATIVE_JUMP_BYTES {
         return Err(HookApiError::request(
             RpcErrorCode::InvalidRequest,
-            format!("hook overwrite must span at least {ABSOLUTE_JUMP_BYTES} complete x64 bytes"),
+            format!("hook overwrite must span at least {RELATIVE_JUMP_BYTES} complete x64 bytes"),
         ));
     }
     let overwrite_end = target_offset.checked_add(overwrite_size);
@@ -287,7 +441,73 @@ pub(crate) fn activate_template<B: MutationBackend>(
             "hook signature changed after scanning and before mutation",
         ));
     }
-    validate_relocatable_x64(&original_bytes)?;
+    if replay_original {
+        validate_relocatable_x64(&original_bytes)?;
+    }
+    let mut prepared_auxiliary = Vec::with_capacity(auxiliary_patches.len());
+    for patch in auxiliary_patches {
+        if patch.expected_bytes.is_empty()
+            || patch.expected_bytes.len() != patch.replacement_bytes.len()
+        {
+            return Err(HookApiError::request(
+                RpcErrorCode::InvalidRequest,
+                "auxiliary hook patches require equal non-empty expected and replacement bytes",
+            ));
+        }
+        let actual = memory::read(
+            sessions,
+            backend,
+            &MemoryReadRequest {
+                session_id: request.session_id.clone(),
+                address: format_address(patch.address),
+                size: patch.expected_bytes.len(),
+            },
+        )?
+        .bytes;
+        if actual != patch.expected_bytes {
+            return Err(HookApiError::request(
+                RpcErrorCode::MemoryRequiredMatchNotFound,
+                format!(
+                    "auxiliary hook target at {:#x} changed before activation",
+                    patch.address
+                ),
+            ));
+        }
+        let patch_end = patch
+            .address
+            .checked_add(patch.expected_bytes.len())
+            .ok_or_else(|| {
+                HookApiError::request(
+                    RpcErrorCode::MemoryInvalidAddress,
+                    "auxiliary hook target range overflowed the agent address width",
+                )
+            })?;
+        let target_end = target_address + overwrite_size;
+        if patch.address < target_end && target_address < patch_end {
+            return Err(HookApiError::request(
+                RpcErrorCode::InvalidRequest,
+                "an auxiliary hook patch overlaps the primary detour target",
+            ));
+        }
+        if prepared_auxiliary.iter().any(|record: &PatchRecord| {
+            let record_end = record.address + record.original_bytes.len();
+            patch.address < record_end && record.address < patch_end
+        }) {
+            return Err(HookApiError::request(
+                RpcErrorCode::InvalidRequest,
+                "auxiliary hook patches overlap each other",
+            ));
+        }
+        prepared_auxiliary.push(PatchRecord {
+            address: patch.address,
+            original_bytes: actual,
+            replacement_bytes: patch.replacement_bytes,
+            original_protection: None,
+            may_be_modified: false,
+            apply_on_activation: patch.apply_on_activation,
+            keep_writable: patch.keep_writable,
+        });
+    }
     let trampoline_size = request
         .payload
         .len()
@@ -306,34 +526,75 @@ pub(crate) fn activate_template<B: MutationBackend>(
         ));
     }
 
-    let allocation = mutation::allocate(
-        sessions,
-        backend,
-        mutations,
-        &MemoryAllocateRequest {
-            session_id: request.session_id.clone(),
-            size: trampoline_size,
-            protection: MemoryProtection::ExecuteReadWrite,
-        },
-    )?;
+    let allocation = if overwrite_size < ABSOLUTE_JUMP_BYTES {
+        mutation::allocate_near(
+            sessions,
+            backend,
+            mutations,
+            &request.session_id,
+            target_address,
+            trampoline_size,
+        )?
+    } else {
+        mutation::allocate(
+            sessions,
+            backend,
+            mutations,
+            &MemoryAllocateRequest {
+                session_id: request.session_id.clone(),
+                size: trampoline_size,
+                protection: MemoryProtection::ExecuteReadWrite,
+            },
+        )?
+    };
     let allocation_address = parse_agent_address(&allocation.address);
     let record = HookRecord {
         spec,
-        target_address,
-        original_bytes,
+        target: PatchRecord {
+            address: target_address,
+            original_bytes,
+            replacement_bytes: Vec::new(),
+            original_protection: None,
+            may_be_modified: false,
+            apply_on_activation: false,
+            keep_writable: false,
+        },
+        auxiliary_patches: prepared_auxiliary,
         allocation_id: allocation.allocation_id,
         allocation_address,
-        original_protection: None,
-        target_may_be_modified: false,
+        allocation_size: trampoline_size,
         activation_complete: false,
         lease_deadline: now + HOOK_LEASE,
     };
     hooks.insert(request.session_id.clone(), request.hook_key.clone(), record);
+    let payload = match payload_builder {
+        Some(builder) => match builder(allocation_address) {
+            Ok(payload) if payload.len() == request.payload.len() => payload,
+            Ok(_) => {
+                return activation_failure(
+                    sessions,
+                    backend,
+                    mutations,
+                    hooks,
+                    request,
+                    HookApiError::request(
+                        RpcErrorCode::InvalidRequest,
+                        "built-in hook payload changed size after allocation",
+                    ),
+                )
+            }
+            Err(error) => {
+                return activation_failure(sessions, backend, mutations, hooks, request, error)
+            }
+        },
+        None => request.payload.clone(),
+    };
     let trampoline = build_trampoline(
-        &request.payload,
+        &payload,
         &hooks
             .get(&request.session_id, &request.hook_key)
             .expect("new hook record must be tracked")
+            .target
             .original_bytes,
         target_address.checked_add(overwrite_size).ok_or_else(|| {
             HookApiError::request(
@@ -363,6 +624,27 @@ pub(crate) fn activate_template<B: MutationBackend>(
         return activation_failure(sessions, backend, mutations, hooks, request, error.into());
     }
 
+    let activation_patches = hooks
+        .get(&request.session_id, &request.hook_key)
+        .expect("provisional hook record must remain tracked")
+        .auxiliary_patches
+        .iter()
+        .enumerate()
+        .filter_map(|(index, patch)| patch.apply_on_activation.then_some(index))
+        .collect::<Vec<_>>();
+    for index in activation_patches {
+        if let Err(error) = apply_auxiliary_patch(
+            sessions,
+            backend,
+            hooks,
+            &request.session_id,
+            &request.hook_key,
+            index,
+        ) {
+            return activation_failure(sessions, backend, mutations, hooks, request, error);
+        }
+    }
+
     let target_address_text = format_address(target_address);
     let protection = match mutation::protect(
         sessions,
@@ -385,10 +667,15 @@ pub(crate) fn activate_template<B: MutationBackend>(
             .get_mut(&request.session_id)
             .and_then(|records| records.get_mut(&request.hook_key))
             .expect("provisional hook record must remain tracked");
-        record.original_protection = Some(protection.previous_protection);
-        record.target_may_be_modified = true;
+        record.target.original_protection = Some(protection.previous_protection);
+        record.target.may_be_modified = true;
     }
-    let detour = build_detour(allocation_address, overwrite_size);
+    let detour = match build_target_detour(target_address, allocation_address, overwrite_size) {
+        Ok(detour) => detour,
+        Err(error) => {
+            return activation_failure(sessions, backend, mutations, hooks, request, error);
+        }
+    };
     if let Err(error) = mutation::write(
         sessions,
         backend,
@@ -429,6 +716,136 @@ pub(crate) fn activate_template<B: MutationBackend>(
     record.activation_complete = true;
     let response = activation_response(request, record);
     Ok(response)
+}
+
+pub(crate) fn apply_owned_patch<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &mut HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+    index: usize,
+) -> Result<(), HookApiError> {
+    apply_auxiliary_patch(sessions, backend, hooks, session_id, hook_key, index)
+}
+
+fn apply_auxiliary_patch<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &mut HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+    index: usize,
+) -> Result<(), HookApiError> {
+    let patch = hooks
+        .get(session_id, hook_key)
+        .and_then(|record| record.auxiliary_patches.get(index))
+        .cloned()
+        .expect("auxiliary patch index must remain tracked");
+    let address = format_address(patch.address);
+    let already_writable = patch.keep_writable && patch.original_protection.is_some();
+    let protection = if already_writable {
+        None
+    } else {
+        Some(mutation::protect(
+            sessions,
+            backend,
+            &MemoryProtectRequest {
+                session_id: session_id.clone(),
+                address: address.clone(),
+                size: patch.original_bytes.len(),
+                protection: MemoryProtection::ExecuteReadWrite,
+            },
+        )?)
+    };
+    let tracked = hooks
+        .hooks
+        .get_mut(session_id)
+        .and_then(|records| records.get_mut(hook_key))
+        .and_then(|record| record.auxiliary_patches.get_mut(index))
+        .expect("auxiliary patch must remain tracked");
+    if tracked.original_protection.is_none() {
+        tracked.original_protection = protection
+            .as_ref()
+            .map(|changed| changed.previous_protection);
+    }
+    tracked.may_be_modified = true;
+    mutation::write(
+        sessions,
+        backend,
+        &MemoryWriteRequest {
+            session_id: session_id.clone(),
+            address: address.clone(),
+            bytes: patch.replacement_bytes,
+        },
+    )?;
+    mutation::flush_instruction_cache(
+        sessions,
+        backend,
+        session_id,
+        &address,
+        patch.original_bytes.len(),
+    )?;
+    if !patch.keep_writable {
+        let previous_protection = protection
+            .expect("non-persistent patch application changes protection")
+            .previous_protection;
+        mutation::protect(
+            sessions,
+            backend,
+            &MemoryProtectRequest {
+                session_id: session_id.clone(),
+                address,
+                size: patch.original_bytes.len(),
+                protection: previous_protection,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_owned_patch<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+    index: usize,
+) -> Result<(), HookApiError> {
+    let patch = hooks
+        .get(session_id, hook_key)
+        .and_then(|record| record.auxiliary_patches.get(index))
+        .cloned()
+        .ok_or_else(|| {
+            HookApiError::request(
+                RpcErrorCode::InvalidRequest,
+                "the requested hook patch is not active",
+            )
+        })?;
+    if !patch.keep_writable {
+        return restore_patch(sessions, backend, session_id, &patch);
+    }
+    if !patch.may_be_modified {
+        return Ok(());
+    }
+    let address = format_address(patch.address);
+    mutation::write(
+        sessions,
+        backend,
+        &MemoryWriteRequest {
+            session_id: session_id.clone(),
+            address: address.clone(),
+            bytes: patch.original_bytes.clone(),
+        },
+    )?;
+    mutation::flush_instruction_cache(
+        sessions,
+        backend,
+        session_id,
+        &address,
+        patch.original_bytes.len(),
+    )?;
+    Ok(())
 }
 
 pub fn deactivate<B: MutationBackend>(
@@ -592,60 +1009,154 @@ fn cleanup_one<B: MutationBackend>(
         .get(session_id, hook_key)
         .cloned()
         .expect("cleanup only runs for a tracked hook");
-    if record.target_may_be_modified {
-        let original_protection = record
-            .original_protection
-            .expect("modified target must retain its original protection");
-        let address = format_address(record.target_address);
-        mutation::protect(
+    let suspended = mutation::suspend_process_threads(sessions, backend, session_id)?;
+    let retirement = (|| {
+        if suspended.executes_range(record.allocation_address, record.allocation_size) {
+            return Err(HookApiError::request(
+                RpcErrorCode::Timeout,
+                "hook cleanup found a target thread still executing the trampoline; ownership is retained for retry",
+            ));
+        }
+        if quiescence_count(sessions, backend, session_id, &record)? != 0 {
+            return Err(HookApiError::request(
+                RpcErrorCode::Timeout,
+                "hook cleanup found a target thread inside an external trampoline call; ownership is retained for retry",
+            ));
+        }
+        restore_patch(sessions, backend, session_id, &record.target)?;
+        if record.spec.metadata.quiescence.is_some() {
+            hooks
+                .hooks
+                .get_mut(session_id)
+                .and_then(|records| records.get_mut(hook_key))
+                .expect("cleanup record must remain tracked")
+                .activation_complete = false;
+        }
+        for patch in record.auxiliary_patches.iter().rev() {
+            restore_patch(sessions, backend, session_id, patch)?;
+        }
+        mutation::free(
             sessions,
             backend,
-            &MemoryProtectRequest {
+            mutations,
+            &MemoryFreeRequest {
                 session_id: session_id.clone(),
-                address: address.clone(),
-                size: record.original_bytes.len(),
-                protection: MemoryProtection::ExecuteReadWrite,
+                allocation_id: record.allocation_id.clone(),
             },
         )?;
-        mutation::write(
-            sessions,
-            backend,
-            &MemoryWriteRequest {
-                session_id: session_id.clone(),
-                address: address.clone(),
-                bytes: record.original_bytes.clone(),
-            },
-        )?;
-        // Do not free the trampoline until the target's original code is
-        // confirmed visible to instruction fetch.
-        mutation::flush_instruction_cache(
-            sessions,
-            backend,
-            session_id,
-            &address,
-            record.original_bytes.len(),
-        )?;
-        mutation::protect(
-            sessions,
-            backend,
-            &MemoryProtectRequest {
-                session_id: session_id.clone(),
-                address,
-                size: record.original_bytes.len(),
-                protection: original_protection,
-            },
-        )?;
+        hooks.remove(session_id, hook_key);
+        Ok(())
+    })();
+    let resume = suspended
+        .resume()
+        .map_err(MutationApiError::from)
+        .map_err(HookApiError::from);
+    match (retirement, resume) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(retirement_error), Err(resume_error)) => Err(HookApiError::request(
+            RpcErrorCode::MemoryWriteFailed,
+            format!(
+                "hook retirement failed and target threads could not be resumed: {}; {}",
+                retirement_error.summary(),
+                resume_error.summary()
+            ),
+        )),
     }
-    mutation::free(
+}
+
+fn quiescence_count<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    record: &HookRecord,
+) -> Result<u64, HookApiError> {
+    let Some((offset, size)) = record.spec.metadata.quiescence else {
+        return Ok(0);
+    };
+    if size != size_of::<u64>() {
+        return Err(HookApiError::request(
+            RpcErrorCode::Internal,
+            "hook quiescence counter has an unsupported size",
+        ));
+    }
+    let address = record
+        .allocation_address
+        .checked_add(offset)
+        .ok_or_else(|| {
+            HookApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "hook quiescence counter address overflowed the agent address width",
+            )
+        })?;
+    let bytes = memory::read(
         sessions,
         backend,
-        mutations,
-        &MemoryFreeRequest {
+        &MemoryReadRequest {
             session_id: session_id.clone(),
-            allocation_id: record.allocation_id.clone(),
+            address: format_address(address),
+            size,
+        },
+    )?
+    .bytes;
+    Ok(u64::from_le_bytes(
+        bytes
+            .try_into()
+            .expect("validated quiescence reads contain one u64"),
+    ))
+}
+
+fn restore_patch<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    patch: &PatchRecord,
+) -> Result<(), HookApiError> {
+    if !patch.may_be_modified {
+        return Ok(());
+    }
+    let original_protection = patch
+        .original_protection
+        .expect("modified patch must retain its original protection");
+    let address = format_address(patch.address);
+    mutation::protect(
+        sessions,
+        backend,
+        &MemoryProtectRequest {
+            session_id: session_id.clone(),
+            address: address.clone(),
+            size: patch.original_bytes.len(),
+            protection: MemoryProtection::ExecuteReadWrite,
         },
     )?;
-    hooks.remove(session_id, hook_key);
+    mutation::write(
+        sessions,
+        backend,
+        &MemoryWriteRequest {
+            session_id: session_id.clone(),
+            address: address.clone(),
+            bytes: patch.original_bytes.clone(),
+        },
+    )?;
+    // Remote code remains owned until its original bytes are visible to
+    // instruction fetch and the exact prior protection is restored.
+    mutation::flush_instruction_cache(
+        sessions,
+        backend,
+        session_id,
+        &address,
+        patch.original_bytes.len(),
+    )?;
+    mutation::protect(
+        sessions,
+        backend,
+        &MemoryProtectRequest {
+            session_id: session_id.clone(),
+            address,
+            size: patch.original_bytes.len(),
+            protection: original_protection,
+        },
+    )?;
     Ok(())
 }
 
@@ -677,7 +1188,7 @@ fn activation_response(request: &HookActivateRequest, record: &HookRecord) -> Ho
     HookActivateResponse {
         session_id: request.session_id.clone(),
         hook_key: request.hook_key.clone(),
-        target_address: format_address(record.target_address),
+        target_address: format_address(record.target.address),
         allocation_id: record.allocation_id.clone(),
         allocation_address: format_address(record.allocation_address),
         active: true,
@@ -863,6 +1374,33 @@ fn build_detour(destination: usize, overwrite_len: usize) -> Vec<u8> {
     bytes
 }
 
+fn build_target_detour(
+    source: usize,
+    destination: usize,
+    overwrite_len: usize,
+) -> Result<Vec<u8>, HookApiError> {
+    if overwrite_len >= ABSOLUTE_JUMP_BYTES {
+        return Ok(build_detour(destination, overwrite_len));
+    }
+    let continuation = source.checked_add(RELATIVE_JUMP_BYTES).ok_or_else(|| {
+        HookApiError::request(
+            RpcErrorCode::MemoryInvalidAddress,
+            "relative hook source overflowed the agent address width",
+        )
+    })?;
+    let displacement = (destination as i128) - (continuation as i128);
+    let displacement = i32::try_from(displacement).map_err(|_| {
+        HookApiError::request(
+            RpcErrorCode::MemoryAllocationFailed,
+            "the hook trampoline was not allocated within rel32 reach of its target",
+        )
+    })?;
+    let mut bytes = vec![0x90; overwrite_len];
+    bytes[0] = 0xe9;
+    bytes[1..RELATIVE_JUMP_BYTES].copy_from_slice(&displacement.to_le_bytes());
+    Ok(bytes)
+}
+
 fn build_trampoline(payload: &[u8], original_bytes: &[u8], continuation: usize) -> Vec<u8> {
     let mut trampoline =
         Vec::with_capacity(payload.len() + original_bytes.len() + ABSOLUTE_JUMP_BYTES);
@@ -943,8 +1481,11 @@ pub(crate) mod tests {
         TrampolineFlush,
         TargetProtect,
         TargetWrite,
+        SecondTargetWrite,
+        FeatureActionWrite,
         TargetFlush,
         TargetRestore,
+        TrampolineExecuting,
         Free,
     }
 
@@ -954,6 +1495,7 @@ pub(crate) mod tests {
         target_protection: MemoryProtection,
         next_allocation: usize,
         failures: Vec<Failure>,
+        target_writes: usize,
     }
 
     #[derive(Clone)]
@@ -977,6 +1519,7 @@ pub(crate) mod tests {
                 target_protection: MemoryProtection::ReadOnly,
                 next_allocation: ALLOCATION,
                 failures,
+                target_writes: 0,
             })))
         }
 
@@ -1002,6 +1545,20 @@ pub(crate) mod tests {
             Self::with_primary(primary, failure.into_iter().collect())
         }
 
+        pub(crate) fn feature(failure: Option<Failure>) -> Self {
+            let mut primary = Vec::new();
+            for marker in 1..=5 {
+                primary.extend_from_slice(&[
+                    0xb8, marker, 0xd1, 0xc0, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0x90, 0xc3,
+                ]);
+            }
+            for marker in [0x11, 0x12, 0x13, 0x14, 0x21, 0x22, 0x23] {
+                primary.extend_from_slice(&[0xb8, marker, 0xf1, 0xc7, 0x00, 0x90, 0x90, 0x90]);
+            }
+            Self::with_primary(primary, failure.into_iter().collect())
+        }
+
         pub(crate) fn primary(&self) -> Vec<u8> {
             self.0.lock().expect("data lock").primary.clone()
         }
@@ -1013,6 +1570,10 @@ pub(crate) mod tests {
 
         pub(crate) fn allocation_count(&self) -> usize {
             self.0.lock().expect("data lock").allocations.len()
+        }
+
+        pub(crate) fn target_protection(&self) -> MemoryProtection {
+            self.0.lock().expect("data lock").target_protection
         }
     }
 
@@ -1095,6 +1656,15 @@ pub(crate) mod tests {
             size: usize,
         ) -> Result<Vec<u8>, ProcessBackendError> {
             let data = self.0.lock().expect("data lock");
+            if let Some((base, allocation)) = data.allocations.iter().find(|(base, allocation)| {
+                **base <= address
+                    && address
+                        .checked_add(size)
+                        .is_some_and(|end| end <= **base + allocation.len())
+            }) {
+                let offset = address - *base;
+                return Ok(allocation[offset..offset + size].to_vec());
+            }
             let end_outside_primary = match address.checked_add(size) {
                 Some(end) => end > TARGET + data.primary.len(),
                 None => true,
@@ -1119,9 +1689,24 @@ pub(crate) mod tests {
             if address == ALLOCATION && take_failure(&mut data, Failure::TrampolineWrite) {
                 return Err(failure("forced trampoline write failure"));
             }
+            if address > ALLOCATION
+                && address < ALLOCATION + 0x1000
+                && take_failure(&mut data, Failure::FeatureActionWrite)
+            {
+                return Err(failure("forced feature action write failure"));
+            }
             let target_range = address >= TARGET && address < TARGET + data.primary.len();
+            if target_range {
+                data.target_writes += 1;
+            }
             if target_range && take_failure(&mut data, Failure::TargetWrite) {
                 return Err(failure("forced target write failure"));
+            }
+            if target_range
+                && data.target_writes == 2
+                && take_failure(&mut data, Failure::SecondTargetWrite)
+            {
+                return Err(failure("forced second target write failure"));
             }
             if address >= TARGET && address < TARGET + data.primary.len() {
                 let offset = address - TARGET;
@@ -1135,14 +1720,18 @@ pub(crate) mod tests {
                 data.primary[offset..offset + bytes.len()].copy_from_slice(bytes);
                 return Ok(());
             }
-            let allocation = data
+            let (base, allocation) = data
                 .allocations
-                .get_mut(&address)
+                .iter_mut()
+                .find(|(base, allocation)| {
+                    **base <= address
+                        && address
+                            .checked_add(bytes.len())
+                            .is_some_and(|end| end <= **base + allocation.len())
+                })
                 .ok_or_else(|| failure("allocation write range"))?;
-            if bytes.len() > allocation.len() {
-                return Err(failure("allocation write range"));
-            }
-            allocation[..bytes.len()].copy_from_slice(bytes);
+            let offset = address - *base;
+            allocation[offset..offset + bytes.len()].copy_from_slice(bytes);
             Ok(())
         }
 
@@ -1175,6 +1764,24 @@ pub(crate) mod tests {
                 .remove(&address)
                 .map(|_| ())
                 .ok_or_else(|| failure("allocation free range"))
+        }
+
+        fn suspend_process_threads(
+            &self,
+            _handle: &Self::Handle,
+        ) -> Result<crate::process::SuspendedProcess, ProcessBackendError> {
+            let instruction_pointers = if take_failure(
+                &mut self.0.lock().expect("data lock"),
+                Failure::TrampolineExecuting,
+            ) {
+                vec![ALLOCATION]
+            } else {
+                Vec::new()
+            };
+            Ok(crate::process::SuspendedProcess::new(
+                instruction_pointers,
+                (),
+            ))
         }
 
         fn protect_memory(

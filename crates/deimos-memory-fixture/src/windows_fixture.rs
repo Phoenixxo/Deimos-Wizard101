@@ -38,6 +38,8 @@ struct ReadOnlyValues {
     exact_pattern: [u8; 16],
     wildcard_pattern: [u8; 16],
     core_hook_targets: [[u8; 16]; 6],
+    feature_hook_targets: [[u8; 16]; 5],
+    feature_hook_auxiliary_targets: [[u8; 8]; 7],
     value_u8: u8,
     padding_after_u8: [u8; 3],
     value_i32: i32,
@@ -143,6 +145,8 @@ impl FixtureMemory {
         let exact_pattern = deterministic_pattern(EXACT_PATTERN_SEED);
         let wildcard_pattern = deterministic_pattern(WILDCARD_PATTERN_SEED);
         let core_hook_targets = core_hook_targets();
+        let feature_hook_targets = feature_hook_targets();
+        let feature_hook_auxiliary_targets = feature_hook_auxiliary_targets();
 
         unsafe {
             read_write.write(ReadWriteValues {
@@ -165,6 +169,8 @@ impl FixtureMemory {
                 exact_pattern,
                 wildcard_pattern,
                 core_hook_targets,
+                feature_hook_targets,
+                feature_hook_auxiliary_targets,
                 value_u8: VALUE_U8,
                 padding_after_u8: [0; 3],
                 value_i32: VALUE_I32,
@@ -334,6 +340,18 @@ fn metadata(
             core_hook_pattern("core_hook_player_stat", 3),
             core_hook_pattern("core_hook_root_window", 4),
             core_hook_pattern("core_hook_render_context", 5),
+            feature_hook_pattern("feature_hook_movement_teleport", 0),
+            feature_hook_pattern("feature_hook_mouseless_cursor", 1),
+            feature_hook_pattern("feature_hook_chat", 2),
+            feature_hook_pattern("feature_hook_chat_send", 3),
+            feature_hook_pattern("feature_hook_dance_game_moves", 4),
+            feature_hook_auxiliary_pattern("feature_movement_forward", 0),
+            feature_hook_auxiliary_pattern("feature_movement_backward", 1),
+            feature_hook_auxiliary_pattern("feature_movement_collision_one", 2),
+            feature_hook_auxiliary_pattern("feature_movement_collision_two", 3),
+            feature_hook_auxiliary_pattern("feature_mouse_set_cursor", 4),
+            feature_hook_auxiliary_pattern("feature_mouse_toggle_one", 5),
+            feature_hook_auxiliary_pattern("feature_mouse_toggle_two", 6),
         ],
         pointer_chains: vec![PointerChainMetadata {
             name: "two_hop_u64".to_string(),
@@ -375,6 +393,57 @@ fn core_hook_pattern(name: &str, index: usize) -> PatternMetadata {
         kind: PatternKind::Exact,
         region: READ_ONLY_REGION.to_string(),
         offset: offset_of!(ReadOnlyValues, core_hook_targets) + index * bytes.len(),
+        signature: signature(&bytes),
+        expected_matches: 1,
+    }
+}
+
+fn feature_hook_targets() -> [[u8; 16]; 5] {
+    let mut targets = [[0u8; 16]; 5];
+    for (index, target) in targets.iter_mut().enumerate() {
+        target[0] = 0xb8;
+        target[1] = (index + 1) as u8;
+        target[2] = 0xd1;
+        target[3] = 0xc0;
+        target[4] = 0;
+        for byte in &mut target[5..15] {
+            *byte = 0x90;
+        }
+        target[15] = 0xc3;
+    }
+    targets
+}
+
+fn feature_hook_pattern(name: &str, index: usize) -> PatternMetadata {
+    let bytes = feature_hook_targets()[index];
+    PatternMetadata {
+        name: name.to_string(),
+        kind: PatternKind::Exact,
+        region: READ_ONLY_REGION.to_string(),
+        offset: offset_of!(ReadOnlyValues, feature_hook_targets) + index * bytes.len(),
+        signature: signature(&bytes),
+        expected_matches: 1,
+    }
+}
+
+fn feature_hook_auxiliary_targets() -> [[u8; 8]; 7] {
+    let mut targets = [[0u8; 8]; 7];
+    for (target, marker) in targets
+        .iter_mut()
+        .zip([0x11, 0x12, 0x13, 0x14, 0x21, 0x22, 0x23])
+    {
+        *target = [0xb8, marker, 0xf1, 0xc7, 0x00, 0x90, 0x90, 0x90];
+    }
+    targets
+}
+
+fn feature_hook_auxiliary_pattern(name: &str, index: usize) -> PatternMetadata {
+    let bytes = feature_hook_auxiliary_targets()[index];
+    PatternMetadata {
+        name: name.to_string(),
+        kind: PatternKind::Exact,
+        region: READ_ONLY_REGION.to_string(),
+        offset: offset_of!(ReadOnlyValues, feature_hook_auxiliary_targets) + index * bytes.len(),
         signature: signature(&bytes),
         expected_matches: 1,
     }
