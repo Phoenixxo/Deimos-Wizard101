@@ -49,6 +49,11 @@ const WIZARD_WINDOW_CLASS: &str = "Wizard Graphical Client";
 
 struct OwnedHandle(HANDLE);
 
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+const _: () = assert!(std::mem::align_of::<AlignedContext>() == 16);
+
 // Windows kernel handles belong to the process rather than to the thread that
 // opened them. Access to this handle is serialized by the agent's session
 // registry, and ownership still has a single Drop implementation.
@@ -957,14 +962,14 @@ fn suspend_process_threads(handle: HANDLE) -> Result<SuspendedProcess, ProcessBa
                 )));
             }
             suspended.0.push(thread);
-            let mut context = CONTEXT {
+            let mut context = AlignedContext(CONTEXT {
                 ContextFlags: CONTEXT_CONTROL_AMD64,
                 ..Default::default()
-            };
+            });
             unsafe {
                 GetThreadContext(
                     suspended.0.last().expect("suspended thread is retained").0,
-                    &mut context,
+                    &mut context.0,
                 )
             }
             .map_err(|error| {
@@ -975,7 +980,7 @@ fn suspend_process_threads(handle: HANDLE) -> Result<SuspendedProcess, ProcessBa
                     error,
                 )
             })?;
-            instruction_pointers.push(context.Rip as usize);
+            instruction_pointers.push(context.0.Rip as usize);
         }
         if !discovered {
             break;
