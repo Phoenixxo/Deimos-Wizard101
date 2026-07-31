@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use deimos_core::client::{ClientDescriptor, ClientId, ListClientsResponse};
+use deimos_core::client::{
+    ClientDescriptor, ClientId, KeyAction, ListClientsResponse, MessageDelivery, MouseButton,
+    WindowPoint, WindowRectangle,
+};
 use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
@@ -71,6 +74,19 @@ pub struct ClientWindowCandidate {
     pub top: i32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientWindowTarget {
+    pub(crate) native_window_id: u64,
+    pub process_identity: ProcessIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientWindowSnapshot {
+    pub title: String,
+    pub is_foreground: bool,
+    pub rectangle: WindowRectangle,
+}
+
 pub trait ProcessBackend: Send + Sync + 'static {
     type Handle: Send + 'static;
 
@@ -107,6 +123,88 @@ pub trait ProcessBackend: Send + Sync + 'static {
         handle: &Self::Handle,
         expected: &ProcessIdentity,
     ) -> Result<Vec<ModuleDescriptor>, ProcessBackendError>;
+
+    fn inspect_client_window(
+        &self,
+        _target: &ClientWindowTarget,
+    ) -> Result<ClientWindowSnapshot, ProcessBackendError> {
+        Err(unsupported_window_operation())
+    }
+
+    fn focus_client_window(
+        &self,
+        _target: &ClientWindowTarget,
+    ) -> Result<bool, ProcessBackendError> {
+        Err(unsupported_window_operation())
+    }
+
+    fn set_client_window_title(
+        &self,
+        _target: &ClientWindowTarget,
+        _title: &str,
+    ) -> Result<(), ProcessBackendError> {
+        Err(unsupported_window_operation())
+    }
+
+    fn client_to_screen(
+        &self,
+        _target: &ClientWindowTarget,
+        _point: WindowPoint,
+    ) -> Result<WindowPoint, ProcessBackendError> {
+        Err(unsupported_window_operation())
+    }
+
+    fn screen_to_client(
+        &self,
+        _target: &ClientWindowTarget,
+        _point: WindowPoint,
+    ) -> Result<WindowPoint, ProcessBackendError> {
+        Err(unsupported_window_operation())
+    }
+
+    fn send_client_key_event(
+        &self,
+        _target: &ClientWindowTarget,
+        _virtual_key: u16,
+        _action: KeyAction,
+        _delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        Err(unsupported_input_operation())
+    }
+
+    fn send_client_mouse_move(
+        &self,
+        _target: &ClientWindowTarget,
+        _point: WindowPoint,
+        _delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        Err(unsupported_input_operation())
+    }
+
+    fn send_client_mouse_button(
+        &self,
+        _target: &ClientWindowTarget,
+        _point: WindowPoint,
+        _button: MouseButton,
+        _pressed: bool,
+        _delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        Err(unsupported_input_operation())
+    }
+}
+
+fn unsupported_window_operation() -> ProcessBackendError {
+    ProcessBackendError::new(
+        ProcessBackendErrorKind::AccessDenied,
+        "window operations require the Windows agent running natively or inside Wine/CrossOver",
+    )
+}
+
+fn unsupported_input_operation() -> ProcessBackendError {
+    ProcessBackendError::new(
+        ProcessBackendErrorKind::AccessDenied,
+        "input operations require the Windows agent running natively or inside Wine/CrossOver",
+    )
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -219,6 +317,35 @@ impl ClientRegistry {
         self.clients = active;
 
         Ok(ListClientsResponse { clients })
+    }
+
+    pub fn resolve<B: ProcessBackend>(
+        &mut self,
+        backend: &B,
+        client_id: &ClientId,
+    ) -> Result<ClientWindowTarget, ProcessBackendError> {
+        self.list(backend)?;
+        let (key, _) = self
+            .clients
+            .iter()
+            .find(|(_, active_id)| *active_id == client_id)
+            .ok_or_else(|| {
+                ProcessBackendError::new(
+                    ProcessBackendErrorKind::NotFound,
+                    format!(
+                        "client {} is no longer associated with an active Wizard101 window",
+                        client_id.0
+                    ),
+                )
+            })?;
+        Ok(ClientWindowTarget {
+            native_window_id: key.native_window_id,
+            process_identity: ProcessIdentity {
+                pid: key.pid,
+                creation_time_100ns: key.creation_time_100ns.clone(),
+                executable_path: key.executable_path.clone(),
+            },
+        })
     }
 }
 
@@ -1594,6 +1721,69 @@ mod tests {
         assert!(!clients[0].is_foreground);
         assert!(clients[1].is_foreground);
         assert_ne!(clients[0].client_id, clients[1].client_id);
+    }
+
+    #[test]
+    fn client_resolution_keeps_multiple_windows_isolated() {
+        let backend = MockBackend::new();
+        {
+            let mut state = backend.state.lock().expect("mock state should lock");
+            state.insert(
+                337,
+                MockProcess {
+                    name: WIZARD101_EXECUTABLE.to_string(),
+                    creation: "1001".to_string(),
+                    path: format!(r"C:\Wizard101-2\{WIZARD101_EXECUTABLE}"),
+                    alive: true,
+                },
+            );
+        }
+        backend.set_windows(vec![
+            ClientWindowCandidate {
+                native_window_id: 20,
+                pid: 336,
+                process_identity: backend.identity(336),
+                is_foreground: true,
+                left: 0,
+                top: 0,
+            },
+            ClientWindowCandidate {
+                native_window_id: 10,
+                pid: 337,
+                process_identity: backend.identity(337),
+                is_foreground: false,
+                left: 100,
+                top: 100,
+            },
+        ]);
+        let mut registry = ClientRegistry::new();
+        let listed = registry
+            .list(&backend)
+            .expect("client listing should work")
+            .clients;
+        let first_id = listed
+            .iter()
+            .find(|client| client.process.pid == 336)
+            .expect("first client")
+            .client_id
+            .clone();
+        let second_id = listed
+            .iter()
+            .find(|client| client.process.pid == 337)
+            .expect("second client")
+            .client_id
+            .clone();
+
+        let first = registry
+            .resolve(&backend, &first_id)
+            .expect("first client should resolve");
+        let second = registry
+            .resolve(&backend, &second_id)
+            .expect("second client should resolve");
+        assert_eq!(first.native_window_id, 20);
+        assert_eq!(first.process_identity.pid, 336);
+        assert_eq!(second.native_window_id, 10);
+        assert_eq!(second.process_identity.pid, 337);
     }
 
     #[test]
