@@ -145,6 +145,19 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         self.session_id = session_id
         self.process = self
         self._native_module = native_module
+        self.supports_feature_hooks = all(
+            hasattr(manager, name)
+            for name in (
+                "activate_feature_hook",
+                "deactivate_feature_hook",
+                "heartbeat_feature_hooks",
+                "read_feature_hook_export",
+                "set_feature_mouse_position",
+                "feature_teleport",
+                "feature_send_chat",
+                "feature_add_buddy",
+            )
+        )
 
     supports_core_hooks = True
 
@@ -201,6 +214,47 @@ class DeimosNativeMemoryBackend(MemoryBackend):
 
     def read_core_hook_base(self, hook: str) -> int:
         return int(self.manager.read_core_hook_base(self.session_id, hook))
+
+    def activate_feature_hook(self, hook: str) -> dict[str, Any]:
+        return self.manager.activate_feature_hook(self.session_id, hook)
+
+    def deactivate_feature_hook(self, hook: str) -> dict[str, Any]:
+        return self.manager.deactivate_feature_hook(self.session_id, hook)
+
+    def heartbeat_feature_hooks(self) -> dict[str, Any]:
+        return self.manager.heartbeat_feature_hooks(self.session_id)
+
+    def read_feature_hook_export(self, export: str) -> int:
+        return int(self.manager.read_feature_hook_export(self.session_id, export))
+
+    def set_feature_mouse_position(self, x: int, y: int) -> dict[str, Any]:
+        return self.manager.set_feature_mouse_position(self.session_id, x, y)
+
+    def feature_teleport(
+        self,
+        object_address: int,
+        position: tuple[float, float, float],
+        *,
+        wait_on_inuse: bool,
+        wait_timeout_ms: int,
+        purge_after_timeout: bool,
+        purge_timeout_ms: int,
+    ) -> dict[str, Any]:
+        return self.manager.feature_teleport(
+            self.session_id,
+            hex(object_address),
+            position,
+            wait_on_inuse=wait_on_inuse,
+            wait_timeout_ms=wait_timeout_ms,
+            purge_after_timeout=purge_after_timeout,
+            purge_timeout_ms=purge_timeout_ms,
+        )
+
+    def feature_send_chat(self, message: str, target_gid: int) -> dict[str, Any]:
+        return self.manager.feature_send_chat(self.session_id, message, target_gid)
+
+    def feature_add_buddy(self, target_gid: int) -> dict[str, Any]:
+        return self.manager.feature_add_buddy(self.session_id, target_gid)
 
     def scan(
         self,

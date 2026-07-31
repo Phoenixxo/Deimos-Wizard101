@@ -7,12 +7,18 @@ use std::time::Duration;
 use deimos_core::client::{ListClientsRequest, OP_CLIENT_LIST};
 use deimos_core::memory::{
     ByteOrder, CoreHook, CoreHookBaseResponse, CoreHookRequest, CoreHookSessionRequest,
+    FeatureBuddyAddRequest, FeatureChatSendRequest, FeatureHook, FeatureHookExport,
+    FeatureHookExportRequest, FeatureHookExportResponse, FeatureHookRequest,
+    FeatureHookSessionRequest, FeatureMousePositionRequest, FeatureTeleportRequest,
     MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem, MemoryReadRequest,
     MemoryReadResponse, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
     TypedMemoryReadRequest, DEFAULT_SCAN_MAX_MATCHES, OP_CORE_HOOK_ACTIVATE,
     OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
-    OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ,
-    OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
+    OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_FEATURE_BUDDY_ADD, OP_FEATURE_CHAT_SEND,
+    OP_FEATURE_HOOK_ACTIVATE, OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL,
+    OP_FEATURE_HOOK_READ_EXPORT, OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT,
+    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
+    OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessSessionId, SessionRequest,
@@ -623,6 +629,52 @@ fn parse_core_hook(value: &str, operation: &str) -> Result<CoreHook, BindingErro
     }
 }
 
+fn parse_feature_hook(value: &str, operation: &str) -> Result<FeatureHook, BindingError> {
+    match value {
+        "movement_teleport" => Ok(FeatureHook::MovementTeleport),
+        "mouseless_cursor" => Ok(FeatureHook::MouselessCursor),
+        "chat" => Ok(FeatureHook::Chat),
+        "chat_send" => Ok(FeatureHook::ChatSend),
+        "dance_game_moves" => Ok(FeatureHook::DanceGameMoves),
+        _ => Err(BindingError::Configuration {
+            code: "invalid_feature_hook",
+            message: format!("{operation} received an unsupported feature hook {value:?}"),
+            details: json!({
+                "operation": operation,
+                "supported": [
+                    "movement_teleport",
+                    "mouseless_cursor",
+                    "chat",
+                    "chat_send",
+                    "dance_game_moves"
+                ],
+            }),
+        }),
+    }
+}
+
+fn parse_feature_export(value: &str) -> Result<FeatureHookExport, BindingError> {
+    match value {
+        "teleport_helper" => Ok(FeatureHookExport::TeleportHelper),
+        "mouse_position" => Ok(FeatureHookExport::MousePosition),
+        "chat_owner" => Ok(FeatureHookExport::ChatOwner),
+        "recv_source_gid" => Ok(FeatureHookExport::ReceiveSourceGid),
+        "recv_message_buf" => Ok(FeatureHookExport::ReceiveMessageBuffer),
+        "recv_message_len" => Ok(FeatureHookExport::ReceiveMessageLength),
+        "recv_counter" => Ok(FeatureHookExport::ReceiveCounter),
+        "send_trigger" => Ok(FeatureHookExport::SendTrigger),
+        "send_struct" => Ok(FeatureHookExport::SendStruct),
+        "buddy_trigger" => Ok(FeatureHookExport::BuddyTrigger),
+        "buddy_obj" => Ok(FeatureHookExport::BuddyObject),
+        "dance_game_moves" => Ok(FeatureHookExport::DanceGameMoves),
+        _ => Err(BindingError::Configuration {
+            code: "invalid_feature_hook_export",
+            message: format!("unsupported feature-hook export {value:?}"),
+            details: json!({"export": value}),
+        }),
+    }
+}
+
 fn parse_hex_u64(value: &str, operation: &str) -> Result<u64, BindingError> {
     let digits = value.strip_prefix("0x").ok_or_else(|| {
         BindingError::serialization(operation, "agent address was not hexadecimal")
@@ -1067,9 +1119,172 @@ impl PyAgentManager {
         parse_hex_u64(&response.base_address, OP_CORE_HOOK_READ_BASE)
             .map_err(|error| error.into_pyerr(py))
     }
+
+    fn activate_feature_hook(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        self.feature_hook_call(py, OP_FEATURE_HOOK_ACTIVATE, session_id, hook)
+    }
+
+    fn deactivate_feature_hook(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        self.feature_hook_call(py, OP_FEATURE_HOOK_DEACTIVATE, session_id, hook)
+    }
+
+    fn heartbeat_feature_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_HOOK_HEARTBEAT_ALL,
+            FeatureHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_FEATURE_HOOK_HEARTBEAT_ALL, request)
+    }
+
+    fn read_feature_hook_export(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        export: &str,
+    ) -> PyResult<u64> {
+        let request = serialize_request(
+            OP_FEATURE_HOOK_READ_EXPORT,
+            FeatureHookExportRequest {
+                session_id: ProcessSessionId(session_id),
+                export: parse_feature_export(export).map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        let response = self.call_value(py, OP_FEATURE_HOOK_READ_EXPORT, request)?;
+        let response: FeatureHookExportResponse =
+            serde_json::from_value(response).map_err(|error| {
+                BindingError::serialization(OP_FEATURE_HOOK_READ_EXPORT, error).into_pyerr(py)
+            })?;
+        parse_hex_u64(&response.address, OP_FEATURE_HOOK_READ_EXPORT)
+            .map_err(|error| error.into_pyerr(py))
+    }
+
+    fn set_feature_mouse_position(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        x: i32,
+        y: i32,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_MOUSE_POSITION,
+            FeatureMousePositionRequest {
+                session_id: ProcessSessionId(session_id),
+                x,
+                y,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_FEATURE_MOUSE_POSITION, request)
+    }
+
+    #[pyo3(signature = (
+        session_id,
+        object_address,
+        position,
+        *,
+        wait_on_inuse = true,
+        wait_timeout_ms = 1000,
+        purge_after_timeout = true,
+        purge_timeout_ms = 600
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn feature_teleport(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        object_address: String,
+        position: (f32, f32, f32),
+        wait_on_inuse: bool,
+        wait_timeout_ms: u32,
+        purge_after_timeout: bool,
+        purge_timeout_ms: u32,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_TELEPORT,
+            FeatureTeleportRequest {
+                session_id: ProcessSessionId(session_id),
+                object_address,
+                position: [position.0, position.1, position.2],
+                wait_on_inuse,
+                wait_timeout_ms,
+                purge_after_timeout,
+                purge_timeout_ms,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_FEATURE_TELEPORT, request)
+    }
+
+    fn feature_send_chat(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        message: String,
+        target_gid: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_CHAT_SEND,
+            FeatureChatSendRequest {
+                session_id: ProcessSessionId(session_id),
+                message,
+                target_gid,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_FEATURE_CHAT_SEND, request)
+    }
+
+    fn feature_add_buddy(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        target_gid: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_BUDDY_ADD,
+            FeatureBuddyAddRequest {
+                session_id: ProcessSessionId(session_id),
+                target_gid,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_FEATURE_BUDDY_ADD, request)
+    }
 }
 
 impl PyAgentManager {
+    fn feature_hook_call(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        session_id: String,
+        hook: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            operation,
+            FeatureHookRequest {
+                session_id: ProcessSessionId(session_id),
+                hook: parse_feature_hook(hook, operation).map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, operation, request)
+    }
+
     fn core_hook_call(
         &self,
         py: Python<'_>,

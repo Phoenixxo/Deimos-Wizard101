@@ -562,6 +562,20 @@ class Client:
                 timeout=wait_on_inuse_timeout,
             )
 
+        if getattr(self.hook_handler._backend, "supports_feature_hooks", False):
+            await self.hook_handler.run_in_executor(
+                self.hook_handler._backend.feature_teleport,
+                object_address,
+                (xyz.x, xyz.y, xyz.z),
+                wait_on_inuse=wait_on_inuse,
+                wait_timeout_ms=max(0, int(wait_on_inuse_timeout * 1000)),
+                purge_after_timeout=purge_on_after_unuser_fixer,
+                purge_timeout_ms=max(
+                    0, int(purge_on_after_unuser_fixer_timeout * 1000)
+                ),
+            )
+            return
+
         jes = await self._get_je_instruction_forward_backwards()
 
         await self._teleport_helper.write_target_object_address(object_address)
