@@ -12,6 +12,7 @@ on:
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
       - "scripts/test-deimos-telemetry-live.py"
+      - "scripts/test-deimos-window-input-live.py"
       - "tests/client_discovery/**"
       - "tests/memory_adapter/**"
       - "tests/hooks/**"
@@ -27,6 +28,7 @@ on:
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
       - "scripts/test-deimos-telemetry-live.py"
+      - "scripts/test-deimos-window-input-live.py"
       - "tests/client_discovery/**"
       - "tests/memory_adapter/**"
       - "tests/hooks/**"
@@ -63,6 +65,7 @@ jobs:
           python -m py_compile
           scripts/test-deimos-native-live.py
           scripts/test-deimos-telemetry-live.py
+          scripts/test-deimos-window-input-live.py
 
       - name: Run portable WizWalker tests
         run: |
@@ -145,6 +148,22 @@ jobs:
           cp "./target/${{ matrix.target }}/release/libdeimos_native.dylib" "$RUNNER_TEMP/deimos_native$suffix"
           PYTHONPATH="$RUNNER_TEMP" python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager')"
           echo "PYTHONPATH=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Upload Wine agent
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deimos-agent-${{ github.sha }}
+          path: ./target/${{ matrix.target }}/release/deimos-agent.exe
+          if-no-files-found: error
+
+      - name: Upload macOS native extension
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deimos-native-macos-${{ github.sha }}
+          path: ${{ runner.temp }}/deimos_native*.so
+          if-no-files-found: error
 
       - name: Run WizWalker compatibility tests
         env:

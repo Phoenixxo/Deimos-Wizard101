@@ -2,15 +2,17 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
 
+use deimos_core::client::{KeyAction, MessageDelivery, MouseButton, WindowPoint, WindowRectangle};
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     classify_process, ModuleDescriptor, ProcessAccessMode, ProcessDescriptor, ProcessIdentity,
 };
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, ERROR_NO_MORE_FILES, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND,
     LPARAM, RECT, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::Debug::{
     FlushInstructionCache, GetThreadContext, ReadProcessMemory, WriteProcessMemory, CONTEXT,
     CONTEXT_CONTROL_AMD64,
@@ -35,13 +37,17 @@ use windows::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostMessageW, SendMessageW,
+    SetForegroundWindow, SetWindowTextW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::process::{
-    enumerate_modules_with_revalidation, ClientWindowCandidate, MemoryBackend, MutationBackend,
-    OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
-    ProcessThreadResume, RemoteThreadPoll, StartedRemoteThread, SuspendedProcess,
+    enumerate_modules_with_revalidation, ClientWindowCandidate, ClientWindowSnapshot,
+    ClientWindowTarget, MemoryBackend, MutationBackend, OpenedProcess, ProcessBackend,
+    ProcessBackendError, ProcessBackendErrorKind, ProcessThreadResume, RemoteThreadPoll,
+    StartedRemoteThread, SuspendedProcess,
 };
 
 const MAX_EXECUTABLE_PATH: usize = 32_768;
@@ -255,6 +261,232 @@ impl ProcessBackend for WindowsProcessBackend {
             enumerate_modules(expected.pid)
         })
     }
+
+    fn inspect_client_window(
+        &self,
+        target: &ClientWindowTarget,
+    ) -> Result<ClientWindowSnapshot, ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let title_length = unsafe { GetWindowTextLengthW(hwnd) };
+        let mut title = vec![0u16; title_length.max(0) as usize + 1];
+        let copied = unsafe { GetWindowTextW(hwnd, &mut title) };
+        title.truncate(copied.max(0) as usize);
+        let mut rectangle = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rectangle) }
+            .map_err(|error| native_error("GetWindowRect failed for Wizard101 client", error))?;
+        Ok(ClientWindowSnapshot {
+            title: String::from_utf16_lossy(&title),
+            is_foreground: unsafe { GetForegroundWindow() } == hwnd,
+            rectangle: WindowRectangle {
+                left: rectangle.left,
+                top: rectangle.top,
+                right: rectangle.right,
+                bottom: rectangle.bottom,
+            },
+        })
+    }
+
+    fn focus_client_window(
+        &self,
+        target: &ClientWindowTarget,
+    ) -> Result<bool, ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+            return Err(last_error(
+                "SetForegroundWindow could not focus the selected Wizard101 client",
+            ));
+        }
+        Ok(unsafe { GetForegroundWindow() } == hwnd)
+    }
+
+    fn set_client_window_title(
+        &self,
+        target: &ClientWindowTarget,
+        title: &str,
+    ) -> Result<(), ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let mut wide = title.encode_utf16().collect::<Vec<_>>();
+        wide.push(0);
+        unsafe { SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())) }.map_err(|error| {
+            native_error(
+                "SetWindowTextW failed for the selected Wizard101 client",
+                error,
+            )
+        })
+    }
+
+    fn client_to_screen(
+        &self,
+        target: &ClientWindowTarget,
+        point: WindowPoint,
+    ) -> Result<WindowPoint, ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let mut point = windows::Win32::Foundation::POINT {
+            x: point.x,
+            y: point.y,
+        };
+        if !unsafe { ClientToScreen(hwnd, &mut point) }.as_bool() {
+            return Err(last_error(
+                "ClientToScreen failed for the selected Wizard101 client",
+            ));
+        }
+        Ok(WindowPoint {
+            x: point.x,
+            y: point.y,
+        })
+    }
+
+    fn screen_to_client(
+        &self,
+        target: &ClientWindowTarget,
+        point: WindowPoint,
+    ) -> Result<WindowPoint, ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let mut point = windows::Win32::Foundation::POINT {
+            x: point.x,
+            y: point.y,
+        };
+        if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() {
+            return Err(last_error(
+                "ScreenToClient failed for the selected Wizard101 client",
+            ));
+        }
+        Ok(WindowPoint {
+            x: point.x,
+            y: point.y,
+        })
+    }
+
+    fn send_client_key_event(
+        &self,
+        target: &ClientWindowTarget,
+        virtual_key: u16,
+        action: KeyAction,
+        delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let message = match action {
+            KeyAction::Down => WM_KEYDOWN,
+            KeyAction::Up => WM_KEYUP,
+        };
+        send_window_message(
+            hwnd,
+            message,
+            windows::Win32::Foundation::WPARAM(usize::from(virtual_key)),
+            LPARAM(0),
+            delivery,
+        )
+    }
+
+    fn send_client_mouse_move(
+        &self,
+        target: &ClientWindowTarget,
+        point: WindowPoint,
+        delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        send_window_message(
+            hwnd,
+            WM_MOUSEMOVE,
+            windows::Win32::Foundation::WPARAM(0),
+            point_lparam(point),
+            delivery,
+        )
+    }
+
+    fn send_client_mouse_button(
+        &self,
+        target: &ClientWindowTarget,
+        point: WindowPoint,
+        button: MouseButton,
+        pressed: bool,
+        delivery: MessageDelivery,
+    ) -> Result<(), ProcessBackendError> {
+        let hwnd = validate_client_window(target)?;
+        let (message, flags) = match (button, pressed) {
+            (MouseButton::Left, true) => (WM_LBUTTONDOWN, 0x0001usize),
+            (MouseButton::Left, false) => (WM_LBUTTONUP, 0usize),
+            (MouseButton::Right, true) => (WM_RBUTTONDOWN, 0x0002usize),
+            (MouseButton::Right, false) => (WM_RBUTTONUP, 0usize),
+        };
+        send_window_message(
+            hwnd,
+            message,
+            windows::Win32::Foundation::WPARAM(flags),
+            point_lparam(point),
+            delivery,
+        )
+    }
+}
+
+fn validate_client_window(target: &ClientWindowTarget) -> Result<HWND, ProcessBackendError> {
+    let hwnd = HWND(target.native_window_id as usize as *mut c_void);
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::NotFound,
+            "the selected Wizard101 window has closed",
+        ));
+    }
+
+    let mut pid = 0u32;
+    if unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } == 0
+        || pid != target.process_identity.pid
+    {
+        return Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::IdentityMismatch,
+            "the selected window no longer belongs to the expected Wizard101 process",
+        ));
+    }
+
+    let handle = open_query_handle(pid)?;
+    let identity = process_identity(handle.0, pid)?;
+    if identity.creation_time_100ns != target.process_identity.creation_time_100ns
+        || !identity
+            .executable_path
+            .eq_ignore_ascii_case(&target.process_identity.executable_path)
+    {
+        return Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::IdentityMismatch,
+            "the selected Wizard101 window was replaced by another process",
+        ));
+    }
+
+    let mut class_name = [0u16; 256];
+    let class_length = unsafe { GetClassNameW(hwnd, &mut class_name) };
+    if class_length == 0
+        || String::from_utf16_lossy(&class_name[..class_length as usize]) != WIZARD_WINDOW_CLASS
+    {
+        return Err(ProcessBackendError::new(
+            ProcessBackendErrorKind::IdentityMismatch,
+            "the selected window is no longer a Wizard101 game client",
+        ));
+    }
+    Ok(hwnd)
+}
+
+fn send_window_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+    delivery: MessageDelivery,
+) -> Result<(), ProcessBackendError> {
+    match delivery {
+        MessageDelivery::Send => {
+            unsafe {
+                SendMessageW(hwnd, message, wparam, lparam);
+            }
+            Ok(())
+        }
+        MessageDelivery::Post => unsafe { PostMessageW(hwnd, message, wparam, lparam) }
+            .map_err(|error| native_error("PostMessageW failed for Wizard101 input", error)),
+    }
+}
+
+fn point_lparam(point: WindowPoint) -> LPARAM {
+    let x = point.x as i16 as u16 as u32;
+    let y = point.y as i16 as u16 as u32;
+    LPARAM((x | (y << 16)) as isize)
 }
 
 fn enumerate_client_windows() -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {

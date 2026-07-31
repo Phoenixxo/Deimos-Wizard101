@@ -38,7 +38,7 @@ mod tests {
     use pyo3::types::PyModule;
 
     #[test]
-    fn python_module_registers_the_managed_read_only_api() {
+    fn python_module_registers_the_managed_agent_api() {
         Python::with_gil(|py| {
             let module =
                 PyModule::new_bound(py, "deimos_native").expect("test module should be created");
@@ -53,6 +53,8 @@ mod tests {
                 "AgentProtocolError",
                 "ProcessError",
                 "MemoryError",
+                "WindowError",
+                "InputError",
                 "NativePanicError",
             ] {
                 assert!(
@@ -81,6 +83,16 @@ mod tests {
                 "stop",
                 "capabilities",
                 "list_clients",
+                "client_window_state",
+                "focus_client_window",
+                "set_client_window_title",
+                "client_to_screen",
+                "key_down",
+                "key_up",
+                "send_key",
+                "send_hotkey",
+                "move_mouse",
+                "click_mouse",
                 "list_processes",
                 "open_process",
                 "process_status",

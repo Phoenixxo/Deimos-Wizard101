@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use deimos_core::client::CAPABILITY_CLIENT_DISCOVERY;
+use deimos_core::client::{
+    CAPABILITY_CLIENT_DISCOVERY, CAPABILITY_CLIENT_INPUT, CAPABILITY_CLIENT_WINDOW,
+};
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -29,7 +31,7 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
 ];
-const REQUESTED_AGENT_CAPABILITIES: [&str; 9] = [
+const REQUESTED_AGENT_CAPABILITIES: [&str; 11] = [
     CAPABILITY_AGENT_LIFECYCLE,
     CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
@@ -39,6 +41,8 @@ const REQUESTED_AGENT_CAPABILITIES: [&str; 9] = [
     CAPABILITY_MEMORY_HOOK,
     CAPABILITY_CORE_HOOK,
     CAPABILITY_FEATURE_HOOK,
+    CAPABILITY_CLIENT_WINDOW,
+    CAPABILITY_CLIENT_INPUT,
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]

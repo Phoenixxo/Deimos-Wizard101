@@ -6,9 +6,178 @@ import threading
 from functools import partial
 from typing import Any
 
-from .errors import UnsupportedClientOperation
 from .memory import DeimosNativeMemoryBackend, MemoryReader
 from .telemetry import ReadOnlyTelemetryReader, ReadOnlyTelemetrySnapshot
+
+
+class WindowRectangle:
+    def __init__(self, x1: int, y1: int, x2: int, y2: int):
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+
+    def __iter__(self):
+        return iter((self.x1, self.x2, self.y1, self.y2))
+
+    def __repr__(self) -> str:
+        return f"<Rectangle ({self.x1}, {self.y1}, {self.x2}, {self.y2})>"
+
+    def center(self) -> tuple[int, int]:
+        return (
+            ((self.x2 - self.x1) // 2) + self.x1,
+            ((self.y2 - self.y1) // 2) + self.y1,
+        )
+
+    def scale_to_client(self, parents, factor: float) -> "WindowRectangle":
+        x1_sum = self.x1 + sum(parent.x1 for parent in parents)
+        y1_sum = self.y1 + sum(parent.y1 for parent in parents)
+        return type(self)(
+            int(x1_sum * factor),
+            int(y1_sum * factor),
+            int(((self.x2 - self.x1) * factor) + (x1_sum * factor)),
+            int(((self.y2 - self.y1) * factor) + (y1_sum * factor)),
+        )
+
+
+class NativeMouseHandler:
+    def __init__(self, client: "DiscoveredClient"):
+        self.client = client
+        self.click_lock: asyncio.Lock | None = None
+        self.click_predelay = 0.02
+        self._ref_lock: asyncio.Lock | None = None
+        self._ref_count = 0
+
+    async def __aenter__(self):
+        if self._ref_lock is None:
+            self._ref_lock = asyncio.Lock()
+        async with self._ref_lock:
+            if self._ref_count == 0:
+                await self._activate_mouseless()
+            self._ref_count += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._ref_lock is None:
+            self._ref_lock = asyncio.Lock()
+        async with self._ref_lock:
+            self._ref_count -= 1
+            if self._ref_count == 0:
+                await self._deactivate_mouseless()
+
+    async def _activate_mouseless(self) -> None:
+        handler, created = await self.client._ensure_hook_handler()
+        try:
+            if "mouseless_cursor" not in handler._active_hooks.values():
+                await handler.activate_mouseless_cursor_hook()
+        except BaseException:
+            if created and handler is self.client.hook_handler:
+                session_id = self.client._detach_hook_session()
+                if session_id is not None:
+                    await self.client._close_session(session_id)
+            raise
+
+    async def _deactivate_mouseless(self) -> None:
+        if (
+            self.client.hook_handler is not None
+            and "mouseless_cursor" in self.client.hook_handler._active_hooks.values()
+        ):
+            await self.client.hook_handler.deactivate_mouseless_cursor_hook()
+
+    async def activate_mouseless(self) -> None:
+        if self._ref_lock is not None or self._ref_count > 0:
+            raise RuntimeError("You can't mix managed mouseless with unmanaged mouseless")
+        await self._activate_mouseless()
+
+    async def deactivate_mouseless(self) -> None:
+        if self._ref_lock is not None or self._ref_count > 0:
+            raise RuntimeError("You can't mix managed mouseless with unmanaged mouseless")
+        await self._deactivate_mouseless()
+
+    async def set_mouse_position_to_window(self, window, **kwargs) -> None:
+        scaled_rect = await window.scale_to_client()
+        await self.set_mouse_position(*scaled_rect.center(), **kwargs)
+
+    async def click_window(self, window, **kwargs) -> None:
+        scaled_rect = await window.scale_to_client()
+        await self.click(*scaled_rect.center(), **kwargs)
+
+    async def click_window_with_name(self, name: str, **kwargs) -> None:
+        possible_windows = await self.client.root_window.get_windows_with_name(name)
+        if not possible_windows:
+            raise ValueError(f"Window with name {name} not found.")
+        if len(possible_windows) > 1:
+            raise ValueError(f"Multiple windows with name {name}.")
+        await self.click_window(possible_windows[0], **kwargs)
+
+    async def set_mouse_position(
+        self,
+        x: int,
+        y: int,
+        *,
+        convert_from_client: bool = True,
+        use_post: bool = False,
+    ):
+        if self.client.hook_handler is None:
+            raise RuntimeError(
+                "Mouseless input is not active. Use the mouse handler as an async context manager."
+            )
+        screen_x, screen_y = x, y
+        if convert_from_client:
+            response = await self.client._agent_call(
+                self.client._agent_manager.client_to_screen,
+                self.client.client_id,
+                x,
+                y,
+            )
+            point = response.get("point") if isinstance(response, dict) else None
+            if not isinstance(point, dict) or not all(
+                isinstance(point.get(axis), int) for axis in ("x", "y")
+            ):
+                raise ValueError(
+                    "The native agent returned an invalid client-to-screen coordinate."
+                )
+            screen_x, screen_y = point["x"], point["y"]
+        result = await self.client.hook_handler.write_mouse_position(screen_x, screen_y)
+        await self.client._agent_call(
+            partial(
+                self.client._agent_manager.move_mouse,
+                convert_from_client=convert_from_client,
+                use_post=use_post,
+            ),
+            self.client.client_id,
+            x,
+            y,
+        )
+        return result
+
+    async def click(
+        self,
+        x: int,
+        y: int,
+        *,
+        right_click: bool = False,
+        sleep_duration: float = 0.0,
+        use_post: bool = False,
+    ) -> None:
+        if self.click_lock is None:
+            self.click_lock = asyncio.Lock()
+        async with self.click_lock:
+            await self.set_mouse_position(x, y, use_post=use_post)
+            await asyncio.sleep(self.click_predelay)
+            await self.client._agent_call(
+                partial(
+                    self.client._agent_manager.click_mouse,
+                    right_click=right_click,
+                    sleep_duration=sleep_duration,
+                    convert_from_client=True,
+                    use_post=use_post,
+                ),
+                self.client.client_id,
+                x,
+                y,
+            )
+            await self.set_mouse_position(-100, -100, use_post=use_post)
 
 
 class DiscoveredClient:
@@ -26,6 +195,7 @@ class DiscoveredClient:
         self._last_session_cleanup_error: BaseException | None = None
         self._attach_lock = asyncio.Lock()
         self._hook_attach_lock = asyncio.Lock()
+        self._mouse_handler = NativeMouseHandler(self)
         self._update(descriptor)
 
     def _update(self, descriptor: dict[str, Any]) -> None:
@@ -48,18 +218,88 @@ class DiscoveredClient:
         self.client_id = client_id
         self.process = process
         self.process_id = process["pid"]
-        self.is_foreground = bool(descriptor.get("is_foreground", False))
+        self._is_foreground = bool(descriptor.get("is_foreground", False))
         self.screen_order = int(descriptor.get("screen_order", 0))
         self._running = True
 
     def _mark_closed(self) -> None:
         self._running = False
-        self.is_foreground = False
+        self._is_foreground = False
         self._schedule_session_close(self._detach_session())
         self._schedule_session_close(self._detach_hook_session())
 
     def is_running(self) -> bool:
         return self._running
+
+    def _window_state(self) -> dict[str, Any]:
+        response = self._agent_manager.client_window_state(self.client_id)
+        if not isinstance(response, dict):
+            raise ValueError("The native agent returned an invalid window state response.")
+        return response
+
+    @property
+    def title(self) -> str:
+        title = self._window_state().get("title")
+        if not isinstance(title, str):
+            raise ValueError("The native agent returned an invalid window title.")
+        return title
+
+    @title.setter
+    def title(self, value: str) -> None:
+        self._agent_manager.set_client_window_title(self.client_id, value)
+
+    @property
+    def is_foreground(self) -> bool:
+        is_foreground = self._window_state().get("is_foreground")
+        if not isinstance(is_foreground, bool):
+            raise ValueError("The native agent returned an invalid foreground state.")
+        self._is_foreground = is_foreground
+        return is_foreground
+
+    @is_foreground.setter
+    def is_foreground(self, value: bool) -> None:
+        if value:
+            response = self._agent_manager.focus_client_window(self.client_id)
+            if not isinstance(response, dict) or response.get("is_foreground") is not True:
+                raise RuntimeError("The native agent could not focus this Wizard101 client.")
+            self._is_foreground = True
+
+    @property
+    def window_rectangle(self) -> WindowRectangle:
+        rectangle = self._window_state().get("rectangle")
+        if not isinstance(rectangle, dict) or not all(
+            isinstance(rectangle.get(edge), int)
+            for edge in ("left", "top", "right", "bottom")
+        ):
+            raise ValueError("The native agent returned an invalid window rectangle.")
+        return WindowRectangle(
+            rectangle["right"],
+            rectangle["top"],
+            rectangle["left"],
+            rectangle["bottom"],
+        )
+
+    async def _agent_call(self, call, *args):
+        return await asyncio.get_running_loop().run_in_executor(None, partial(call, *args))
+
+    async def send_key(self, key, seconds: float = 0):
+        virtual_key = int(getattr(key, "value", key))
+        return await self._agent_call(
+            self._agent_manager.send_key,
+            self.client_id,
+            virtual_key,
+            seconds,
+        )
+
+    async def send_hotkey(self, modifiers, key):
+        modifier_values = [int(getattr(modifier, "value", modifier)) for modifier in modifiers]
+        virtual_key = int(getattr(key, "value", key))
+        return await self._agent_call(
+            self._agent_manager.send_hotkey,
+            self.client_id,
+            modifier_values,
+            virtual_key,
+        )
 
     def _expected_identity(self) -> dict[str, Any]:
         identity = self.process.get("identity")
@@ -214,24 +454,18 @@ class DiscoveredClient:
             process_id=self.process_id,
         )
 
-    async def activate_hooks(self, wait_for_ready: bool = True) -> None:
-        """Open a mutation session and activate the core hooks."""
+    async def _ensure_hook_handler(self):
+        """Open an identity-checked mutation session without activating hooks."""
         if not self._running:
             raise RuntimeError(
                 "This Wizard101 client has closed. Rediscover it before activating hooks."
             )
         if self.hook_handler is not None:
-            await self.hook_handler.activate_all_hooks(
-                wait_for_ready=wait_for_ready
-            )
-            return
+            return self.hook_handler, False
 
         async with self._hook_attach_lock:
             if self.hook_handler is not None:
-                await self.hook_handler.activate_all_hooks(
-                    wait_for_ready=wait_for_ready
-                )
-                return
+                return self.hook_handler, False
             session_generation = self._session_generation
             process_id = self.process_id
             identity_json = json.dumps(
@@ -271,32 +505,41 @@ class DiscoveredClient:
                 DeimosNativeMemoryBackend(self._agent_manager, session_id),
                 self,
             )
-            try:
-                await handler.activate_all_hooks(wait_for_ready=wait_for_ready)
-                if (
-                    not self._running
-                    or session_generation != self._session_generation
-                    or process_id != self.process_id
-                ):
-                    if not self._running:
-                        raise RuntimeError(
-                            "This Wizard101 client closed while its core hooks "
-                            "were activating."
-                        )
-                    raise RuntimeError(
-                        "The Wizard101 client changed identity while its core hooks "
-                        "were activating. Rediscover it and try again."
-                    )
-            except BaseException:
-                handler.cancel_core_hook_heartbeat()
-                await self._close_session(session_id)
-                raise
             self._hook_session_id = session_id
             self.hook_handler = handler
+            return handler, True
+
+    async def activate_hooks(self, wait_for_ready: bool = True) -> None:
+        """Open a mutation session and activate the core hooks."""
+        session_generation = self._session_generation
+        process_id = self.process_id
+        handler, created = await self._ensure_hook_handler()
+        try:
+            await handler.activate_all_hooks(wait_for_ready=wait_for_ready)
+            if (
+                not self._running
+                or session_generation != self._session_generation
+                or process_id != self.process_id
+                or handler is not self.hook_handler
+            ):
+                if not self._running:
+                    raise RuntimeError(
+                        "This Wizard101 client closed while its core hooks were activating."
+                    )
+                raise RuntimeError(
+                    "The Wizard101 client changed identity while its core hooks "
+                    "were activating. Rediscover it and try again."
+                )
+        except BaseException:
+            if created and handler is self.hook_handler:
+                session_id = self._detach_hook_session()
+                if session_id is not None:
+                    await self._close_session(session_id)
+            raise
 
     @property
     def mouse_handler(self):
-        raise UnsupportedClientOperation("mouseless input")
+        return self._mouse_handler
 
     async def close(self) -> None:
         hook_handler = self.hook_handler

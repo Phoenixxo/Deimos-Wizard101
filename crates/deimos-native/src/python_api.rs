@@ -4,7 +4,15 @@ use std::sync::Mutex;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
-use deimos_core::client::{ListClientsRequest, OP_CLIENT_LIST};
+use deimos_core::client::{
+    ClientId, ClientKeyCombinationRequest, ClientKeyEventRequest, ClientMouseClickRequest,
+    ClientMouseMoveRequest, ClientTimedKeyRequest, ClientToScreenRequest, ClientWindowRequest,
+    ClientWindowSetTitleRequest, CoordinateSpace, KeyAction, ListClientsRequest, MessageDelivery,
+    MouseButton, WindowPoint, MAX_INPUT_DURATION_MS, OP_CLIENT_KEY_COMBINATION,
+    OP_CLIENT_KEY_EVENT, OP_CLIENT_LIST, OP_CLIENT_MOUSE_CLICK, OP_CLIENT_MOUSE_MOVE,
+    OP_CLIENT_TIMED_KEY, OP_CLIENT_TO_SCREEN, OP_CLIENT_WINDOW_FOCUS, OP_CLIENT_WINDOW_SET_TITLE,
+    OP_CLIENT_WINDOW_STATE,
+};
 use deimos_core::memory::{
     ByteOrder, CoreHook, CoreHookBaseResponse, CoreHookRequest, CoreHookSessionRequest,
     FeatureBuddyAddRequest, FeatureChatSendRequest, FeatureHook, FeatureHookExport,
@@ -47,6 +55,8 @@ create_exception!(deimos_native, AgentLifecycleError, DeimosNativeError);
 create_exception!(deimos_native, AgentProtocolError, DeimosNativeError);
 create_exception!(deimos_native, ProcessError, AgentProtocolError);
 create_exception!(deimos_native, MemoryError, AgentProtocolError);
+create_exception!(deimos_native, WindowError, AgentProtocolError);
+create_exception!(deimos_native, InputError, AgentProtocolError);
 create_exception!(deimos_native, NativePanicError, DeimosNativeError);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -219,6 +229,12 @@ impl BindingError {
                     PyErr::new::<ProcessError, _>(user_message)
                 } else if code.starts_with("memory_") {
                     PyErr::new::<MemoryError, _>(user_message)
+                } else if code.starts_with("input_")
+                    || (code == "client_not_found" && operation.starts_with("client.input."))
+                {
+                    PyErr::new::<InputError, _>(user_message)
+                } else if code.starts_with("window_") || code == "client_not_found" {
+                    PyErr::new::<WindowError, _>(user_message)
                 } else {
                     PyErr::new::<AgentProtocolError, _>(user_message)
                 };
@@ -285,6 +301,10 @@ fn configuration_user_message(code: &str, details: &Value) -> String {
         }
         "invalid_timeout" => {
             "The agent timeout must be greater than zero milliseconds.".to_string()
+        }
+        "invalid_input_duration" => {
+            "Input durations must be finite, non-negative, and no longer than 30 seconds."
+                .to_string()
         }
         "wine_configuration" => match details.get("kind").and_then(Value::as_str) {
             Some("InvalidConfiguration") => {
@@ -403,6 +423,15 @@ fn protocol_user_message(code: &RpcErrorCode) -> &'static str {
         }
         RpcErrorCode::SessionNotFound => {
             "This Wizard101 connection is no longer valid. Reconnect to the game and try again."
+        }
+        RpcErrorCode::ClientNotFound => {
+            "That Wizard101 window closed or was replaced. Rediscover the client and try again."
+        }
+        RpcErrorCode::WindowOperationFailed => {
+            "Deimos could not update the selected Wizard101 window. Make sure the game is still running in the same Wine bottle and try again."
+        }
+        RpcErrorCode::InputFailed => {
+            "Deimos could not deliver input to the selected Wizard101 client. Rediscover the client and try again."
         }
         RpcErrorCode::MemoryInvalidAddress => {
             "That memory address is not valid for the connected Wizard101 process. Refresh the game state and try again."
@@ -827,6 +856,197 @@ impl PyAgentManager {
         let request = serialize_request(OP_CLIENT_LIST, ListClientsRequest::default())
             .map_err(|error| error.into_pyerr(py))?;
         self.call_as_python(py, OP_CLIENT_LIST, request)
+    }
+
+    fn client_window_state(&self, py: Python<'_>, client_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_WINDOW_STATE,
+            ClientWindowRequest {
+                client_id: ClientId(client_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_WINDOW_STATE, request)
+    }
+
+    fn focus_client_window(&self, py: Python<'_>, client_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_WINDOW_FOCUS,
+            ClientWindowRequest {
+                client_id: ClientId(client_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_WINDOW_FOCUS, request)
+    }
+
+    fn set_client_window_title(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        title: String,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_WINDOW_SET_TITLE,
+            ClientWindowSetTitleRequest {
+                client_id: ClientId(client_id),
+                title,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_WINDOW_SET_TITLE, request)
+    }
+
+    fn client_to_screen(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        x: i32,
+        y: i32,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_TO_SCREEN,
+            ClientToScreenRequest {
+                client_id: ClientId(client_id),
+                point: WindowPoint { x, y },
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_TO_SCREEN, request)
+    }
+
+    #[pyo3(signature = (client_id, virtual_key, *, use_post = false))]
+    fn key_down(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        virtual_key: u16,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.key_event(py, client_id, virtual_key, KeyAction::Down, use_post)
+    }
+
+    #[pyo3(signature = (client_id, virtual_key, *, use_post = false))]
+    fn key_up(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        virtual_key: u16,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.key_event(py, client_id, virtual_key, KeyAction::Up, use_post)
+    }
+
+    #[pyo3(signature = (client_id, virtual_key, seconds = 0.0, *, use_post = false))]
+    fn send_key(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        virtual_key: u16,
+        seconds: f64,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let duration_ms = seconds_to_milliseconds(seconds, "key duration")
+            .map_err(|error| error.into_pyerr(py))?;
+        let request = serialize_request(
+            OP_CLIENT_TIMED_KEY,
+            ClientTimedKeyRequest {
+                client_id: ClientId(client_id),
+                virtual_key,
+                duration_ms,
+                delivery: delivery(use_post),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_TIMED_KEY, request)
+    }
+
+    #[pyo3(signature = (client_id, modifiers, virtual_key, *, use_post = false))]
+    fn send_hotkey(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        modifiers: Vec<u16>,
+        virtual_key: u16,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_KEY_COMBINATION,
+            ClientKeyCombinationRequest {
+                client_id: ClientId(client_id),
+                modifiers,
+                virtual_key,
+                delivery: delivery(use_post),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_KEY_COMBINATION, request)
+    }
+
+    #[pyo3(signature = (client_id, x, y, *, convert_from_client = true, use_post = false))]
+    fn move_mouse(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        x: i32,
+        y: i32,
+        convert_from_client: bool,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_MOUSE_MOVE,
+            ClientMouseMoveRequest {
+                client_id: ClientId(client_id),
+                point: WindowPoint { x, y },
+                coordinate_space: coordinate_space(convert_from_client),
+                delivery: delivery(use_post),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_MOUSE_MOVE, request)
+    }
+
+    #[pyo3(signature = (
+        client_id,
+        x,
+        y,
+        *,
+        right_click = false,
+        sleep_duration = 0.0,
+        convert_from_client = true,
+        use_post = false
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn click_mouse(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        x: i32,
+        y: i32,
+        right_click: bool,
+        sleep_duration: f64,
+        convert_from_client: bool,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let hold_ms = seconds_to_milliseconds(sleep_duration, "mouse button duration")
+            .map_err(|error| error.into_pyerr(py))?;
+        let request = serialize_request(
+            OP_CLIENT_MOUSE_CLICK,
+            ClientMouseClickRequest {
+                client_id: ClientId(client_id),
+                point: WindowPoint { x, y },
+                coordinate_space: coordinate_space(convert_from_client),
+                button: if right_click {
+                    MouseButton::Right
+                } else {
+                    MouseButton::Left
+                },
+                hold_ms,
+                delivery: delivery(use_post),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_MOUSE_CLICK, request)
     }
 
     #[pyo3(signature = (names = None))]
@@ -1267,6 +1487,27 @@ impl PyAgentManager {
 }
 
 impl PyAgentManager {
+    fn key_event(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        virtual_key: u16,
+        action: KeyAction,
+        use_post: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CLIENT_KEY_EVENT,
+            ClientKeyEventRequest {
+                client_id: ClientId(client_id),
+                virtual_key,
+                action,
+                delivery: delivery(use_post),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_CLIENT_KEY_EVENT, request)
+    }
+
     fn feature_hook_call(
         &self,
         py: Python<'_>,
@@ -1354,6 +1595,39 @@ impl PyAgentManager {
     }
 }
 
+fn delivery(use_post: bool) -> MessageDelivery {
+    if use_post {
+        MessageDelivery::Post
+    } else {
+        MessageDelivery::Send
+    }
+}
+
+fn coordinate_space(convert_from_client: bool) -> CoordinateSpace {
+    if convert_from_client {
+        CoordinateSpace::Client
+    } else {
+        CoordinateSpace::Screen
+    }
+}
+
+fn seconds_to_milliseconds(seconds: f64, name: &str) -> Result<u32, BindingError> {
+    let maximum_seconds = f64::from(MAX_INPUT_DURATION_MS) / 1000.0;
+    if !seconds.is_finite() || seconds < 0.0 || seconds > maximum_seconds {
+        return Err(BindingError::Configuration {
+            code: "invalid_input_duration",
+            message: format!("{name} must be finite and between 0 and {maximum_seconds} seconds"),
+            details: json!({"name": name, "seconds": seconds, "maximum": maximum_seconds}),
+        });
+    }
+    let milliseconds = (seconds * 1000.0).round();
+    Ok(if seconds > 0.0 && milliseconds == 0.0 {
+        1
+    } else {
+        milliseconds as u32
+    })
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn wine_configuration_error(py: Python<'_>, error: WineRuntimeError) -> PyErr {
     BindingError::Configuration {
@@ -1434,6 +1708,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add("ProcessError", module.py().get_type_bound::<ProcessError>())?;
     module.add("MemoryError", module.py().get_type_bound::<MemoryError>())?;
+    module.add("WindowError", module.py().get_type_bound::<WindowError>())?;
+    module.add("InputError", module.py().get_type_bound::<InputError>())?;
     module.add(
         "NativePanicError",
         module.py().get_type_bound::<NativePanicError>(),
@@ -1446,7 +1722,8 @@ mod tests {
     use super::{
         agent_call_error, lifecycle_user_message, panic_message, parse_byte_order,
         parse_value_type, protocol_user_message, run_without_gil, AgentLifecycleError,
-        AgentProtocolError, BindingError, ConfigurationError, MemoryError, NativePanicError,
+        AgentProtocolError, BindingError, ConfigurationError, InputError, MemoryError,
+        NativePanicError, WindowError,
     };
     use crate::lifecycle::{AgentCallError, LifecycleError, LifecycleErrorCode};
     use deimos_core::memory::{ByteOrder, MemoryValueType};
@@ -1795,6 +2072,42 @@ mod tests {
                     .expect("technical message should be text"),
                 "read failed"
             );
+        });
+    }
+
+    #[test]
+    fn stale_client_errors_use_the_operation_specific_python_type() {
+        Python::with_gil(|py| {
+            for (operation, expect_input) in [
+                ("client.input.key_event", true),
+                ("client.window.state", false),
+            ] {
+                let native_context = NativeContext {
+                    component: "python-test".to_string(),
+                    version: "1".to_string(),
+                    native_pid: Some(42),
+                    launch_id: None,
+                };
+                let rpc_error = RpcError::new(
+                    RpcErrorCode::ClientNotFound,
+                    "client closed",
+                    17,
+                    operation,
+                    Some(native_context.clone()),
+                );
+                let error = agent_call_error(AgentCallError::Rpc {
+                    operation: operation.to_string(),
+                    native_context,
+                    source: Box::new(RpcClientError::Protocol(Box::new(rpc_error))),
+                })
+                .into_pyerr(py);
+
+                if expect_input {
+                    assert!(error.is_instance_of::<InputError>(py));
+                } else {
+                    assert!(error.is_instance_of::<WindowError>(py));
+                }
+            }
         });
     }
 

@@ -1,11 +1,20 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use deimos_core::client::{ListClientsRequest, CAPABILITY_CLIENT_DISCOVERY, OP_CLIENT_LIST};
+use deimos_core::client::{
+    ClientId, ClientKeyCombinationRequest, ClientKeyEventRequest, ClientMouseClickRequest,
+    ClientMouseMoveRequest, ClientTimedKeyRequest, ClientToScreenRequest, ClientWindowRequest,
+    ClientWindowSetTitleRequest, ListClientsRequest, CAPABILITY_CLIENT_DISCOVERY,
+    CAPABILITY_CLIENT_INPUT, CAPABILITY_CLIENT_WINDOW, OP_CLIENT_KEY_COMBINATION,
+    OP_CLIENT_KEY_EVENT, OP_CLIENT_LIST, OP_CLIENT_MOUSE_CLICK, OP_CLIENT_MOUSE_MOVE,
+    OP_CLIENT_TIMED_KEY, OP_CLIENT_TO_SCREEN, OP_CLIENT_WINDOW_FOCUS, OP_CLIENT_WINDOW_SET_TITLE,
+    OP_CLIENT_WINDOW_STATE,
+};
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -54,6 +63,7 @@ pub mod instance;
 pub mod memory;
 pub mod mutation;
 pub mod process;
+pub mod window_input;
 
 #[cfg(windows)]
 mod windows_probe;
@@ -93,6 +103,8 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_AGENT_LIFECYCLE.to_string(),
             CAPABILITY_PROBE.to_string(),
             CAPABILITY_CLIENT_DISCOVERY.to_string(),
+            CAPABILITY_CLIENT_WINDOW.to_string(),
+            CAPABILITY_CLIENT_INPUT.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
             CAPABILITY_PROCESS_MUTATION.to_string(),
@@ -251,6 +263,7 @@ pub struct AgentService<B: MutationBackend> {
     backend: B,
     identity: AgentIdentity,
     clients: Mutex<ClientRegistry>,
+    input_locks: Mutex<HashMap<ClientId, Weak<Mutex<()>>>>,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
     mutations: Mutex<mutation::MutationState<B::ThreadHandle>>,
     hooks: Mutex<hook::HookState>,
@@ -278,6 +291,7 @@ impl<B: MutationBackend> AgentService<B> {
             backend,
             identity,
             clients: Mutex::new(ClientRegistry::new()),
+            input_locks: Mutex::new(HashMap::new()),
             sessions: Mutex::new(ProcessSessionRegistry::new()),
             mutations: Mutex::new(mutation::MutationState::new()),
             hooks: Mutex::new(hook::HookState::default()),
@@ -386,6 +400,107 @@ impl<B: MutationBackend> AgentService<B> {
                         process::ProcessApiError::from_backend(error, None, None)
                             .into_rpc_error(call.request_id, &call.operation),
                     )
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_WINDOW_STATE => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_WINDOW])?;
+                let request: ClientWindowRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response = window_input::state(&mut clients, &self.backend, &request).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_WINDOW_FOCUS => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_WINDOW])?;
+                let request: ClientWindowRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response = window_input::focus(&mut clients, &self.backend, &request).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_WINDOW_SET_TITLE => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_WINDOW])?;
+                let request: ClientWindowSetTitleRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response = window_input::set_title(&mut clients, &self.backend, &request)
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_TO_SCREEN => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_WINDOW])?;
+                let request: ClientToScreenRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response =
+                    window_input::client_to_screen(&mut clients, &self.backend, &request).map_err(
+                        |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                    )?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_KEY_EVENT => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_INPUT])?;
+                let request: ClientKeyEventRequest = decode_payload(call)?;
+                let target = self.resolve_client_target(call, &request.client_id)?;
+                let input_lock = self.input_lock_for(call, &request.client_id)?;
+                let _input = lock_input(call, &input_lock)?;
+                let response =
+                    window_input::key_event(&self.backend, &target, &request).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_TIMED_KEY => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_INPUT])?;
+                let request: ClientTimedKeyRequest = decode_payload(call)?;
+                let target = self.resolve_client_target(call, &request.client_id)?;
+                let input_lock = self.input_lock_for(call, &request.client_id)?;
+                let _input = lock_input(call, &input_lock)?;
+                let response = window_input::timed_key(&self.backend, &target, &request, || {
+                    self.is_shutting_down()
+                })
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_KEY_COMBINATION => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_INPUT])?;
+                let request: ClientKeyCombinationRequest = decode_payload(call)?;
+                let target = self.resolve_client_target(call, &request.client_id)?;
+                let input_lock = self.input_lock_for(call, &request.client_id)?;
+                let _input = lock_input(call, &input_lock)?;
+                let response = window_input::key_combination(&self.backend, &target, &request)
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_MOUSE_MOVE => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_INPUT])?;
+                let request: ClientMouseMoveRequest = decode_payload(call)?;
+                let target = self.resolve_client_target(call, &request.client_id)?;
+                let input_lock = self.input_lock_for(call, &request.client_id)?;
+                let _input = lock_input(call, &input_lock)?;
+                let response = window_input::mouse_move(&self.backend, &target, &request).map_err(
+                    |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
+                )?;
+                encode_payload(call, response)
+            }
+            OP_CLIENT_MOUSE_CLICK => {
+                require_capabilities(call, capabilities, &[CAPABILITY_CLIENT_INPUT])?;
+                let request: ClientMouseClickRequest = decode_payload(call)?;
+                let target = self.resolve_client_target(call, &request.client_id)?;
+                let input_lock = self.input_lock_for(call, &request.client_id)?;
+                let _input = lock_input(call, &input_lock)?;
+                let response = window_input::mouse_click(&self.backend, &target, &request, || {
+                    self.is_shutting_down()
+                })
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
                 })?;
                 encode_payload(call, response)
             }
@@ -1015,6 +1130,39 @@ impl<B: MutationBackend> AgentService<B> {
         })
     }
 
+    fn resolve_client_target(
+        &self,
+        call: &RpcCall,
+        client_id: &ClientId,
+    ) -> Result<process::ClientWindowTarget, Box<RpcError>> {
+        let mut clients = self.lock_clients(call)?;
+        window_input::resolve(&mut clients, &self.backend, client_id)
+            .map_err(|error| Box::new(error.into_rpc_error(call.request_id, &call.operation)))
+    }
+
+    fn input_lock_for(
+        &self,
+        call: &RpcCall,
+        client_id: &ClientId,
+    ) -> Result<Arc<Mutex<()>>, Box<RpcError>> {
+        let mut locks = self.input_locks.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "client input lock registry was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(client_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(client_id.clone(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
     fn lock_mutations(
         &self,
         call: &RpcCall,
@@ -1101,6 +1249,21 @@ impl<B: MutationBackend> AgentService<B> {
         )
         .map_err(|error| io::Error::other(error.into_rpc_error(0, "hook.cleanup").message))
     }
+}
+
+fn lock_input<'a>(
+    call: &RpcCall,
+    lock: &'a Mutex<()>,
+) -> Result<std::sync::MutexGuard<'a, ()>, Box<RpcError>> {
+    lock.lock().map_err(|_| {
+        Box::new(RpcError::new(
+            RpcErrorCode::Internal,
+            "client input lock was poisoned",
+            call.request_id,
+            call.operation.clone(),
+            call.native_context.clone(),
+        ))
+    })
 }
 
 impl<B: MutationBackend> Drop for AgentService<B> {
@@ -1193,10 +1356,18 @@ mod tests {
         MAX_AGENT_CONNECTIONS,
     };
     use crate::process::{
-        ClientWindowCandidate, MemoryBackend, MutationBackend, OpenedProcess, ProcessBackend,
-        ProcessBackendError, ProcessBackendErrorKind, RemoteThreadPoll, StartedRemoteThread,
+        ClientWindowCandidate, ClientWindowSnapshot, ClientWindowTarget, MemoryBackend,
+        MutationBackend, OpenedProcess, ProcessBackend, ProcessBackendError,
+        ProcessBackendErrorKind, RemoteThreadPoll, StartedRemoteThread,
     };
-    use deimos_core::client::{ListClientsRequest, ListClientsResponse, OP_CLIENT_LIST};
+    use deimos_core::client::{
+        ClientId, ClientKeyCombinationRequest, ClientKeyEventRequest, ClientMouseMoveRequest,
+        ClientTimedKeyRequest, ClientToScreenRequest, ClientWindowRequest, CoordinateSpace,
+        KeyAction, ListClientsRequest, ListClientsResponse, MessageDelivery, WindowPoint,
+        WindowRectangle, CAPABILITY_CLIENT_INPUT, CAPABILITY_CLIENT_WINDOW,
+        OP_CLIENT_KEY_COMBINATION, OP_CLIENT_KEY_EVENT, OP_CLIENT_LIST, OP_CLIENT_MOUSE_MOVE,
+        OP_CLIENT_TIMED_KEY, OP_CLIENT_TO_SCREEN, OP_CLIENT_WINDOW_STATE,
+    };
     use deimos_core::lifecycle::{
         AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentState,
         CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -1218,7 +1389,7 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     fn test_identity() -> AgentIdentity {
@@ -1347,9 +1518,24 @@ mod tests {
         server_thread.join().expect("server should not panic");
     }
 
+    type KeyEventRecord = (u64, u16, KeyAction, MessageDelivery);
+    type MouseEventRecord = (u64, WindowPoint, MessageDelivery);
+
     #[derive(Clone)]
     struct RpcTestBackend {
         alive: Arc<AtomicBool>,
+        window_events: Arc<Mutex<Vec<KeyEventRecord>>>,
+        mouse_events: Arc<Mutex<Vec<MouseEventRecord>>>,
+    }
+
+    impl RpcTestBackend {
+        fn new(alive: Arc<AtomicBool>) -> Self {
+            Self {
+                alive,
+                window_events: Arc::new(Mutex::new(Vec::new())),
+                mouse_events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl ProcessBackend for RpcTestBackend {
@@ -1416,6 +1602,86 @@ mod tests {
             _expected: &ProcessIdentity,
         ) -> Result<Vec<ModuleDescriptor>, ProcessBackendError> {
             Ok(Vec::new())
+        }
+
+        fn inspect_client_window(
+            &self,
+            target: &ClientWindowTarget,
+        ) -> Result<ClientWindowSnapshot, ProcessBackendError> {
+            if !self.alive.load(Ordering::SeqCst) {
+                return Err(ProcessBackendError::new(
+                    ProcessBackendErrorKind::Exited,
+                    "client window closed",
+                ));
+            }
+            Ok(ClientWindowSnapshot {
+                title: format!("Wizard101 {}", target.process_identity.pid),
+                is_foreground: true,
+                rectangle: WindowRectangle {
+                    left: 20,
+                    top: 10,
+                    right: 820,
+                    bottom: 610,
+                },
+            })
+        }
+
+        fn send_client_key_event(
+            &self,
+            target: &ClientWindowTarget,
+            virtual_key: u16,
+            action: KeyAction,
+            delivery: MessageDelivery,
+        ) -> Result<(), ProcessBackendError> {
+            if !self.alive.load(Ordering::SeqCst) {
+                return Err(ProcessBackendError::new(
+                    ProcessBackendErrorKind::Exited,
+                    "client window closed",
+                ));
+            }
+            self.window_events.lock().expect("event lock").push((
+                target.native_window_id,
+                virtual_key,
+                action,
+                delivery,
+            ));
+            Ok(())
+        }
+
+        fn client_to_screen(
+            &self,
+            _target: &ClientWindowTarget,
+            point: WindowPoint,
+        ) -> Result<WindowPoint, ProcessBackendError> {
+            Ok(WindowPoint {
+                x: point.x + 20,
+                y: point.y + 10,
+            })
+        }
+
+        fn screen_to_client(
+            &self,
+            _target: &ClientWindowTarget,
+            point: WindowPoint,
+        ) -> Result<WindowPoint, ProcessBackendError> {
+            Ok(WindowPoint {
+                x: point.x - 20,
+                y: point.y - 10,
+            })
+        }
+
+        fn send_client_mouse_move(
+            &self,
+            target: &ClientWindowTarget,
+            point: WindowPoint,
+            delivery: MessageDelivery,
+        ) -> Result<(), ProcessBackendError> {
+            self.mouse_events.lock().expect("mouse event lock").push((
+                target.native_window_id,
+                point,
+                delivery,
+            ));
+            Ok(())
         }
     }
 
@@ -1539,9 +1805,7 @@ mod tests {
     #[test]
     fn client_list_returns_agent_owned_identity_without_a_native_window_handle() {
         let service = AgentService::with_identity(
-            RpcTestBackend {
-                alive: Arc::new(AtomicBool::new(true)),
-            },
+            RpcTestBackend::new(Arc::new(AtomicBool::new(true))),
             test_identity(),
         );
         let call = RpcCall {
@@ -1568,6 +1832,242 @@ mod tests {
     }
 
     #[test]
+    fn window_and_input_calls_resolve_client_ids_without_exposing_native_handles() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let backend = RpcTestBackend::new(Arc::clone(&alive));
+        let events = Arc::clone(&backend.window_events);
+        let mouse_events = Arc::clone(&backend.mouse_events);
+        let service = AgentService::with_identity(backend, test_identity());
+        let list_call = RpcCall {
+            request_id: 1,
+            operation: OP_CLIENT_LIST.to_string(),
+            payload: to_value(ListClientsRequest::default()).expect("list should serialize"),
+            native_context: None,
+        };
+        let listed: ListClientsResponse = serde_json::from_value(
+            service
+                .handle_call(&list_call)
+                .expect("client listing should succeed"),
+        )
+        .expect("client listing should deserialize");
+        let client_id = listed.clients[0].client_id.clone();
+
+        let state_call = RpcCall {
+            request_id: 2,
+            operation: OP_CLIENT_WINDOW_STATE.to_string(),
+            payload: to_value(ClientWindowRequest {
+                client_id: client_id.clone(),
+            })
+            .expect("window state should serialize"),
+            native_context: None,
+        };
+        let state = service
+            .handle_call_with_capabilities(&state_call, &[CAPABILITY_CLIENT_WINDOW.to_string()])
+            .expect("window state should succeed");
+        assert_eq!(state["title"], "Wizard101 336");
+        assert!(state.get("window_handle").is_none());
+
+        let coordinate_call = RpcCall {
+            request_id: 3,
+            operation: OP_CLIENT_TO_SCREEN.to_string(),
+            payload: to_value(ClientToScreenRequest {
+                client_id: client_id.clone(),
+                point: WindowPoint { x: 100, y: 200 },
+            })
+            .expect("coordinate request should serialize"),
+            native_context: None,
+        };
+        let coordinate = service
+            .handle_call_with_capabilities(
+                &coordinate_call,
+                &[CAPABILITY_CLIENT_WINDOW.to_string()],
+            )
+            .expect("coordinate conversion should succeed");
+        assert_eq!(coordinate["point"]["x"], 120);
+        assert_eq!(coordinate["point"]["y"], 210);
+
+        let mouse_call = RpcCall {
+            request_id: 4,
+            operation: OP_CLIENT_MOUSE_MOVE.to_string(),
+            payload: to_value(ClientMouseMoveRequest {
+                client_id: client_id.clone(),
+                point: WindowPoint { x: 120, y: 210 },
+                coordinate_space: CoordinateSpace::Screen,
+                delivery: MessageDelivery::Post,
+            })
+            .expect("mouse request should serialize"),
+            native_context: None,
+        };
+        service
+            .handle_call_with_capabilities(&mouse_call, &[CAPABILITY_CLIENT_INPUT.to_string()])
+            .expect("background mouse movement should succeed");
+        assert_eq!(
+            mouse_events.lock().expect("mouse event lock").as_slice(),
+            &[(
+                0x1234,
+                WindowPoint { x: 100, y: 200 },
+                MessageDelivery::Post
+            )]
+        );
+
+        let key_call = RpcCall {
+            request_id: 5,
+            operation: OP_CLIENT_KEY_EVENT.to_string(),
+            payload: to_value(ClientKeyEventRequest {
+                client_id: client_id.clone(),
+                virtual_key: 0x57,
+                action: KeyAction::Down,
+                delivery: MessageDelivery::Post,
+            })
+            .expect("key event should serialize"),
+            native_context: None,
+        };
+        service
+            .handle_call_with_capabilities(&key_call, &[CAPABILITY_CLIENT_INPUT.to_string()])
+            .expect("key event should succeed");
+        assert_eq!(
+            events.lock().expect("event lock").as_slice(),
+            &[(0x1234, 0x57, KeyAction::Down, MessageDelivery::Post)]
+        );
+
+        alive.store(false, Ordering::SeqCst);
+        let error = service
+            .handle_call_with_capabilities(&key_call, &[CAPABILITY_CLIENT_INPUT.to_string()])
+            .expect_err("stale client identity should fail closed");
+        assert_eq!(error.code, RpcErrorCode::ClientNotFound);
+        assert_eq!(events.lock().expect("event lock").len(), 1);
+    }
+
+    #[test]
+    fn shutdown_cancels_timed_input_and_releases_the_held_key() {
+        let backend = RpcTestBackend::new(Arc::new(AtomicBool::new(true)));
+        let events = Arc::clone(&backend.window_events);
+        let service = Arc::new(AgentService::with_identity(backend, test_identity()));
+        let list_call = RpcCall {
+            request_id: 1,
+            operation: OP_CLIENT_LIST.to_string(),
+            payload: to_value(ListClientsRequest::default()).expect("list should serialize"),
+            native_context: None,
+        };
+        let listed: ListClientsResponse = serde_json::from_value(
+            service
+                .handle_call(&list_call)
+                .expect("client listing should succeed"),
+        )
+        .expect("client listing should deserialize");
+        let call = RpcCall {
+            request_id: 2,
+            operation: OP_CLIENT_TIMED_KEY.to_string(),
+            payload: to_value(ClientTimedKeyRequest {
+                client_id: listed.clients[0].client_id.clone(),
+                virtual_key: 0x57,
+                duration_ms: 2_000,
+                delivery: MessageDelivery::Send,
+            })
+            .expect("timed key should serialize"),
+            native_context: None,
+        };
+        let worker_service = Arc::clone(&service);
+        let worker = thread::spawn(move || {
+            worker_service
+                .handle_call_with_capabilities(&call, &[CAPABILITY_CLIENT_INPUT.to_string()])
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while events.lock().expect("event lock").is_empty() && std::time::Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(!events.lock().expect("event lock").is_empty());
+        service.shutting_down.store(true, Ordering::Release);
+
+        let error = worker
+            .join()
+            .expect("timed input worker should not panic")
+            .expect_err("shutdown should cancel timed input");
+        assert_eq!(error.code, RpcErrorCode::InputFailed);
+        let events = events.lock().expect("event lock");
+        assert_eq!(events.first().map(|event| event.2), Some(KeyAction::Down));
+        assert_eq!(events.last().map(|event| event.2), Some(KeyAction::Up));
+    }
+
+    #[test]
+    fn hotkeys_release_the_primary_key_then_modifiers_in_legacy_order() {
+        let backend = RpcTestBackend::new(Arc::new(AtomicBool::new(true)));
+        let events = Arc::clone(&backend.window_events);
+        let service = AgentService::with_identity(backend, test_identity());
+        let listed: ListClientsResponse = serde_json::from_value(
+            service
+                .handle_call(&RpcCall {
+                    request_id: 1,
+                    operation: OP_CLIENT_LIST.to_string(),
+                    payload: to_value(ListClientsRequest::default())
+                        .expect("list should serialize"),
+                    native_context: None,
+                })
+                .expect("client listing should succeed"),
+        )
+        .expect("client listing should deserialize");
+        let call = RpcCall {
+            request_id: 2,
+            operation: OP_CLIENT_KEY_COMBINATION.to_string(),
+            payload: to_value(ClientKeyCombinationRequest {
+                client_id: listed.clients[0].client_id.clone(),
+                modifiers: vec![0x11, 0x10],
+                virtual_key: 0x43,
+                delivery: MessageDelivery::Send,
+            })
+            .expect("hotkey should serialize"),
+            native_context: None,
+        };
+
+        service
+            .handle_call_with_capabilities(&call, &[CAPABILITY_CLIENT_INPUT.to_string()])
+            .expect("hotkey should succeed");
+
+        let events = events.lock().expect("event lock");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.1, event.2))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x11, KeyAction::Down),
+                (0x10, KeyAction::Down),
+                (0x43, KeyAction::Down),
+                (0x43, KeyAction::Up),
+                (0x11, KeyAction::Up),
+                (0x10, KeyAction::Up),
+            ]
+        );
+    }
+
+    #[test]
+    fn inactive_client_input_locks_are_pruned() {
+        let service = AgentService::with_identity(
+            RpcTestBackend::new(Arc::new(AtomicBool::new(true))),
+            test_identity(),
+        );
+        let call = RpcCall {
+            request_id: 1,
+            operation: OP_CLIENT_KEY_EVENT.to_string(),
+            payload: serde_json::Value::Null,
+            native_context: None,
+        };
+        let first = service
+            .input_lock_for(&call, &ClientId("closed-client".to_string()))
+            .expect("first lock should be created");
+        drop(first);
+        let active = service
+            .input_lock_for(&call, &ClientId("active-client".to_string()))
+            .expect("active lock should be created");
+
+        let locks = service.input_locks.lock().expect("lock registry");
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key(&ClientId("active-client".to_string())));
+        drop(active);
+    }
+
+    #[test]
     fn authenticated_clients_receive_distinct_agent_owned_sessions() {
         let token = AuthToken::generate().expect("token generation should work");
         let (server, listener) = deimos_core::rpc::RpcServer::bind(
@@ -1581,9 +2081,7 @@ mod tests {
             .local_addr()
             .expect("listener should have an address");
         let server = Arc::new(server);
-        let backend = RpcTestBackend {
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let backend = RpcTestBackend::new(Arc::new(AtomicBool::new(true)));
         let service = Arc::new(
             AgentService::try_new(backend.clone()).expect("agent identity should be generated"),
         );
@@ -1668,9 +2166,7 @@ mod tests {
     #[test]
     fn mutation_operations_require_negotiated_capabilities_and_mutation_sessions() {
         let service = AgentService::with_identity(
-            RpcTestBackend {
-                alive: Arc::new(AtomicBool::new(true)),
-            },
+            RpcTestBackend::new(Arc::new(AtomicBool::new(true))),
             test_identity(),
         );
         let open = RpcCall {
@@ -1951,9 +2447,7 @@ mod tests {
 
     #[test]
     fn health_invalidates_exited_game_sessions_without_stopping_agent() {
-        let backend = RpcTestBackend {
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let backend = RpcTestBackend::new(Arc::new(AtomicBool::new(true)));
         let service = AgentService::with_identity(backend.clone(), test_identity());
         let open_call = RpcCall {
             request_id: 1,
@@ -2003,9 +2497,7 @@ mod tests {
 
     #[test]
     fn shutting_down_rejects_new_work_with_protocol_1_0_error_code() {
-        let backend = RpcTestBackend {
-            alive: Arc::new(AtomicBool::new(true)),
-        };
+        let backend = RpcTestBackend::new(Arc::new(AtomicBool::new(true)));
         let service = AgentService::with_identity(backend, test_identity());
         service
             .handle_call(&RpcCall {
