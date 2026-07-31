@@ -7,8 +7,8 @@ use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     ListModulesResponse, ListProcessesRequest, ListProcessesResponse, ModuleDescriptor,
-    OpenProcessRequest, ProcessAccessMode, ProcessDescriptor, ProcessIdentity, ProcessSessionId,
-    ProcessSessionResponse, ProcessSessionState,
+    OpenProcessRequest, ProcessAccessMode, ProcessDescriptor, ProcessIdentity, ProcessKind,
+    ProcessSessionId, ProcessSessionResponse, ProcessSessionState,
 };
 use deimos_core::rpc::{RpcError, RpcErrorCode};
 
@@ -590,6 +590,12 @@ impl<H> ProcessSessionRegistry<H> {
     pub fn new() -> Self {
         let registry = NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed);
         Self::with_id_prefix(format!("{:08x}-{registry:016x}", std::process::id()))
+    }
+
+    pub(crate) fn process_kind(&self, session_id: &ProcessSessionId) -> Option<ProcessKind> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.process.kind)
     }
 
     fn with_id_prefix(id_prefix: impl Into<String>) -> Self {

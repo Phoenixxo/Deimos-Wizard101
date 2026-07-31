@@ -8,6 +8,8 @@ pub const CAPABILITY_MEMORY_MUTATION: &str = "memory.mutation.v1";
 /// separate from generic mutation so existing mutation clients cannot install
 /// code hooks merely by negotiating `memory.mutation.v1`.
 pub const CAPABILITY_MEMORY_HOOK: &str = "memory.hook.v1";
+/// Enables the built-in WizWalker core hooks.
+pub const CAPABILITY_CORE_HOOK: &str = "memory.core_hook.v1";
 pub const CAPABILITY_REMOTE_THREAD: &str = "thread.remote.v1";
 pub const OP_MEMORY_REGIONS: &str = "memory.regions";
 pub const OP_MEMORY_READ: &str = "memory.read";
@@ -23,6 +25,12 @@ pub const OP_THREAD_START: &str = "thread.start";
 pub const OP_HOOK_ACTIVATE: &str = "hook.activate";
 pub const OP_HOOK_DEACTIVATE: &str = "hook.deactivate";
 pub const OP_HOOK_HEARTBEAT: &str = "hook.heartbeat";
+pub const OP_CORE_HOOK_ACTIVATE: &str = "core_hook.activate";
+pub const OP_CORE_HOOK_ACTIVATE_ALL: &str = "core_hook.activate_all";
+pub const OP_CORE_HOOK_DEACTIVATE: &str = "core_hook.deactivate";
+pub const OP_CORE_HOOK_DEACTIVATE_ALL: &str = "core_hook.deactivate_all";
+pub const OP_CORE_HOOK_HEARTBEAT_ALL: &str = "core_hook.heartbeat_all";
+pub const OP_CORE_HOOK_READ_BASE: &str = "core_hook.read_base";
 
 pub const DEFAULT_SCAN_MAX_MATCHES: usize = 256;
 // These limits keep Vec<u8>-encoded JSON results comfortably below the 1 MiB
@@ -244,6 +252,69 @@ pub struct HookHeartbeatResponse {
     pub session_id: ProcessSessionId,
     pub hook_key: String,
     pub active: bool,
+}
+
+/// Hooks required for WizWalker telemetry and UI-object access.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreHook {
+    Client,
+    Player,
+    Quest,
+    PlayerStat,
+    RootWindow,
+    RenderContext,
+}
+
+impl CoreHook {
+    pub const ALL: [Self; 6] = [
+        Self::Client,
+        Self::Player,
+        Self::Quest,
+        Self::PlayerStat,
+        Self::RootWindow,
+        Self::RenderContext,
+    ];
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHookRequest {
+    pub session_id: ProcessSessionId,
+    pub hook: CoreHook,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHookSessionRequest {
+    pub session_id: ProcessSessionId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHookResponse {
+    pub session_id: ProcessSessionId,
+    pub hook: CoreHook,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHooksResponse {
+    pub session_id: ProcessSessionId,
+    pub hooks: Vec<CoreHookResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHookDeactivateResponse {
+    pub session_id: ProcessSessionId,
+    pub hook: CoreHook,
+    pub deactivated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoreHookBaseResponse {
+    pub session_id: ProcessSessionId,
+    pub hook: CoreHook,
+    /// Hexadecimal text preserves the target's native pointer width across
+    /// JSON and Python boundaries.
+    pub base_address: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

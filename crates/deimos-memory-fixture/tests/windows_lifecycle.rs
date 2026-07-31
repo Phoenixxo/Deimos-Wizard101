@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use deimos_agent::process::ProcessSessionRegistry;
 use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
 use deimos_core::memory::{
-    ByteOrder, HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest,
-    MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest,
-    MemoryProtectRequest, MemoryReadItem, MemoryReadRequest, MemoryScanRequest, MemoryScanScope,
-    MemorySessionRequest, MemoryValueType, MemoryWriteRequest, RemoteThreadStartRequest,
-    TypedMemoryReadRequest,
+    ByteOrder, CoreHook, CoreHookRequest, CoreHookSessionRequest, HookActivateRequest,
+    HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest, MemoryBatchReadRequest,
+    MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadItem,
+    MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
+    MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessKind,
@@ -1135,6 +1135,192 @@ fn fixture_validates_transactional_hook_lifecycle() {
     assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
 }
 
+#[test]
+fn fixture_validates_every_core_hook_and_combined_cleanup() {
+    let mut fixture = FixtureProcess::spawn();
+    let metadata = read_metadata(&mut fixture);
+    let backend = WindowsProcessBackend;
+    let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
+    let listed = sessions
+        .list(
+            &backend,
+            &ListProcessesRequest {
+                names: vec![MEMORY_FIXTURE_EXECUTABLE.to_string()],
+            },
+        )
+        .expect("agent should enumerate the fixture")
+        .processes
+        .into_iter()
+        .find(|process| process.pid == metadata.pid)
+        .expect("fixture should be discoverable");
+    let session = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: listed.identity,
+                access_mode: ProcessAccessMode::Mutation,
+            },
+        )
+        .expect("mutation fixture session should open");
+    let read_only = metadata
+        .regions
+        .iter()
+        .find(|region| region.name == "read_only_values")
+        .expect("fixture should publish its core-hook region");
+    let region_base = parse_address(&read_only.address);
+    let mut targets = Vec::new();
+    for name in [
+        "core_hook_client",
+        "core_hook_player",
+        "core_hook_quest",
+        "core_hook_player_stat",
+        "core_hook_root_window",
+        "core_hook_render_context",
+    ] {
+        let pattern = metadata
+            .patterns
+            .iter()
+            .find(|pattern| pattern.name == name)
+            .expect("fixture should publish every core-hook target");
+        targets.push((region_base + pattern.offset, pattern.signature.clone()));
+    }
+
+    let mut mutations = deimos_agent::mutation::MutationState::new();
+    let mut hooks = deimos_agent::hook::HookState::default();
+    for (selected, (target, signature)) in CoreHook::ALL.into_iter().zip(&targets) {
+        let before = deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: format!("{target:#x}"),
+                size: 16,
+            },
+        )
+        .expect("fixture target should be readable")
+        .bytes;
+        assert_eq!(signature, &signature_bytes(&before));
+        let request = CoreHookRequest {
+            session_id: session.session_id.clone(),
+            hook: selected,
+        };
+        deimos_agent::core_hook::activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+            Instant::now(),
+        )
+        .expect("core hook should activate");
+        deimos_agent::core_hook::activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+            Instant::now(),
+        )
+        .expect("core hook activation should be idempotent");
+        assert_ne!(
+            deimos_agent::memory::read(
+                &mut sessions,
+                &backend,
+                &MemoryReadRequest {
+                    session_id: session.session_id.clone(),
+                    address: format!("{target:#x}"),
+                    size: 16,
+                },
+            )
+            .expect("active target should be readable")
+            .bytes,
+            before
+        );
+        deimos_agent::core_hook::deactivate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+        )
+        .expect("core hook should deactivate");
+        assert_eq!(
+            deimos_agent::memory::read(
+                &mut sessions,
+                &backend,
+                &MemoryReadRequest {
+                    session_id: session.session_id.clone(),
+                    address: format!("{target:#x}"),
+                    size: 16,
+                },
+            )
+            .expect("restored target should be readable")
+            .bytes,
+            before
+        );
+        assert!(
+            !deimos_agent::core_hook::deactivate(
+                &mut sessions,
+                &backend,
+                &mut mutations,
+                &mut hooks,
+                &request,
+            )
+            .expect("core hook deactivation should be idempotent")
+            .deactivated
+        );
+    }
+
+    let combined = CoreHookSessionRequest {
+        session_id: session.session_id.clone(),
+    };
+    deimos_agent::core_hook::activate_all(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &combined,
+        Instant::now(),
+    )
+    .expect("combined core hooks should activate atomically");
+    assert_eq!(
+        hooks.tracked_count(&session.session_id),
+        CoreHook::ALL.len()
+    );
+    deimos_agent::core_hook::deactivate_all(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &combined,
+    )
+    .expect("combined core hooks should clean up");
+    assert_eq!(hooks.tracked_count(&session.session_id), 0);
+    assert_eq!(mutations.tracked_count(&session.session_id), 0);
+
+    sessions
+        .close(&backend, &session.session_id)
+        .expect("fixture session should close");
+    let mut stdin = fixture
+        .child
+        .stdin
+        .take()
+        .expect("fixture stdin should be piped");
+    writeln!(stdin, "{SHUTDOWN_COMMAND}").expect("shutdown command should be writable");
+    stdin.flush().expect("shutdown command should flush");
+    drop(stdin);
+    assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}
+
+fn signature_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn read_metadata(fixture: &mut FixtureProcess) -> FixtureMetadata {
     let stdout = fixture
         .child
@@ -1233,7 +1419,7 @@ fn query_protection(process: &OwnedHandle, address: usize) -> u32 {
 }
 
 fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
-    assert_eq!(metadata.patterns.len(), 2);
+    assert_eq!(metadata.patterns.len(), 2 + CoreHook::ALL.len());
     let executable = fs::read(env!("CARGO_BIN_EXE_deimos-memory-fixture"))
         .expect("fixture PE should be readable");
     for pattern in &metadata.patterns {

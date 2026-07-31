@@ -1,13 +1,14 @@
+from __future__ import annotations
+
 import asyncio
 import struct
+from contextlib import suppress
 from typing import Any
 import warnings
 
-import pymem
-import pymem.exception
 from loguru import logger
 
-from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
+from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, MemoryReadError
 from .hooks import (
     ChatHook,
     ChatSendHook,
@@ -54,6 +55,8 @@ class HookHandler(MemoryReader):
         self._base_addrs = {}
 
         self._hook_cache = {}
+        self._core_hook_heartbeat_task = None
+        self._last_core_hook_heartbeat_error = None
 
     async def _get_open_autobot_address(self, size: int) -> int:
         if self._autobot_pos + size > self.AUTOBOT_SIZE:
@@ -113,6 +116,13 @@ class HookHandler(MemoryReader):
         return address
 
     async def close(self):
+        if self._uses_agent_core_hooks():
+            await self._stop_core_hook_heartbeat()
+            if self._active_hooks:
+                await self.run_in_executor(self._backend.deactivate_core_hooks)
+            self._active_hooks = {}
+            self._base_addrs = {}
+            return
         for hook in self._active_hooks.values():
             await hook.unhook()
 
@@ -137,15 +147,102 @@ class HookHandler(MemoryReader):
     def _get_hook_by_type(self, hook_type) -> MemoryHook:
         return self._active_hooks.get(hook_type, None)
 
+    def _uses_agent_core_hooks(self) -> bool:
+        return bool(getattr(self._backend, "supports_core_hooks", False))
+
+    async def _activate_agent_core_hook(
+        self,
+        hook_type,
+        hook_name: str,
+        addr_name: str,
+        *,
+        wait_for_ready: bool,
+        timeout: float,
+    ):
+        await self.run_in_executor(self._backend.activate_core_hook, hook_name)
+        self._active_hooks[hook_type] = hook_name
+        self._base_addrs[addr_name] = hook_name
+        self._ensure_core_hook_heartbeat()
+        if wait_for_ready:
+            await self._wait_for_core_hook(hook_name, timeout)
+
+    async def _deactivate_agent_core_hook(self, hook_type, hook_name: str, addr_name: str):
+        await self.run_in_executor(self._backend.deactivate_core_hook, hook_name)
+        self._active_hooks.pop(hook_type)
+        del self._base_addrs[addr_name]
+        if not self._active_hooks:
+            await self._stop_core_hook_heartbeat()
+
+    def _ensure_core_hook_heartbeat(self):
+        if (
+            self._core_hook_heartbeat_task is None
+            or self._core_hook_heartbeat_task.done()
+        ):
+            self._core_hook_heartbeat_task = asyncio.create_task(
+                self._core_hook_heartbeat_loop()
+            )
+
+    async def _core_hook_heartbeat_loop(self):
+        while True:
+            await asyncio.sleep(10)
+            await self._heartbeat_core_hooks_once()
+
+    async def _heartbeat_core_hooks_once(self):
+        try:
+            await self.run_in_executor(self._backend.heartbeat_core_hooks)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._last_core_hook_heartbeat_error = error
+        else:
+            self._last_core_hook_heartbeat_error = None
+
+    async def _stop_core_hook_heartbeat(self):
+        task = self._core_hook_heartbeat_task
+        self._core_hook_heartbeat_task = None
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    def cancel_core_hook_heartbeat(self):
+        task = self._core_hook_heartbeat_task
+        self._core_hook_heartbeat_task = None
+        if task is not None:
+            task.cancel()
+
     async def _read_hook_base_addr(self, addr_name: str, hook_name: str):
         addr = self._base_addrs.get(addr_name)
         if addr is None:
             raise HookNotActive(hook_name)
+        if self._uses_agent_core_hooks():
+            value = await self.run_in_executor(
+                self._backend.read_core_hook_base, addr
+            )
+            if value == 0:
+                raise HookNotReady(hook_name)
+            return value
 
         try:
             return await self.read_typed(addr, Primitive.int64)
-        except pymem.exception.MemoryReadError:
-            raise HookNotReady(hook_name)
+        except MemoryReadError as error:
+            raise HookNotReady(hook_name) from error
+
+    async def _wait_for_core_hook(self, hook_name: str, timeout: float = None):
+        async def _wait():
+            while True:
+                value = await self.run_in_executor(
+                    self._backend.read_core_hook_base, hook_name
+                )
+                if value != 0:
+                    return
+                await asyncio.sleep(0.5)
+
+        try:
+            await asyncio.wait_for(_wait(), timeout)
+        except asyncio.TimeoutError as error:
+            raise TimeoutError("Hook value took too long") from error
 
     # wait for an addr to be set and not 0
     async def _wait_for_value(self, address: int, timeout: int = None):
@@ -156,7 +253,7 @@ class HookHandler(MemoryReader):
                     logger.debug(
                         f"Waiting for address {hex(address)}; got value {value}"
                     )
-                except pymem.exception.MemoryReadError:
+                except MemoryReadError:
                     pass
                 else:
                     if value != 0:
@@ -168,9 +265,8 @@ class HookHandler(MemoryReader):
 
         try:
             await asyncio.wait_for(_wait_for_value_task(), timeout)
-        except TimeoutError:
-            # TODO: replace error
-            raise TimeoutError("Hook value took too long")
+        except asyncio.TimeoutError as error:
+            raise TimeoutError("Hook value took too long") from error
 
     # TODO: make this faster
     async def activate_all_hooks(
@@ -183,6 +279,37 @@ class HookHandler(MemoryReader):
             wait_for_ready: Wait for hook values to be written
             timeout: How long to wait for hook values to be written (None for no timeout)
         """
+        if self._uses_agent_core_hooks():
+            if self._active_hooks:
+                duplicate = next(iter(self._active_hooks))
+                raise HookAlreadyActivated(duplicate.__name__.removesuffix("Hook"))
+            await self.run_in_executor(self._backend.activate_core_hooks)
+            mappings = (
+                (PlayerHook, "player", "player_struct"),
+                (QuestHook, "quest", "quest_struct"),
+                (PlayerStatHook, "player_stat", "player_stat_struct"),
+                (ClientHook, "client", "current_client"),
+                (RootWindowHook, "root_window", "current_root_window"),
+                (RenderContextHook, "render_context", "current_render_context"),
+            )
+            for hook_type, hook_name, addr_name in mappings:
+                self._active_hooks[hook_type] = hook_name
+                self._base_addrs[addr_name] = hook_name
+            self._ensure_core_hook_heartbeat()
+            if wait_for_ready:
+                await asyncio.gather(
+                    *(
+                        self._wait_for_core_hook(hook_name, timeout)
+                        for hook_name in (
+                            "player",
+                            "player_stat",
+                            "client",
+                            "root_window",
+                            "render_context",
+                        )
+                    )
+                )
+            return
         await self.activate_player_hook(wait_for_ready=False)
         # quest hook is not written if the quest arrow is off
         await self.activate_quest_hook()
@@ -220,6 +347,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(PlayerHook):
             raise HookAlreadyActivated("Player")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                PlayerHook,
+                "player",
+                "player_struct",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -238,6 +373,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(PlayerHook):
             raise HookNotActive("Player")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                PlayerHook, "player", "player_struct"
+            )
 
         hook = self._active_hooks.pop(PlayerHook)
         await hook.unhook()
@@ -265,6 +404,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(QuestHook):
             raise HookAlreadyActivated("Quest")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                QuestHook,
+                "quest",
+                "quest_struct",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -283,6 +430,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(QuestHook):
             raise HookNotActive("Quest")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                QuestHook, "quest", "quest_struct"
+            )
 
         hook = self._active_hooks.pop(QuestHook)
         await hook.unhook()
@@ -310,6 +461,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(PlayerStatHook):
             raise HookAlreadyActivated("Player stat")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                PlayerStatHook,
+                "player_stat",
+                "player_stat_struct",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -328,6 +487,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(PlayerStatHook):
             raise HookNotActive("Player stat")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                PlayerStatHook, "player_stat", "player_stat_struct"
+            )
 
         hook = self._active_hooks.pop(PlayerStatHook)
         await hook.unhook()
@@ -355,6 +518,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(ClientHook):
             raise HookAlreadyActivated("Client")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                ClientHook,
+                "client",
+                "current_client",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -373,6 +544,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(ClientHook):
             raise HookNotActive("Client")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                ClientHook, "client", "current_client"
+            )
 
         hook = self._active_hooks.pop(ClientHook)
         await hook.unhook()
@@ -400,6 +575,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(RootWindowHook):
             raise HookAlreadyActivated("Root window")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                RootWindowHook,
+                "root_window",
+                "current_root_window",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -422,6 +605,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(RootWindowHook):
             raise HookNotActive("Root window")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                RootWindowHook, "root_window", "current_root_window"
+            )
 
         hook = self._active_hooks.pop(RootWindowHook)
         await hook.unhook()
@@ -449,6 +636,14 @@ class HookHandler(MemoryReader):
         """
         if self._check_if_hook_active(RenderContextHook):
             raise HookAlreadyActivated("Render context")
+        if self._uses_agent_core_hooks():
+            return await self._activate_agent_core_hook(
+                RenderContextHook,
+                "render_context",
+                "current_render_context",
+                wait_for_ready=wait_for_ready,
+                timeout=timeout,
+            )
 
         await self._check_for_autobot()
 
@@ -471,6 +666,10 @@ class HookHandler(MemoryReader):
         """
         if not self._check_if_hook_active(RenderContextHook):
             raise HookNotActive("Render context")
+        if self._uses_agent_core_hooks():
+            return await self._deactivate_agent_core_hook(
+                RenderContextHook, "render_context", "current_render_context"
+            )
 
         hook = self._active_hooks.pop(RenderContextHook)
         await hook.unhook()

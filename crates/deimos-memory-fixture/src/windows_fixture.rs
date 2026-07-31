@@ -37,6 +37,7 @@ const POINTER_TARGET: u64 = 0xcafe_babe_1020_3040;
 struct ReadOnlyValues {
     exact_pattern: [u8; 16],
     wildcard_pattern: [u8; 16],
+    core_hook_targets: [[u8; 16]; 6],
     value_u8: u8,
     padding_after_u8: [u8; 3],
     value_i32: i32,
@@ -141,6 +142,7 @@ impl FixtureMemory {
         let node_two_address = read_write.address() + offset_of!(ReadWriteValues, node_two);
         let exact_pattern = deterministic_pattern(EXACT_PATTERN_SEED);
         let wildcard_pattern = deterministic_pattern(WILDCARD_PATTERN_SEED);
+        let core_hook_targets = core_hook_targets();
 
         unsafe {
             read_write.write(ReadWriteValues {
@@ -162,6 +164,7 @@ impl FixtureMemory {
             read_only.write(ReadOnlyValues {
                 exact_pattern,
                 wildcard_pattern,
+                core_hook_targets,
                 value_u8: VALUE_U8,
                 padding_after_u8: [0; 3],
                 value_i32: VALUE_I32,
@@ -325,6 +328,12 @@ fn metadata(
                 signature: wildcard_signature(wildcard_pattern),
                 expected_matches: 1,
             },
+            core_hook_pattern("core_hook_client", 0),
+            core_hook_pattern("core_hook_player", 1),
+            core_hook_pattern("core_hook_quest", 2),
+            core_hook_pattern("core_hook_player_stat", 3),
+            core_hook_pattern("core_hook_root_window", 4),
+            core_hook_pattern("core_hook_render_context", 5),
         ],
         pointer_chains: vec![PointerChainMetadata {
             name: "two_hop_u64".to_string(),
@@ -340,6 +349,34 @@ fn metadata(
             expected: "0xcafebabe10203040".to_string(),
             expected_bytes: bytes_hex(&POINTER_TARGET.to_le_bytes()),
         }],
+    }
+}
+
+fn core_hook_targets() -> [[u8; 16]; 6] {
+    let mut targets = [[0u8; 16]; 6];
+    for (index, target) in targets.iter_mut().enumerate() {
+        target[0] = 0xb8;
+        target[1] = (index + 1) as u8;
+        target[2] = 0xd0;
+        target[3] = 0xc0;
+        target[4] = 0;
+        for byte in &mut target[5..15] {
+            *byte = 0x90;
+        }
+        target[15] = 0xc3;
+    }
+    targets
+}
+
+fn core_hook_pattern(name: &str, index: usize) -> PatternMetadata {
+    let bytes = core_hook_targets()[index];
+    PatternMetadata {
+        name: name.to_string(),
+        kind: PatternKind::Exact,
+        region: READ_ONLY_REGION.to_string(),
+        offset: offset_of!(ReadOnlyValues, core_hook_targets) + index * bytes.len(),
+        signature: signature(&bytes),
+        expected_matches: 1,
     }
 }
 

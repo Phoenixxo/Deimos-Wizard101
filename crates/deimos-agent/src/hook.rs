@@ -26,6 +26,8 @@ struct HookSpec {
     signature: String,
     scope: MemoryScanScope,
     payload: Vec<u8>,
+    target_offset: usize,
+    overwrite_size: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +72,16 @@ impl HookState {
             }
         }
     }
+
+    pub(crate) fn allocation_address(
+        &self,
+        session_id: &ProcessSessionId,
+        hook_key: &str,
+    ) -> Option<usize> {
+        self.get(session_id, hook_key)
+            .filter(|record| record.activation_complete)
+            .map(|record| record.allocation_address)
+    }
 }
 
 #[derive(Debug)]
@@ -92,7 +104,7 @@ impl From<MutationApiError> for HookApiError {
 }
 
 impl HookApiError {
-    fn request(code: RpcErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn request(code: RpcErrorCode, message: impl Into<String>) -> Self {
         Self::Request {
             code,
             message: message.into(),
@@ -126,6 +138,21 @@ pub fn activate<B: MutationBackend>(
     request: &HookActivateRequest,
     now: Instant,
 ) -> Result<HookActivateResponse, HookApiError> {
+    activate_template(sessions, backend, mutations, hooks, request, 0, None, now)
+}
+
+/// Installs a built-in hook with a verified target and overwrite span.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_template<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    mutations: &mut MutationState<B::ThreadHandle>,
+    hooks: &mut HookState,
+    request: &HookActivateRequest,
+    target_offset: usize,
+    overwrite_size: Option<usize>,
+    now: Instant,
+) -> Result<HookActivateResponse, HookApiError> {
     validate_hook_key(&request.hook_key)?;
     let signature = memory::parse_signature(&request.signature)?;
     if signature.len() < MIN_HOOK_SIGNATURE_BYTES {
@@ -146,6 +173,8 @@ pub fn activate<B: MutationBackend>(
         signature: request.signature.clone(),
         scope: request.scope.clone(),
         payload: request.payload.clone(),
+        target_offset,
+        overwrite_size,
     };
     if let Some(existing) = hooks.get(&request.session_id, &request.hook_key) {
         if existing.spec != spec {
@@ -186,22 +215,73 @@ pub fn activate<B: MutationBackend>(
             scope: request.scope.clone(),
         },
     )?;
-    let target_address = parse_address(
+    let match_address = parse_address(
         scan.matches
             .first()
             .expect("required unique scan must return one address"),
     )?;
+    let target_address = match_address.checked_add(target_offset).ok_or_else(|| {
+        HookApiError::request(
+            RpcErrorCode::MemoryInvalidAddress,
+            "core hook target offset overflowed the agent address width",
+        )
+    })?;
+    let available_size = signature.len().checked_sub(target_offset).ok_or_else(|| {
+        HookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            "hook target offset extends beyond its verified signature",
+        )
+    })?;
+    let overwrite_size = match overwrite_size {
+        Some(0) => {
+            let candidate = memory::read(
+                sessions,
+                backend,
+                &MemoryReadRequest {
+                    session_id: request.session_id.clone(),
+                    address: format_address(target_address),
+                    size: available_size,
+                },
+            )?
+            .bytes;
+            if !signature_matches(&candidate, &signature[target_offset..]) {
+                return Err(HookApiError::request(
+                    RpcErrorCode::MemoryRequiredMatchNotFound,
+                    "hook signature changed after scanning and before mutation",
+                ));
+            }
+            relocatable_prefix_len(&candidate, ABSOLUTE_JUMP_BYTES)?
+        }
+        Some(size) => size,
+        None => signature.len(),
+    };
+    if overwrite_size < ABSOLUTE_JUMP_BYTES {
+        return Err(HookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            format!("hook overwrite must span at least {ABSOLUTE_JUMP_BYTES} complete x64 bytes"),
+        ));
+    }
+    let overwrite_end = target_offset.checked_add(overwrite_size);
+    if !matches!(overwrite_end, Some(end) if end <= signature.len()) {
+        return Err(HookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            "hook overwrite extends beyond its verified signature",
+        ));
+    }
     let original_bytes = memory::read(
         sessions,
         backend,
         &MemoryReadRequest {
             session_id: request.session_id.clone(),
             address: format_address(target_address),
-            size: signature.len(),
+            size: overwrite_size,
         },
     )?
     .bytes;
-    if !signature_matches(&original_bytes, &signature) {
+    if !signature_matches(
+        &original_bytes,
+        &signature[target_offset..target_offset + overwrite_size],
+    ) {
         return Err(HookApiError::request(
             RpcErrorCode::MemoryRequiredMatchNotFound,
             "hook signature changed after scanning and before mutation",
@@ -255,7 +335,7 @@ pub fn activate<B: MutationBackend>(
             .get(&request.session_id, &request.hook_key)
             .expect("new hook record must be tracked")
             .original_bytes,
-        target_address.checked_add(signature.len()).ok_or_else(|| {
+        target_address.checked_add(overwrite_size).ok_or_else(|| {
             HookApiError::request(
                 RpcErrorCode::MemoryInvalidAddress,
                 "hook continuation address overflowed",
@@ -290,7 +370,7 @@ pub fn activate<B: MutationBackend>(
         &MemoryProtectRequest {
             session_id: request.session_id.clone(),
             address: target_address_text.clone(),
-            size: signature.len(),
+            size: overwrite_size,
             protection: MemoryProtection::ExecuteReadWrite,
         },
     ) {
@@ -308,7 +388,7 @@ pub fn activate<B: MutationBackend>(
         record.original_protection = Some(protection.previous_protection);
         record.target_may_be_modified = true;
     }
-    let detour = build_detour(allocation_address, signature.len());
+    let detour = build_detour(allocation_address, overwrite_size);
     if let Err(error) = mutation::write(
         sessions,
         backend,
@@ -325,7 +405,7 @@ pub fn activate<B: MutationBackend>(
         backend,
         &request.session_id,
         &target_address_text,
-        signature.len(),
+        overwrite_size,
     ) {
         return activation_failure(sessions, backend, mutations, hooks, request, error.into());
     }
@@ -335,7 +415,7 @@ pub fn activate<B: MutationBackend>(
         &MemoryProtectRequest {
             session_id: request.session_id.clone(),
             address: target_address_text,
-            size: signature.len(),
+            size: overwrite_size,
             protection: protection.previous_protection,
         },
     ) {
@@ -635,19 +715,14 @@ fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
     while offset < bytes.len() {
         let instruction_start = offset;
         let mut address_size_override = false;
+        let mut rex_w = false;
         while let Some(prefix) = bytes.get(offset) {
             match *prefix {
-                0x40..=0x4f
-                | 0x66
-                | 0xf0
-                | 0xf2
-                | 0xf3
-                | 0x26
-                | 0x2e
-                | 0x36
-                | 0x3e
-                | 0x64
-                | 0x65 => offset += 1,
+                0x40..=0x4f => {
+                    rex_w = *prefix & 0x08 != 0;
+                    offset += 1;
+                }
+                0x66 | 0xf0 | 0xf2 | 0xf3 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => offset += 1,
                 0x67 => {
                     address_size_override = true;
                     offset += 1;
@@ -668,7 +743,7 @@ fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
         let (has_modrm, immediate_bytes) = match opcode {
             0x90 | 0xc3 | 0xcc | 0x50..=0x5f => (false, 0),
             0xc2 => (false, 2),
-            0xb8..=0xbf => (false, 4),
+            0xb8..=0xbf => (false, if rex_w { 8 } else { 4 }),
             0x00..=0x03
             | 0x08..=0x0b
             | 0x10..=0x13
@@ -697,7 +772,9 @@ fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
                     ));
                 }
                 match extended {
-                    0x1f | 0xaf | 0xb6 | 0xb7 | 0xbe | 0xbf => (true, 0),
+                    0x10 | 0x11 | 0x1f | 0x28 | 0x29 | 0x49 | 0xaf | 0xb6 | 0xb7 | 0xbe | 0xbf => {
+                        (true, 0)
+                    }
                     _ => return Err(invalid_instruction(instruction_start)),
                 }
             }
@@ -756,6 +833,20 @@ fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
     Ok(())
 }
 
+fn relocatable_prefix_len(bytes: &[u8], minimum: usize) -> Result<usize, HookApiError> {
+    for size in minimum..=bytes.len() {
+        if validate_relocatable_x64(&bytes[..size]).is_ok() {
+            return Ok(size);
+        }
+    }
+    Err(HookApiError::request(
+        RpcErrorCode::InvalidRequest,
+        format!(
+            "hook site does not contain at least {minimum} complete position-independent x64 bytes"
+        ),
+    ))
+}
+
 fn invalid_instruction(offset: usize) -> HookApiError {
     HookApiError::request(
         RpcErrorCode::InvalidRequest,
@@ -810,7 +901,7 @@ fn format_address(address: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -831,17 +922,22 @@ mod tests {
     };
 
     use super::{
-        activate, build_detour, build_trampoline, cleanup_session, deactivate, expire_at,
-        heartbeat, validate_relocatable_x64, HookState, HOOK_LEASE,
+        activate, activate_template, build_detour, build_trampoline, cleanup_session, deactivate,
+        expire_at, heartbeat, relocatable_prefix_len, validate_relocatable_x64, HookState,
+        HOOK_LEASE,
     };
 
     const TARGET: usize = 0x1000;
     const ALLOCATION: usize = 0x2000;
     const SIGNATURE: &str = "90 90 90 90 90 90 90 90 90 90 90 90 90 90 C3 90";
     const SECOND_SIGNATURE: &str = "90 90 90 90 90 90 90 90 90 90 90 90 90 90 C3 C3";
+    const LONG_SIGNATURE: &str = concat!(
+        "90 90 90 90 90 90 90 90 90 90 90 90 90 90 C3 90 ",
+        "90 90 90 90 90 90 90 90 90 90 90 90 90 90 C3 C3"
+    );
 
-    #[derive(Clone, Copy)]
-    enum Failure {
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Failure {
         Allocate,
         TrampolineWrite,
         TrampolineFlush,
@@ -861,26 +957,22 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct Backend(Arc<Mutex<Data>>);
+    pub(crate) struct Backend(Arc<Mutex<Data>>);
 
     #[derive(Clone, Copy)]
-    struct Handle;
+    pub(crate) struct Handle;
 
     #[derive(Clone, Copy)]
-    struct Thread;
+    pub(crate) struct Thread;
 
     impl Backend {
-        fn new(failure: Option<Failure>) -> Self {
+        pub(crate) fn new(failure: Option<Failure>) -> Self {
             Self::with_failures(failure.into_iter().collect())
         }
 
-        fn with_failures(failures: Vec<Failure>) -> Self {
+        fn with_primary(primary: Vec<u8>, failures: Vec<Failure>) -> Self {
             Self(Arc::new(Mutex::new(Data {
-                primary: vec![
-                    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-                    0x90, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-                    0x90, 0x90, 0x90, 0x90, 0xc3, 0xc3,
-                ],
+                primary,
                 allocations: BTreeMap::new(),
                 target_protection: MemoryProtection::ReadOnly,
                 next_allocation: ALLOCATION,
@@ -888,11 +980,38 @@ mod tests {
             })))
         }
 
-        fn primary(&self) -> Vec<u8> {
+        fn with_failures(failures: Vec<Failure>) -> Self {
+            Self::with_primary(
+                vec![
+                    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0x90, 0x90, 0x90, 0xc3, 0xc3,
+                ],
+                failures,
+            )
+        }
+
+        pub(crate) fn core(failure: Option<Failure>) -> Self {
+            let mut primary = Vec::new();
+            for marker in 1..=6 {
+                primary.extend_from_slice(&[
+                    0xb8, marker, 0xd0, 0xc0, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0x90, 0xc3,
+                ]);
+            }
+            Self::with_primary(primary, failure.into_iter().collect())
+        }
+
+        pub(crate) fn primary(&self) -> Vec<u8> {
             self.0.lock().expect("data lock").primary.clone()
         }
 
-        fn allocation_count(&self) -> usize {
+        pub(crate) fn corrupt_primary_byte(&self, offset: usize) {
+            let mut data = self.0.lock().expect("data lock");
+            data.primary[offset] ^= 0xff;
+        }
+
+        pub(crate) fn allocation_count(&self) -> usize {
             self.0.lock().expect("data lock").allocations.len()
         }
     }
@@ -964,7 +1083,7 @@ mod tests {
         ) -> Result<Vec<MemoryRegionDescriptor>, ProcessBackendError> {
             Ok(vec![MemoryRegionDescriptor {
                 base_address: format!("{TARGET:#x}"),
-                size: 32,
+                size: self.0.lock().expect("data lock").primary.len(),
                 protection: MemoryProtection::ReadOnly,
             }])
         }
@@ -1000,7 +1119,8 @@ mod tests {
             if address == ALLOCATION && take_failure(&mut data, Failure::TrampolineWrite) {
                 return Err(failure("forced trampoline write failure"));
             }
-            if address == TARGET && take_failure(&mut data, Failure::TargetWrite) {
+            let target_range = address >= TARGET && address < TARGET + data.primary.len();
+            if target_range && take_failure(&mut data, Failure::TargetWrite) {
                 return Err(failure("forced target write failure"));
             }
             if address >= TARGET && address < TARGET + data.primary.len() {
@@ -1065,13 +1185,14 @@ mod tests {
             protection: MemoryProtection,
         ) -> Result<MemoryProtection, ProcessBackendError> {
             let mut data = self.0.lock().expect("data lock");
-            if address == TARGET
+            let target_range = address >= TARGET && address < TARGET + data.primary.len();
+            if target_range
                 && protection == MemoryProtection::ExecuteReadWrite
                 && take_failure(&mut data, Failure::TargetProtect)
             {
                 return Err(failure("forced target protect failure"));
             }
-            if address == TARGET
+            if target_range
                 && protection == MemoryProtection::ReadOnly
                 && take_failure(&mut data, Failure::TargetRestore)
             {
@@ -1106,7 +1227,7 @@ mod tests {
             _size: usize,
         ) -> Result<(), ProcessBackendError> {
             let mut data = self.0.lock().expect("data lock");
-            let failure_stage = if address == ALLOCATION {
+            let failure_stage = if address >= ALLOCATION {
                 Failure::TrampolineFlush
             } else {
                 Failure::TargetFlush
@@ -1133,7 +1254,7 @@ mod tests {
         }
     }
 
-    fn registry(
+    pub(crate) fn registry(
         backend: &Backend,
     ) -> (
         ProcessSessionRegistry<Handle>,
@@ -1208,11 +1329,36 @@ mod tests {
             RpcErrorCode::InvalidRequest
         );
         assert_eq!(
+            relocatable_prefix_len(
+                &[
+                    0xf2, 0x0f, 0x10, 0x40, 0x58, // movsd xmm0,[rax+58]
+                    0xf2, 0x0f, 0x10, 0x48, 0x60, // movsd xmm1,[rax+60]
+                    0xf2, 0x0f, 0x10, 0x50, 0x68, // movsd xmm2,[rax+68]
+                    0xc3,
+                ],
+                14,
+            )
+            .expect("SIMD core-hook instructions should decode"),
+            15
+        );
+        assert_eq!(
             validate_relocatable_x64(&[0x48, 0x8b, 0x05, 0, 0, 0, 0])
                 .expect_err("RIP-relative read must be rejected")
                 .into_rpc_error(2, "hook.activate")
                 .code,
             RpcErrorCode::InvalidRequest
+        );
+        assert!(validate_relocatable_x64(&[
+            0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8, // mov rax, imm64
+            0x90,
+        ])
+        .is_ok());
+        assert!(
+            validate_relocatable_x64(&[0x48, 0xb8, 1, 2, 3, 4])
+                .expect_err("truncated movabs must be rejected")
+                .into_rpc_error(3, "hook.activate")
+                .code
+                == RpcErrorCode::InvalidRequest
         );
     }
 
@@ -1276,6 +1422,51 @@ mod tests {
             .expect("idempotent deactivation")
             .deactivated
         );
+    }
+
+    #[test]
+    fn template_overwrite_does_not_modify_verified_signature_suffix() {
+        let backend = Backend::new(None);
+        let before = backend.primary();
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        let request = HookActivateRequest {
+            session_id: session_id.clone(),
+            hook_key: "fixture.long-signature".to_string(),
+            signature: LONG_SIGNATURE.to_string(),
+            scope: MemoryScanScope::Process,
+            payload: vec![0x90],
+        };
+
+        activate_template(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+            0,
+            Some(16),
+            Instant::now(),
+        )
+        .expect("template activation");
+
+        let active = backend.primary();
+        assert_ne!(&active[..16], &before[..16]);
+        assert_eq!(&active[16..], &before[16..]);
+
+        deactivate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &HookDeactivateRequest {
+                session_id,
+                hook_key: request.hook_key,
+            },
+        )
+        .expect("template deactivation");
+        assert_eq!(backend.primary(), before);
     }
 
     #[test]
