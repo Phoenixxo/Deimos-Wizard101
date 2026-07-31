@@ -36,6 +36,7 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, 
 const SHUTDOWN_COMMAND: &str = "shutdown";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const FEATURE_HOOK_AUXILIARY_PATTERN_COUNT: usize = 7;
 
 struct FixtureProcess {
     child: Child,
@@ -1626,7 +1627,10 @@ fn query_protection(process: &OwnedHandle, address: usize) -> u32 {
 }
 
 fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
-    assert_eq!(metadata.patterns.len(), 2 + CoreHook::ALL.len());
+    assert_eq!(
+        metadata.patterns.len(),
+        2 + CoreHook::ALL.len() + FeatureHook::ALL.len() + FEATURE_HOOK_AUXILIARY_PATTERN_COUNT
+    );
     let executable = fs::read(env!("CARGO_BIN_EXE_deimos-memory-fixture"))
         .expect("fixture PE should be readable");
     for pattern in &metadata.patterns {
