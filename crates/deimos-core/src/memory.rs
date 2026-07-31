@@ -4,6 +4,10 @@ use crate::process::ProcessSessionId;
 
 pub const CAPABILITY_MEMORY_READ_ONLY: &str = "memory.read_only.v1";
 pub const CAPABILITY_MEMORY_MUTATION: &str = "memory.mutation.v1";
+/// Enables agent-owned transactional detours.  This capability is deliberately
+/// separate from generic mutation so existing mutation clients cannot install
+/// code hooks merely by negotiating `memory.mutation.v1`.
+pub const CAPABILITY_MEMORY_HOOK: &str = "memory.hook.v1";
 pub const CAPABILITY_REMOTE_THREAD: &str = "thread.remote.v1";
 pub const OP_MEMORY_REGIONS: &str = "memory.regions";
 pub const OP_MEMORY_READ: &str = "memory.read";
@@ -16,6 +20,9 @@ pub const OP_MEMORY_ALLOCATE: &str = "memory.allocate";
 pub const OP_MEMORY_FREE: &str = "memory.free";
 pub const OP_MEMORY_PROTECT: &str = "memory.protect";
 pub const OP_THREAD_START: &str = "thread.start";
+pub const OP_HOOK_ACTIVATE: &str = "hook.activate";
+pub const OP_HOOK_DEACTIVATE: &str = "hook.deactivate";
+pub const OP_HOOK_HEARTBEAT: &str = "hook.heartbeat";
 
 pub const DEFAULT_SCAN_MAX_MATCHES: usize = 256;
 // These limits keep Vec<u8>-encoded JSON results comfortably below the 1 MiB
@@ -33,6 +40,8 @@ pub const MAX_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 // Keep one second of headroom under the default five-second RPC I/O timeout
 // for validation, serialization, and transport.
 pub const MAX_REMOTE_THREAD_WAIT_MS: u32 = 4_000;
+pub const MIN_HOOK_SIGNATURE_BYTES: usize = 14;
+pub const MAX_HOOK_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +194,56 @@ pub struct RemoteThreadStartResponse {
     pub completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u32>,
+}
+
+/// A hook is identified within a mutation session by `hook_key`.  The
+/// signature is always scanned uniquely before the target is modified.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookActivateRequest {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+    pub signature: String,
+    pub scope: MemoryScanScope,
+    /// Bytes placed before the saved instructions in the remote trampoline.
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookActivateResponse {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+    pub target_address: String,
+    pub allocation_id: String,
+    pub allocation_address: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookDeactivateRequest {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookDeactivateResponse {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+    /// Deactivation is idempotent: false means the hook was already absent.
+    pub deactivated: bool,
+    pub allocation_released: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookHeartbeatRequest {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HookHeartbeatResponse {
+    pub session_id: ProcessSessionId,
+    pub hook_key: String,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
