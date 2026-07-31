@@ -1419,7 +1419,7 @@ fn query_protection(process: &OwnedHandle, address: usize) -> u32 {
 }
 
 fn verify_patterns(process: &OwnedHandle, metadata: &FixtureMetadata) {
-    assert_eq!(metadata.patterns.len(), 2);
+    assert_eq!(metadata.patterns.len(), 2 + CoreHook::ALL.len());
     let executable = fs::read(env!("CARGO_BIN_EXE_deimos-memory-fixture"))
         .expect("fixture PE should be readable");
     for pattern in &metadata.patterns {
