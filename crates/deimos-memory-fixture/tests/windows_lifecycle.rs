@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use deimos_agent::process::ProcessSessionRegistry;
 use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
 use deimos_core::memory::{
-    ByteOrder, CoreHook, CoreHookRequest, CoreHookSessionRequest, HookActivateRequest,
-    HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest, MemoryBatchReadRequest,
-    MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadItem,
-    MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
-    MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
+    ByteOrder, CoreHook, CoreHookRequest, CoreHookSessionRequest, FeatureHook, FeatureHookRequest,
+    HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest,
+    MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest,
+    MemoryReadItem, MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemorySessionRequest,
+    MemoryValueType, MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessKind,
@@ -1311,6 +1311,213 @@ fn fixture_validates_every_core_hook_and_combined_cleanup() {
     stdin.flush().expect("shutdown command should flush");
     drop(stdin);
     assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}
+
+#[test]
+fn fixture_restores_feature_auxiliary_patches_for_deactivate_expiry_and_session_cleanup() {
+    let mut fixture = FixtureProcess::spawn();
+    let metadata = read_metadata(&mut fixture);
+    let backend = WindowsProcessBackend;
+    let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
+    let listed = sessions
+        .list(
+            &backend,
+            &ListProcessesRequest {
+                names: vec![MEMORY_FIXTURE_EXECUTABLE.to_string()],
+            },
+        )
+        .expect("agent should enumerate the fixture")
+        .processes
+        .into_iter()
+        .find(|process| process.pid == metadata.pid)
+        .expect("fixture should be discoverable");
+    let session = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: listed.identity,
+                access_mode: ProcessAccessMode::Mutation,
+            },
+        )
+        .expect("mutation fixture session should open");
+    let read_only = region(&metadata, "read_only_values");
+    let region_base = parse_address(&read_only.address);
+    let tracked = [
+        "feature_hook_movement_teleport",
+        "feature_movement_forward",
+        "feature_movement_backward",
+        "feature_movement_collision_one",
+        "feature_movement_collision_two",
+        "feature_hook_mouseless_cursor",
+        "feature_mouse_set_cursor",
+        "feature_mouse_toggle_one",
+        "feature_mouse_toggle_two",
+    ]
+    .into_iter()
+    .map(|name| {
+        let pattern = metadata
+            .patterns
+            .iter()
+            .find(|pattern| pattern.name == name)
+            .expect("fixture should publish every feature target");
+        let address = region_base + pattern.offset;
+        let size = pattern.signature.split_whitespace().count();
+        let original = deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: format!("{address:#x}"),
+                size,
+            },
+        )
+        .expect("feature target should be readable")
+        .bytes;
+        (name, address, original)
+    })
+    .collect::<Vec<_>>();
+    let mut mutations = deimos_agent::mutation::MutationState::new();
+    let mut hooks = deimos_agent::hook::HookState::default();
+
+    let movement = FeatureHookRequest {
+        session_id: session.session_id.clone(),
+        hook: FeatureHook::MovementTeleport,
+    };
+    deimos_agent::feature_hook::activate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &movement,
+        Instant::now(),
+    )
+    .expect("movement feature should activate");
+    assert_feature_target_changed(&mut sessions, &backend, &session.session_id, &tracked[3]);
+    assert_feature_target_changed(&mut sessions, &backend, &session.session_id, &tracked[4]);
+    deimos_agent::feature_hook::deactivate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &movement,
+    )
+    .expect("movement feature should deactivate");
+    assert_feature_targets_restored(&mut sessions, &backend, &session.session_id, &tracked[..5]);
+
+    let mouseless = FeatureHookRequest {
+        session_id: session.session_id.clone(),
+        hook: FeatureHook::MouselessCursor,
+    };
+    deimos_agent::feature_hook::activate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &mouseless,
+        Instant::now(),
+    )
+    .expect("mouseless feature should activate");
+    for target in &tracked[6..] {
+        assert_feature_target_changed(&mut sessions, &backend, &session.session_id, target);
+    }
+    deimos_agent::hook::expire_at(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        Instant::now() + deimos_agent::hook::HOOK_LEASE + Duration::from_millis(1),
+    )
+    .expect("lease expiry should restore mouseless ownership");
+    assert_feature_targets_restored(&mut sessions, &backend, &session.session_id, &tracked[5..]);
+
+    deimos_agent::feature_hook::activate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &movement,
+        Instant::now(),
+    )
+    .expect("movement feature should reactivate");
+    deimos_agent::hook::cleanup_session(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &session.session_id,
+    )
+    .expect("session cleanup should restore movement ownership");
+    assert_feature_targets_restored(&mut sessions, &backend, &session.session_id, &tracked[..5]);
+    assert_eq!(hooks.tracked_count(&session.session_id), 0);
+    assert_eq!(mutations.tracked_count(&session.session_id), 0);
+    let regions = deimos_agent::memory::regions(
+        &mut sessions,
+        &backend,
+        &MemorySessionRequest {
+            session_id: session.session_id.clone(),
+        },
+    )
+    .expect("fixture regions should remain readable");
+    assert!(regions.regions.iter().any(|candidate| {
+        parse_address(&candidate.base_address) == region_base
+            && candidate.protection == deimos_core::memory::MemoryProtection::ReadOnly
+    }));
+
+    sessions
+        .close(&backend, &session.session_id)
+        .expect("fixture session should close");
+    let mut stdin = fixture
+        .child
+        .stdin
+        .take()
+        .expect("fixture stdin should be piped");
+    writeln!(stdin, "{SHUTDOWN_COMMAND}").expect("shutdown command should be writable");
+    stdin.flush().expect("shutdown command should flush");
+    drop(stdin);
+    assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}
+
+fn assert_feature_target_changed(
+    sessions: &mut ProcessSessionRegistry<WindowsProcessHandle>,
+    backend: &WindowsProcessBackend,
+    session_id: &deimos_core::process::ProcessSessionId,
+    target: &(&str, usize, Vec<u8>),
+) {
+    let actual = deimos_agent::memory::read(
+        sessions,
+        backend,
+        &MemoryReadRequest {
+            session_id: session_id.clone(),
+            address: format!("{:#x}", target.1),
+            size: target.2.len(),
+        },
+    )
+    .expect("active feature target should be readable")
+    .bytes;
+    assert_ne!(actual, target.2, "{} should be patched", target.0);
+}
+
+fn assert_feature_targets_restored(
+    sessions: &mut ProcessSessionRegistry<WindowsProcessHandle>,
+    backend: &WindowsProcessBackend,
+    session_id: &deimos_core::process::ProcessSessionId,
+    targets: &[(&str, usize, Vec<u8>)],
+) {
+    for target in targets {
+        let actual = deimos_agent::memory::read(
+            sessions,
+            backend,
+            &MemoryReadRequest {
+                session_id: session_id.clone(),
+                address: format!("{:#x}", target.1),
+                size: target.2.len(),
+            },
+        )
+        .expect("restored feature target should be readable")
+        .bytes;
+        assert_eq!(actual, target.2, "{} should be restored exactly", target.0);
+    }
 }
 
 fn signature_bytes(bytes: &[u8]) -> String {

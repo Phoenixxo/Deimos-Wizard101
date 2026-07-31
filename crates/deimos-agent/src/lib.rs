@@ -11,14 +11,19 @@ use deimos_core::lifecycle::{
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
 use deimos_core::memory::{
-    CoreHookRequest, CoreHookSessionRequest, HookActivateRequest, HookDeactivateRequest,
-    HookHeartbeatRequest, MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest,
-    MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadRequest, MemoryScanRequest,
-    MemorySessionRequest, MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
-    CAPABILITY_CORE_HOOK, CAPABILITY_MEMORY_HOOK, CAPABILITY_MEMORY_MUTATION,
-    CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD, OP_CORE_HOOK_ACTIVATE,
-    OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
-    OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE,
+    CoreHookRequest, CoreHookSessionRequest, FeatureBuddyAddRequest, FeatureChatSendRequest,
+    FeatureHookExportRequest, FeatureHookRequest, FeatureHookSessionRequest,
+    FeatureMousePositionRequest, FeatureTeleportRequest, HookActivateRequest,
+    HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest, MemoryBatchReadRequest,
+    MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadRequest,
+    MemoryScanRequest, MemorySessionRequest, MemoryWriteRequest, RemoteThreadStartRequest,
+    TypedMemoryReadRequest, CAPABILITY_CORE_HOOK, CAPABILITY_FEATURE_HOOK, CAPABILITY_MEMORY_HOOK,
+    CAPABILITY_MEMORY_MUTATION, CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD,
+    OP_CORE_HOOK_ACTIVATE, OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE,
+    OP_CORE_HOOK_DEACTIVATE_ALL, OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE,
+    OP_FEATURE_BUDDY_ADD, OP_FEATURE_CHAT_SEND, OP_FEATURE_HOOK_ACTIVATE,
+    OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL, OP_FEATURE_HOOK_READ_EXPORT,
+    OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT, OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE,
     OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE, OP_MEMORY_POINTER_CHAIN,
     OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
     OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
@@ -43,6 +48,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod core_hook;
+pub mod feature_hook;
 pub mod hook;
 pub mod instance;
 pub mod memory;
@@ -93,6 +99,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_MEMORY_MUTATION.to_string(),
             CAPABILITY_MEMORY_HOOK.to_string(),
             CAPABILITY_CORE_HOOK.to_string(),
+            CAPABILITY_FEATURE_HOOK.to_string(),
             CAPABILITY_REMOTE_THREAD.to_string(),
         ],
         service.identity().clone(),
@@ -756,6 +763,130 @@ impl<B: MutationBackend> AgentService<B> {
                     })?;
                 encode_payload(call, response)
             }
+            OP_FEATURE_HOOK_ACTIVATE => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureHookRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = feature_hook::activate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                    Instant::now(),
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_HOOK_DEACTIVATE => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureHookRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = feature_hook::deactivate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_HOOK_HEARTBEAT_ALL => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureHookSessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let response = feature_hook::heartbeat_all(&mut hooks, &request, Instant::now())
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_HOOK_READ_EXPORT => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureHookExportRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    feature_hook::read_export(&mut sessions, &self.backend, &hooks, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_MOUSE_POSITION => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureMousePositionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response = feature_hook::set_mouse_position(
+                    &mut sessions,
+                    &self.backend,
+                    &hooks,
+                    &request,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_TELEPORT => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureTeleportRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    feature_hook::teleport(&mut sessions, &self.backend, &mut hooks, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_CHAT_SEND => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureChatSendRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    feature_hook::send_chat(&mut sessions, &self.backend, &hooks, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_BUDDY_ADD => {
+                require_feature_hook_capabilities(call, capabilities)?;
+                let request: FeatureBuddyAddRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    feature_hook::add_buddy(&mut sessions, &self.backend, &hooks, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
+                encode_payload(call, response)
+            }
             OP_PROCESS_LIST => {
                 let request: ListProcessesRequest = decode_payload(call)?;
                 let sessions = self.lock_sessions(call)?;
@@ -1025,6 +1156,22 @@ fn require_capabilities(
         .details
         .insert("missing_capabilities".to_string(), missing.join(","));
     Err(Box::new(error))
+}
+
+fn require_feature_hook_capabilities(
+    call: &RpcCall,
+    capabilities: &[String],
+) -> Result<(), Box<RpcError>> {
+    require_capabilities(
+        call,
+        capabilities,
+        &[
+            CAPABILITY_PROCESS_MUTATION,
+            CAPABILITY_MEMORY_MUTATION,
+            CAPABILITY_MEMORY_HOOK,
+            CAPABILITY_FEATURE_HOOK,
+        ],
+    )
 }
 
 fn encode_payload<T: Serialize>(call: &RpcCall, value: T) -> Result<Value, Box<RpcError>> {
@@ -1320,6 +1467,13 @@ mod tests {
             _handle: &Self::Handle,
             _address: usize,
         ) -> Result<(), ProcessBackendError> {
+            Err(rpc_test_mutation_error())
+        }
+
+        fn suspend_process_threads(
+            &self,
+            _handle: &Self::Handle,
+        ) -> Result<crate::process::SuspendedProcess, ProcessBackendError> {
             Err(rpc_test_mutation_error())
         }
 

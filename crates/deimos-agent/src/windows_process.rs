@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
 
@@ -7,27 +8,31 @@ use deimos_core::process::{
 };
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND, LPARAM, RECT,
-    STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, BOOL, ERROR_NO_MORE_FILES, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND,
+    LPARAM, RECT, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Diagnostics::Debug::{
-    FlushInstructionCache, ReadProcessMemory, WriteProcessMemory,
+    FlushInstructionCache, GetThreadContext, ReadProcessMemory, WriteProcessMemory, CONTEXT,
+    CONTEXT_CONTROL_AMD64,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
-    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+    Thread32First, Thread32Next, MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE,
+    TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION,
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    MEM_COMMIT, MEM_FREE, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
     PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, GetProcessTimes, OpenProcess,
-    QueryFullProcessImageNameW, WaitForSingleObject, LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, GetProcessId, GetProcessTimes,
+    OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
+    WaitForSingleObject, LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
+    THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
@@ -35,8 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::process::{
     enumerate_modules_with_revalidation, ClientWindowCandidate, MemoryBackend, MutationBackend,
-    OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind, RemoteThreadPoll,
-    StartedRemoteThread,
+    OpenedProcess, ProcessBackend, ProcessBackendError, ProcessBackendErrorKind,
+    ProcessThreadResume, RemoteThreadPoll, StartedRemoteThread, SuspendedProcess,
 };
 
 const MAX_EXECUTABLE_PATH: usize = 32_768;
@@ -60,6 +65,42 @@ impl Drop for OwnedHandle {
 pub struct WindowsProcessHandle(OwnedHandle);
 
 pub struct WindowsThreadHandle(OwnedHandle);
+
+struct SuspendedWindowsThreads(Vec<OwnedHandle>);
+
+impl ProcessThreadResume for SuspendedWindowsThreads {
+    fn resume(&mut self) -> Result<(), ProcessBackendError> {
+        let mut retained = Vec::new();
+        let mut first_error = None;
+        while let Some(thread) = self.0.pop() {
+            if unsafe { ResumeThread(thread.0) } != u32::MAX {
+                continue;
+            }
+            let resume_error = last_error("ResumeThread failed during hook retirement");
+            let mut exit_code = 0u32;
+            let exited = unsafe { GetExitCodeThread(thread.0, &mut exit_code) }.is_ok()
+                && exit_code != STILL_ACTIVE.0 as u32;
+            if !exited {
+                retained.push(thread);
+                if first_error.is_none() {
+                    first_error = Some(resume_error);
+                }
+            }
+        }
+        retained.reverse();
+        self.0 = retained;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SuspendedWindowsThreads {
+    fn drop(&mut self) {
+        let _ = self.resume();
+    }
+}
 
 impl WindowsProcessHandle {
     pub(crate) fn raw(&self) -> HANDLE {
@@ -428,6 +469,76 @@ impl MutationBackend for WindowsProcessBackend {
         Ok(pointer as usize)
     }
 
+    fn allocate_memory_near(
+        &self,
+        handle: &Self::Handle,
+        target: usize,
+        size: usize,
+        protection: MemoryProtection,
+    ) -> Result<usize, ProcessBackendError> {
+        const GRANULARITY: usize = 64 * 1024;
+        const REL32_REACH: usize = i32::MAX as usize;
+
+        let minimum = align_up(
+            target.saturating_sub(REL32_REACH).max(GRANULARITY),
+            GRANULARITY,
+        )
+        .ok_or_else(|| {
+            ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                "near-allocation lower bound overflowed",
+            )
+        })?;
+        let maximum = target.saturating_add(REL32_REACH);
+        let mut cursor = minimum;
+        while cursor < maximum {
+            let mut information = MEMORY_BASIC_INFORMATION::default();
+            let queried = unsafe {
+                VirtualQueryEx(
+                    handle.raw(),
+                    Some(cursor as *const c_void),
+                    &mut information,
+                    size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if queried == 0 {
+                break;
+            }
+            let region_base = information.BaseAddress as usize;
+            let region_end = region_base.saturating_add(information.RegionSize);
+            if information.State == MEM_FREE {
+                let candidate =
+                    align_up(region_base.max(minimum), GRANULARITY).ok_or_else(|| {
+                        ProcessBackendError::new(
+                            ProcessBackendErrorKind::Native,
+                            "near-allocation candidate overflowed",
+                        )
+                    })?;
+                if candidate
+                    .checked_add(size)
+                    .is_some_and(|end| end <= region_end && end <= maximum)
+                {
+                    let pointer = unsafe {
+                        VirtualAllocEx(
+                            handle.raw(),
+                            Some(candidate as *const c_void),
+                            size,
+                            MEM_COMMIT | MEM_RESERVE,
+                            native_protection(protection),
+                        )
+                    };
+                    if !pointer.is_null() {
+                        return Ok(pointer as usize);
+                    }
+                }
+            }
+            cursor = region_end.max(cursor.saturating_add(GRANULARITY));
+        }
+        Err(last_error(format!(
+            "VirtualAllocEx could not allocate {size} bytes within rel32 reach of {target:#x}"
+        )))
+    }
+
     fn free_memory(
         &self,
         handle: &Self::Handle,
@@ -435,6 +546,13 @@ impl MutationBackend for WindowsProcessBackend {
     ) -> Result<(), ProcessBackendError> {
         unsafe { VirtualFreeEx(handle.raw(), address as *mut c_void, 0, MEM_RELEASE) }
             .map_err(|error| native_error(format!("VirtualFreeEx failed at {address:#x}"), error))
+    }
+
+    fn suspend_process_threads(
+        &self,
+        handle: &Self::Handle,
+    ) -> Result<SuspendedProcess, ProcessBackendError> {
+        suspend_process_threads(handle.raw())
     }
 
     fn protect_memory(
@@ -804,6 +922,97 @@ fn process_snapshot() -> Result<OwnedHandle, ProcessBackendError> {
         .map_err(|error| native_error("CreateToolhelp32Snapshot(processes) failed", error))
 }
 
+fn suspend_process_threads(handle: HANDLE) -> Result<SuspendedProcess, ProcessBackendError> {
+    let pid = unsafe { GetProcessId(handle) };
+    if pid == 0 {
+        return Err(last_error("GetProcessId failed before hook retirement"));
+    }
+    let mut suspended = SuspendedWindowsThreads(Vec::new());
+    let mut suspended_ids = HashSet::new();
+    let mut instruction_pointers = Vec::new();
+    loop {
+        let mut discovered = false;
+        for thread_id in target_thread_ids(pid)? {
+            if !suspended_ids.insert(thread_id) {
+                continue;
+            }
+            discovered = true;
+            let thread = unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    false,
+                    thread_id,
+                )
+            }
+            .map(OwnedHandle)
+            .map_err(|error| {
+                native_error(
+                    format!("OpenThread failed for thread {thread_id} during hook retirement"),
+                    error,
+                )
+            })?;
+            if unsafe { SuspendThread(thread.0) } == u32::MAX {
+                return Err(last_error(format!(
+                    "SuspendThread failed for thread {thread_id} during hook retirement"
+                )));
+            }
+            suspended.0.push(thread);
+            let mut context = CONTEXT {
+                ContextFlags: CONTEXT_CONTROL_AMD64,
+                ..Default::default()
+            };
+            unsafe {
+                GetThreadContext(
+                    suspended.0.last().expect("suspended thread is retained").0,
+                    &mut context,
+                )
+            }
+            .map_err(|error| {
+                native_error(
+                    format!(
+                        "GetThreadContext failed for thread {thread_id} during hook retirement"
+                    ),
+                    error,
+                )
+            })?;
+            instruction_pointers.push(context.Rip as usize);
+        }
+        if !discovered {
+            break;
+        }
+    }
+    Ok(SuspendedProcess::new(instruction_pointers, suspended))
+}
+
+fn target_thread_ids(pid: u32) -> Result<Vec<u32>, ProcessBackendError> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .map(OwnedHandle)
+        .map_err(|error| native_error("CreateToolhelp32Snapshot(threads) failed", error))?;
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    unsafe { Thread32First(snapshot.0, &mut entry) }
+        .map_err(|error| native_error("Thread32First failed during hook retirement", error))?;
+    let mut thread_ids = Vec::new();
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            thread_ids.push(entry.th32ThreadID);
+        }
+        match unsafe { Thread32Next(snapshot.0, &mut entry) } {
+            Ok(()) => {}
+            Err(error) if error.code() == ERROR_NO_MORE_FILES.to_hresult() => break,
+            Err(error) => {
+                return Err(native_error(
+                    "Thread32Next failed during hook retirement",
+                    error,
+                ))
+            }
+        }
+    }
+    Ok(thread_ids)
+}
+
 fn open_query_handle(pid: u32) -> Result<OwnedHandle, ProcessBackendError> {
     unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map(OwnedHandle)
@@ -878,6 +1087,12 @@ fn enumerate_modules(pid: u32) -> Result<Vec<ModuleDescriptor>, ProcessBackendEr
 
 fn executable_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+fn align_up(value: usize, alignment: usize) -> Option<usize> {
+    value
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|value| value & !(alignment - 1))
 }
 
 fn open_error(pid: u32, error: windows::core::Error) -> ProcessBackendError {
