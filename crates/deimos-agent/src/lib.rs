@@ -11,13 +11,14 @@ use deimos_core::lifecycle::{
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
 use deimos_core::memory::{
-    MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest,
-    MemoryProtectRequest, MemoryReadRequest, MemoryScanRequest, MemorySessionRequest,
-    MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
+    HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest,
+    MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest,
+    MemoryReadRequest, MemoryScanRequest, MemorySessionRequest, MemoryWriteRequest,
+    RemoteThreadStartRequest, TypedMemoryReadRequest, CAPABILITY_MEMORY_HOOK,
     CAPABILITY_MEMORY_MUTATION, CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD,
-    OP_MEMORY_ALLOCATE, OP_MEMORY_FREE, OP_MEMORY_POINTER_CHAIN, OP_MEMORY_PROTECT, OP_MEMORY_READ,
-    OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
-    OP_THREAD_START,
+    OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE, OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE,
+    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH,
+    OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, SessionRequest,
@@ -38,6 +39,7 @@ pub const MAX_AGENT_CONNECTIONS: usize = 16;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub mod hook;
 pub mod instance;
 pub mod memory;
 pub mod mutation;
@@ -85,6 +87,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
             CAPABILITY_PROCESS_MUTATION.to_string(),
             CAPABILITY_MEMORY_MUTATION.to_string(),
+            CAPABILITY_MEMORY_HOOK.to_string(),
             CAPABILITY_REMOTE_THREAD.to_string(),
         ],
         service.identity().clone(),
@@ -95,6 +98,17 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
     let mut workers: Vec<ConnectionWorker> = Vec::new();
     while !shutdown_acknowledged.load(Ordering::Acquire) {
         reap_finished_workers(&mut workers)?;
+        if let Err(error) = service.expire_hooks() {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "component": "deimos-agent",
+                    "event": "hook_cleanup_failed",
+                    "message": error.to_string(),
+                    "process_id": std::process::id()
+                })
+            );
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false)?;
@@ -227,6 +241,7 @@ pub struct AgentService<B: MutationBackend> {
     clients: Mutex<ClientRegistry>,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
     mutations: Mutex<mutation::MutationState<B::ThreadHandle>>,
+    hooks: Mutex<hook::HookState>,
     mutation_gate: Mutex<()>,
     shutting_down: AtomicBool,
     shutdown_complete: AtomicBool,
@@ -253,6 +268,7 @@ impl<B: MutationBackend> AgentService<B> {
             clients: Mutex::new(ClientRegistry::new()),
             sessions: Mutex::new(ProcessSessionRegistry::new()),
             mutations: Mutex::new(mutation::MutationState::new()),
+            hooks: Mutex::new(hook::HookState::default()),
             mutation_gate: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
@@ -326,8 +342,13 @@ impl<B: MutationBackend> AgentService<B> {
                 // operations waiting behind shutdown recheck and fail closed.
                 self.shutting_down.store(true, Ordering::Release);
                 let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
                 let mut sessions = self.lock_sessions(call)?;
                 let mut mutations = self.lock_mutations(call)?;
+                hook::cleanup_all(&mut sessions, &self.backend, &mut mutations, &mut hooks)
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
                 mutation::cleanup_all(&mut sessions, &self.backend, &mut mutations).map_err(
                     |error| Box::new(error.into_rpc_error(call.request_id, &call.operation)),
                 )?;
@@ -498,6 +519,81 @@ impl<B: MutationBackend> AgentService<B> {
                         })?;
                 encode_payload(call, response)
             }
+            OP_HOOK_ACTIVATE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                    ],
+                )?;
+                let request: HookActivateRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = hook::activate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                    Instant::now(),
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_HOOK_DEACTIVATE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                    ],
+                )?;
+                let request: HookDeactivateRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = hook::deactivate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_HOOK_HEARTBEAT => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                    ],
+                )?;
+                let request: HookHeartbeatRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let response =
+                    hook::heartbeat(&mut hooks, &request, Instant::now()).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
             OP_PROCESS_LIST => {
                 let request: ListProcessesRequest = decode_payload(call)?;
                 let sessions = self.lock_sessions(call)?;
@@ -531,8 +627,19 @@ impl<B: MutationBackend> AgentService<B> {
             OP_PROCESS_CLOSE => {
                 let request: SessionRequest = decode_payload(call)?;
                 let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
                 let mut sessions = self.lock_sessions(call)?;
                 let mut mutations = self.lock_mutations(call)?;
+                hook::cleanup_session(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request.session_id,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
                 mutation::cleanup_session(
                     &mut sessions,
                     &self.backend,
@@ -631,6 +738,21 @@ impl<B: MutationBackend> AgentService<B> {
         })
     }
 
+    fn lock_hooks(
+        &self,
+        call: &RpcCall,
+    ) -> Result<std::sync::MutexGuard<'_, hook::HookState>, Box<RpcError>> {
+        self.hooks.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "hook registry lock was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })
+    }
+
     fn lock_mutation_gate(
         &self,
         call: &RpcCall,
@@ -659,11 +781,43 @@ impl<B: MutationBackend> AgentService<B> {
             Ok(())
         }
     }
+
+    fn expire_hooks(&self) -> io::Result<usize> {
+        let _gate = self
+            .mutation_gate
+            .lock()
+            .map_err(|_| io::Error::other("mutation admission lock was poisoned"))?;
+        let mut hooks = self
+            .hooks
+            .lock()
+            .map_err(|_| io::Error::other("hook registry lock was poisoned"))?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| io::Error::other("process session registry lock was poisoned"))?;
+        let mut mutations = self
+            .mutations
+            .lock()
+            .map_err(|_| io::Error::other("mutation resource registry lock was poisoned"))?;
+        hook::expire_at(
+            &mut sessions,
+            &self.backend,
+            &mut mutations,
+            &mut hooks,
+            Instant::now(),
+        )
+        .map_err(|error| io::Error::other(error.into_rpc_error(0, "hook.cleanup").message))
+    }
 }
 
 impl<B: MutationBackend> Drop for AgentService<B> {
     fn drop(&mut self) {
-        if let (Ok(sessions), Ok(mutations)) = (self.sessions.get_mut(), self.mutations.get_mut()) {
+        if let (Ok(hooks), Ok(sessions), Ok(mutations)) = (
+            self.hooks.get_mut(),
+            self.sessions.get_mut(),
+            self.mutations.get_mut(),
+        ) {
+            let _ = hook::cleanup_all(sessions, &self.backend, mutations, hooks);
             let _ = mutation::cleanup_all(sessions, &self.backend, mutations);
         }
     }
@@ -739,7 +893,8 @@ mod tests {
         CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
     };
     use deimos_core::memory::{
-        MemoryRegionDescriptor, MemoryWriteRequest, CAPABILITY_MEMORY_MUTATION, OP_MEMORY_WRITE,
+        HookActivateRequest, MemoryRegionDescriptor, MemoryScanScope, MemoryWriteRequest,
+        CAPABILITY_MEMORY_HOOK, CAPABILITY_MEMORY_MUTATION, OP_HOOK_ACTIVATE, OP_MEMORY_WRITE,
     };
     use deimos_core::process::{
         classify_process, ModuleDescriptor, OpenProcessRequest, ProcessDescriptor, ProcessIdentity,
@@ -1223,7 +1378,7 @@ mod tests {
             request_id: 2,
             operation: OP_MEMORY_WRITE.to_string(),
             payload: to_value(MemoryWriteRequest {
-                session_id: session.session_id,
+                session_id: session.session_id.clone(),
                 address: "0x1000".to_string(),
                 bytes: vec![1],
             })
@@ -1255,6 +1410,34 @@ mod tests {
         assert_eq!(
             error.details.get("required_access_mode"),
             Some(&"mutation".to_string())
+        );
+
+        let hook_call = RpcCall {
+            request_id: 3,
+            operation: OP_HOOK_ACTIVATE.to_string(),
+            payload: to_value(HookActivateRequest {
+                session_id: session.session_id,
+                hook_key: "test.hook".to_string(),
+                signature: "00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D".to_string(),
+                scope: MemoryScanScope::Process,
+                payload: vec![],
+            })
+            .expect("hook request should serialize"),
+            native_context: None,
+        };
+        let error = service
+            .handle_call_with_capabilities(
+                &hook_call,
+                &[
+                    CAPABILITY_PROCESS_MUTATION.to_string(),
+                    CAPABILITY_MEMORY_MUTATION.to_string(),
+                ],
+            )
+            .expect_err("hooks must require their distinct capability");
+        assert_eq!(error.code, RpcErrorCode::CapabilityRequired);
+        assert_eq!(
+            error.details.get("missing_capabilities"),
+            Some(&CAPABILITY_MEMORY_HOOK.to_string())
         );
     }
 

@@ -172,6 +172,31 @@ pub fn write<B: MutationBackend>(
     })
 }
 
+/// Flushes code that was just written to a remote process before it can be
+/// reached by a detour.  It intentionally shares mutation-session validation
+/// with writes so a stale process never receives a cache operation.
+pub fn flush_instruction_cache<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    address: &str,
+    size: usize,
+) -> Result<(), MutationApiError> {
+    let address = validate_range(address, size)?;
+    let execution =
+        sessions.with_mutation_session_effect(backend, session_id, |backend, handle, _| {
+            backend
+                .flush_instruction_cache(handle, address, size)
+                .map_err(|error| MutationApiError::backend(RpcErrorCode::MemoryWriteFailed, error))
+        })?;
+    if let Some(error) = execution.validation_error {
+        return Err(MutationApiError::Process(
+            error.with_detail("instruction_cache_flushed", "true"),
+        ));
+    }
+    Ok(())
+}
+
 pub fn allocate<B: MutationBackend>(
     sessions: &mut ProcessSessionRegistry<B::Handle>,
     backend: &B,

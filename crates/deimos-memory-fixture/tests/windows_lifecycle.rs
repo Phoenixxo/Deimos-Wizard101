@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use deimos_agent::process::ProcessSessionRegistry;
 use deimos_agent::windows_process::{WindowsProcessBackend, WindowsProcessHandle};
 use deimos_core::memory::{
-    ByteOrder, MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest,
-    MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadItem, MemoryReadRequest,
-    MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType, MemoryWriteRequest,
-    RemoteThreadStartRequest, TypedMemoryReadRequest,
+    ByteOrder, HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest,
+    MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest,
+    MemoryProtectRequest, MemoryReadItem, MemoryReadRequest, MemoryScanRequest, MemoryScanScope,
+    MemorySessionRequest, MemoryValueType, MemoryWriteRequest, RemoteThreadStartRequest,
+    TypedMemoryReadRequest,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessKind,
@@ -860,6 +861,269 @@ fn fixture_validates_controlled_mutation_primitives_and_cleanup() {
         .close(&backend, &read_only.session_id)
         .expect("read-only session should close");
 
+    let mut stdin = fixture
+        .child
+        .stdin
+        .take()
+        .expect("fixture stdin should be piped");
+    writeln!(stdin, "{SHUTDOWN_COMMAND}").expect("shutdown command should be writable");
+    stdin.flush().expect("shutdown command should flush");
+    drop(stdin);
+    assert!(fixture.wait_for_exit(SHUTDOWN_TIMEOUT).success());
+}
+
+#[test]
+fn fixture_validates_transactional_hook_lifecycle() {
+    let mut fixture = FixtureProcess::spawn();
+    let metadata = read_metadata(&mut fixture);
+    let backend = WindowsProcessBackend;
+    let mut sessions = ProcessSessionRegistry::<WindowsProcessHandle>::new();
+    let listed = sessions
+        .list(
+            &backend,
+            &ListProcessesRequest {
+                names: vec![MEMORY_FIXTURE_EXECUTABLE.to_string()],
+            },
+        )
+        .expect("agent should enumerate fixture")
+        .processes
+        .into_iter()
+        .find(|process| process.pid == metadata.pid)
+        .expect("fixture should be discoverable");
+    let session = sessions
+        .open(
+            &backend,
+            &OpenProcessRequest {
+                pid: metadata.pid,
+                expected_identity: listed.identity,
+                access_mode: ProcessAccessMode::Mutation,
+            },
+        )
+        .expect("mutation fixture session should open");
+    // A private executable allocation keeps the hook test independent of the
+    // fixture's data signatures and proves the trampoline is executable. The
+    // original body stores 0x11111111 at [rcx], clears [rcx + 4], returns, and
+    // is exactly 16 complete position-independent x64 bytes.
+    let original_code = [
+        0xc7, 0x01, 0x11, 0x11, 0x11, 0x11, // mov dword ptr [rcx], 0x11111111
+        0xc7, 0x41, 0x04, 0, 0, 0, 0, // mov dword ptr [rcx + 4], 0
+        0x31, 0xc0, // xor eax, eax
+        0xc3, // ret
+    ];
+    let mut mutations = deimos_agent::mutation::MutationState::new();
+    let target_allocation = deimos_agent::mutation::allocate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &MemoryAllocateRequest {
+            session_id: session.session_id.clone(),
+            size: original_code.len(),
+            protection: deimos_core::memory::MemoryProtection::ExecuteReadWrite,
+        },
+    )
+    .expect("fixture hook target allocation should succeed");
+    let output_allocation = deimos_agent::mutation::allocate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &MemoryAllocateRequest {
+            session_id: session.session_id.clone(),
+            size: 12,
+            protection: deimos_core::memory::MemoryProtection::ReadWrite,
+        },
+    )
+    .expect("fixture hook output allocation should succeed");
+    deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: session.session_id.clone(),
+            address: target_allocation.address.clone(),
+            bytes: original_code.to_vec(),
+        },
+    )
+    .expect("fixture hook target should be writable");
+    let target = parse_address(&target_allocation.address);
+    let before = deimos_agent::memory::read(
+        &mut sessions,
+        &backend,
+        &MemoryReadRequest {
+            session_id: session.session_id.clone(),
+            address: format!("{target:#x}"),
+            size: original_code.len(),
+        },
+    )
+    .expect("hook target should be readable")
+    .bytes;
+    let request = HookActivateRequest {
+        session_id: session.session_id.clone(),
+        hook_key: "fixture.lifecycle".to_string(),
+        signature: "C7 01 11 11 11 11 C7 41 04 00 00 00 00 31 C0 C3".to_string(),
+        scope: MemoryScanScope::Process,
+        // This payload runs before the copied original code and writes a
+        // separate output slot that the original body does not touch.
+        payload: vec![0xc7, 0x41, 0x08, 0x22, 0x22, 0x22, 0x22],
+    };
+    let mut hooks = deimos_agent::hook::HookState::default();
+    let activated = deimos_agent::hook::activate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &request,
+        Instant::now(),
+    )
+    .expect("fixture hook should activate");
+    assert_eq!(activated.target_address, format!("{target:#x}"));
+    assert_eq!(hooks.tracked_count(&session.session_id), 1);
+    assert_eq!(mutations.tracked_count(&session.session_id), 3);
+    assert_ne!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: format!("{target:#x}"),
+                size: before.len(),
+            },
+        )
+        .expect("active detour should be readable")
+        .bytes,
+        before
+    );
+    let repeated = deimos_agent::hook::activate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &request,
+        Instant::now(),
+    )
+    .expect("identical activation should be idempotent");
+    assert_eq!(repeated.allocation_id, activated.allocation_id);
+    assert_eq!(mutations.tracked_count(&session.session_id), 3);
+    let hooked = deimos_agent::mutation::start_thread(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &RemoteThreadStartRequest {
+            session_id: session.session_id.clone(),
+            start_address: target_allocation.address.clone(),
+            parameter: Some(output_allocation.address.clone()),
+            wait_timeout_ms: 4_000,
+        },
+    )
+    .expect("hooked fixture target should execute");
+    assert!(hooked.completed);
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: output_allocation.address.clone(),
+                size: 12,
+            },
+        )
+        .expect("hooked output should be readable")
+        .bytes,
+        [
+            0x11, 0x11, 0x11, 0x11, // copied original body
+            0, 0, 0, 0, // copied original body
+            0x22, 0x22, 0x22, 0x22, // hook payload
+        ],
+        "payload, saved original instructions, and continuation must execute in order"
+    );
+    deimos_agent::hook::heartbeat(
+        &mut hooks,
+        &HookHeartbeatRequest {
+            session_id: session.session_id.clone(),
+            hook_key: request.hook_key.clone(),
+        },
+        Instant::now(),
+    )
+    .expect("heartbeat should renew active hook");
+    deimos_agent::hook::deactivate(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &mut hooks,
+        &HookDeactivateRequest {
+            session_id: session.session_id.clone(),
+            hook_key: request.hook_key.clone(),
+        },
+    )
+    .expect("deactivation should restore fixture bytes");
+    assert_eq!(hooks.tracked_count(&session.session_id), 0);
+    assert_eq!(mutations.tracked_count(&session.session_id), 2);
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: format!("{target:#x}"),
+                size: before.len(),
+            },
+        )
+        .expect("deactivated target should be readable")
+        .bytes,
+        before
+    );
+    deimos_agent::mutation::write(
+        &mut sessions,
+        &backend,
+        &MemoryWriteRequest {
+            session_id: session.session_id.clone(),
+            address: output_allocation.address.clone(),
+            bytes: vec![0; 12],
+        },
+    )
+    .expect("fixture output should reset");
+    deimos_agent::mutation::start_thread(
+        &mut sessions,
+        &backend,
+        &mut mutations,
+        &RemoteThreadStartRequest {
+            session_id: session.session_id.clone(),
+            start_address: target_allocation.address.clone(),
+            parameter: Some(output_allocation.address.clone()),
+            wait_timeout_ms: 4_000,
+        },
+    )
+    .expect("unhooked fixture target should execute");
+    assert_eq!(
+        deimos_agent::memory::read(
+            &mut sessions,
+            &backend,
+            &MemoryReadRequest {
+                session_id: session.session_id.clone(),
+                address: output_allocation.address.clone(),
+                size: 12,
+            },
+        )
+        .expect("unhooked output should be readable")
+        .bytes,
+        [0x11, 0x11, 0x11, 0x11, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    for allocation_id in [
+        target_allocation.allocation_id,
+        output_allocation.allocation_id,
+    ] {
+        deimos_agent::mutation::free(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &MemoryFreeRequest {
+                session_id: session.session_id.clone(),
+                allocation_id,
+            },
+        )
+        .expect("fixture hook test allocation should be released");
+    }
+    sessions
+        .close(&backend, &session.session_id)
+        .expect("fixture session should close");
     let mut stdin = fixture
         .child
         .stdin
