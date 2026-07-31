@@ -11,14 +11,17 @@ use deimos_core::lifecycle::{
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
 };
 use deimos_core::memory::{
-    HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest, MemoryAllocateRequest,
-    MemoryBatchReadRequest, MemoryFreeRequest, MemoryPointerChainRequest, MemoryProtectRequest,
-    MemoryReadRequest, MemoryScanRequest, MemorySessionRequest, MemoryWriteRequest,
-    RemoteThreadStartRequest, TypedMemoryReadRequest, CAPABILITY_MEMORY_HOOK,
-    CAPABILITY_MEMORY_MUTATION, CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD,
-    OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE, OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE,
-    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH,
-    OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
+    CoreHookRequest, CoreHookSessionRequest, HookActivateRequest, HookDeactivateRequest,
+    HookHeartbeatRequest, MemoryAllocateRequest, MemoryBatchReadRequest, MemoryFreeRequest,
+    MemoryPointerChainRequest, MemoryProtectRequest, MemoryReadRequest, MemoryScanRequest,
+    MemorySessionRequest, MemoryWriteRequest, RemoteThreadStartRequest, TypedMemoryReadRequest,
+    CAPABILITY_CORE_HOOK, CAPABILITY_MEMORY_HOOK, CAPABILITY_MEMORY_MUTATION,
+    CAPABILITY_MEMORY_READ_ONLY, CAPABILITY_REMOTE_THREAD, OP_CORE_HOOK_ACTIVATE,
+    OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
+    OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE,
+    OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE, OP_MEMORY_POINTER_CHAIN,
+    OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
+    OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, SessionRequest,
@@ -39,6 +42,7 @@ pub const MAX_AGENT_CONNECTIONS: usize = 16;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub mod core_hook;
 pub mod hook;
 pub mod instance;
 pub mod memory;
@@ -88,6 +92,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_PROCESS_MUTATION.to_string(),
             CAPABILITY_MEMORY_MUTATION.to_string(),
             CAPABILITY_MEMORY_HOOK.to_string(),
+            CAPABILITY_CORE_HOOK.to_string(),
             CAPABILITY_REMOTE_THREAD.to_string(),
         ],
         service.identity().clone(),
@@ -590,6 +595,163 @@ impl<B: MutationBackend> AgentService<B> {
                 let mut hooks = self.lock_hooks(call)?;
                 let response =
                     hook::heartbeat(&mut hooks, &request, Instant::now()).map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_ACTIVATE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = core_hook::activate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                    Instant::now(),
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_ACTIVATE_ALL => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookSessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                self.ensure_mutation_admission(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = core_hook::activate_all(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                    Instant::now(),
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_DEACTIVATE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = core_hook::deactivate(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_DEACTIVATE_ALL => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookSessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let mut mutations = self.lock_mutations(call)?;
+                let response = core_hook::deactivate_all(
+                    &mut sessions,
+                    &self.backend,
+                    &mut mutations,
+                    &mut hooks,
+                    &request,
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_HEARTBEAT_ALL => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookSessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let response = core_hook::heartbeat_all(&mut hooks, &request, Instant::now())
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
+                encode_payload(call, response)
+            }
+            OP_CORE_HOOK_READ_BASE => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_MUTATION,
+                        CAPABILITY_MEMORY_MUTATION,
+                        CAPABILITY_MEMORY_HOOK,
+                        CAPABILITY_CORE_HOOK,
+                    ],
+                )?;
+                let request: CoreHookRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response = core_hook::read_base(&mut sessions, &self.backend, &hooks, &request)
+                    .map_err(|error| {
                         Box::new(error.into_rpc_error(call.request_id, &call.operation))
                     })?;
                 encode_payload(call, response)
