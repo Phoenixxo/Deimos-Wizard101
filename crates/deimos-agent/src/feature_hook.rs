@@ -23,6 +23,9 @@ use crate::process::{MutationBackend, ProcessApiError, ProcessSessionRegistry};
 
 const MODULE: &str = "WizardGraphicalClient.exe";
 const MAX_CHAT_WCHARS: usize = 79;
+const CHAT_TYPE_MARKER: &[u8] = &[0xc7, 0x45, 0xf0, 0x09, 0, 0, 0];
+const CHAT_HOOK_SITE: &[u8] = &[0x48, 0x8d, 0x4d, 0xf8, 0x48, 0x3b, 0xc8];
+const SEND_FUNCTION_MARKER: &[u8] = &[0x48, 0x83, 0xc2, 0x20];
 const ACTION_POLL: Duration = Duration::from_millis(20);
 const MAX_EXPORT_FORWARD_DEPTH: usize = 4;
 const MAX_EXPORT_NAME_BYTES: usize = 4096;
@@ -1073,8 +1076,7 @@ fn resolve_chat_target<B: MutationBackend>(
         backend,
         session_id,
         "48 89 5C 24 18 48 89 74 24 20 55 57 41 56 48 8D AC 24 40 FF FF FF 48 81 EC C0 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 B0 00 00 00 48 8B FA 48 8B F1 45 33 F6",
-        0x7e,
-        &[0xc7, 0x45, 0xf0, 0x09, 0, 0, 0],
+        &[(0x7e, CHAT_TYPE_MARKER), (0x379, CHAT_HOOK_SITE)],
     )?;
     base.checked_add(0x379).ok_or_else(|| {
         FeatureHookApiError::request(
@@ -1094,8 +1096,7 @@ fn resolve_send_function<B: MutationBackend>(
         backend,
         session_id,
         "48 89 5C 24 18 55 56 57 48 8D AC 24 30 FF FF FF 48 81 EC D0 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 C0 00 00 00 48 8B DA 48 8B F9",
-        0x33,
-        &[0x48, 0x83, 0xc2, 0x20],
+        &[(0x33, SEND_FUNCTION_MARKER)],
     )
 }
 
@@ -1164,8 +1165,7 @@ fn resolve_disambiguated<B: MutationBackend>(
     backend: &B,
     session_id: &ProcessSessionId,
     signature: &str,
-    marker_offset: usize,
-    marker: &[u8],
+    probes: &[(usize, &[u8])],
 ) -> Result<usize, FeatureHookApiError> {
     let response = memory::scan(
         sessions,
@@ -1179,30 +1179,50 @@ fn resolve_disambiguated<B: MutationBackend>(
             scope: module_scope(),
         },
     )?;
+    let candidates = response
+        .matches
+        .iter()
+        .map(|candidate| parse_address(candidate))
+        .collect::<Result<Vec<_>, _>>()?;
+    select_disambiguated_candidate(&candidates, probes, &mut |address, size| {
+        read_at(sessions, backend, session_id, address, size)
+    })?
+    .ok_or_else(|| {
+        FeatureHookApiError::request(
+            RpcErrorCode::MemoryRequiredMatchNotFound,
+            "feature-hook function marker was not found",
+        )
+    })
+}
+
+fn select_disambiguated_candidate(
+    candidates: &[usize],
+    probes: &[(usize, &[u8])],
+    read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>, FeatureHookApiError>,
+) -> Result<Option<usize>, FeatureHookApiError> {
     let mut selected = None;
-    for candidate in response.matches {
-        let candidate = parse_address(&candidate)?;
-        if read_at(
-            sessions,
-            backend,
-            session_id,
-            candidate + marker_offset,
-            marker.len(),
-        )? == marker
-            && selected.replace(candidate).is_some()
-        {
+    for candidate in candidates {
+        let mut matches = true;
+        for (offset, expected) in probes {
+            let address = candidate.checked_add(*offset).ok_or_else(|| {
+                FeatureHookApiError::request(
+                    RpcErrorCode::MemoryInvalidAddress,
+                    "feature-hook disambiguation address overflowed the agent address width",
+                )
+            })?;
+            if read(address, expected.len())? != *expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches && selected.replace(*candidate).is_some() {
             return Err(FeatureHookApiError::request(
                 RpcErrorCode::MemoryAmbiguousMatch,
                 "feature-hook disambiguation matched more than one function",
             ));
         }
     }
-    selected.ok_or_else(|| {
-        FeatureHookApiError::request(
-            RpcErrorCode::MemoryRequiredMatchNotFound,
-            "feature-hook function marker was not found",
-        )
-    })
+    Ok(selected)
 }
 
 fn resolve_relative_call<B: MutationBackend>(
@@ -2226,8 +2246,9 @@ mod tests {
 
     use super::{
         activate, add_buddy, build_payload, dance_code, deactivate, movement_code,
-        quiescence_counter_code, read_export, resolve_export_from_modules, send_chat,
-        set_mouse_position, teleport, write_at, ExportLookup, FeatureHookApiError, PayloadKind,
+        quiescence_counter_code, read_export, resolve_export_from_modules,
+        select_disambiguated_candidate, send_chat, set_mouse_position, teleport, write_at,
+        ExportLookup, FeatureHookApiError, PayloadKind, CHAT_HOOK_SITE, CHAT_TYPE_MARKER,
     };
     use crate::hook::tests::{registry, Backend, Failure};
     use crate::hook::{self, HookState, HOOK_LEASE};
@@ -2241,6 +2262,38 @@ mod tests {
         let address = resolve(&modules, &images, "user32.dll", "GetCursorPos")
             .expect("named export should resolve");
         assert_eq!(address, 0x1500);
+    }
+
+    #[test]
+    fn chat_selector_requires_hook_site_when_type_markers_are_duplicated() {
+        let candidates = [0x1000, 0x2000];
+        let memory = BTreeMap::from([
+            (candidates[0] + 0x7e, CHAT_TYPE_MARKER.to_vec()),
+            (candidates[1] + 0x7e, CHAT_TYPE_MARKER.to_vec()),
+            (candidates[0] + 0x379, CHAT_HOOK_SITE.to_vec()),
+            (
+                candidates[1] + 0x379,
+                vec![0x48, 0x8b, 0x10, 0x4c, 0x8b, 0x40, 0x10],
+            ),
+        ]);
+        let mut read = |address, size| {
+            let bytes = memory.get(&address).expect("probe address should exist");
+            assert_eq!(bytes.len(), size);
+            Ok(bytes.clone())
+        };
+
+        let error =
+            select_disambiguated_candidate(&candidates, &[(0x7e, CHAT_TYPE_MARKER)], &mut read)
+                .expect_err("the legacy type marker alone should remain ambiguous");
+        assert!(error_message(error).contains("more than one function"));
+
+        let selected = select_disambiguated_candidate(
+            &candidates,
+            &[(0x7e, CHAT_TYPE_MARKER), (0x379, CHAT_HOOK_SITE)],
+            &mut read,
+        )
+        .expect("the hook-site instructions should disambiguate the candidates");
+        assert_eq!(selected, Some(candidates[0]));
     }
 
     #[test]
