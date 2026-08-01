@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use deimos_core::client::{
     ClientDescriptor, ClientId, KeyAction, ListClientsResponse, MessageDelivery, MouseButton,
-    WindowPoint, WindowRectangle,
+    WindowPoint, WindowRectangle, WindowSize,
 };
 use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
@@ -85,6 +85,8 @@ pub struct ClientWindowSnapshot {
     pub title: String,
     pub is_foreground: bool,
     pub rectangle: WindowRectangle,
+    pub client_origin: WindowPoint,
+    pub client_size: WindowSize,
 }
 
 pub trait ProcessBackend: Send + Sync + 'static {

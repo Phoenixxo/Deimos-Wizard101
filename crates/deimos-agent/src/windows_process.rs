@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use deimos_core::client::{KeyAction, MessageDelivery, MouseButton, WindowPoint, WindowRectangle};
+use deimos_core::client::{
+    KeyAction, MessageDelivery, MouseButton, WindowPoint, WindowRectangle, WindowSize,
+};
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     classify_process, ModuleDescriptor, ProcessAccessMode, ProcessDescriptor, ProcessIdentity,
@@ -10,7 +12,7 @@ use deimos_core::process::{
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, ERROR_NO_MORE_FILES, E_ACCESSDENIED, E_INVALIDARG, FILETIME, HANDLE, HWND,
-    LPARAM, RECT, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    LPARAM, POINT, RECT, STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Diagnostics::Debug::{
@@ -37,10 +39,10 @@ use windows::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostMessageW, SendMessageW,
-    SetForegroundWindow, SetWindowTextW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, PostMessageW,
+    SendMessageW, SetForegroundWindow, SetWindowTextW, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
 };
 
 use crate::process::{
@@ -274,6 +276,13 @@ impl ProcessBackend for WindowsProcessBackend {
         let mut rectangle = RECT::default();
         unsafe { GetWindowRect(hwnd, &mut rectangle) }
             .map_err(|error| native_error("GetWindowRect failed for Wizard101 client", error))?;
+        let mut client_rectangle = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut client_rectangle) }
+            .map_err(|error| native_error("GetClientRect failed for Wizard101 client", error))?;
+        let mut client_origin = POINT::default();
+        if !unsafe { ClientToScreen(hwnd, &mut client_origin) }.as_bool() {
+            return Err(last_error("ClientToScreen failed for Wizard101 client"));
+        }
         Ok(ClientWindowSnapshot {
             title: String::from_utf16_lossy(&title),
             is_foreground: unsafe { GetForegroundWindow() } == hwnd,
@@ -282,6 +291,14 @@ impl ProcessBackend for WindowsProcessBackend {
                 top: rectangle.top,
                 right: rectangle.right,
                 bottom: rectangle.bottom,
+            },
+            client_origin: WindowPoint {
+                x: client_origin.x,
+                y: client_origin.y,
+            },
+            client_size: WindowSize {
+                width: client_rectangle.right - client_rectangle.left,
+                height: client_rectangle.bottom - client_rectangle.top,
             },
         })
     }

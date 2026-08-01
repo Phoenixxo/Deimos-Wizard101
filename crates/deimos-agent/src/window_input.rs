@@ -100,6 +100,8 @@ pub fn state<B: ProcessBackend>(
         title: snapshot.title,
         is_foreground: snapshot.is_foreground,
         rectangle: snapshot.rectangle,
+        client_origin: snapshot.client_origin,
+        client_size: snapshot.client_size,
     })
 }
 

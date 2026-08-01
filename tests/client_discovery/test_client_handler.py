@@ -63,6 +63,8 @@ class FakeAgentManager:
             "title": "Wizard101",
             "is_foreground": client_id in self.foreground_clients,
             "rectangle": {"left": 10, "top": 20, "right": 810, "bottom": 620},
+            "client_origin": {"x": 12, "y": 42},
+            "client_size": {"width": 796, "height": 576},
         }
 
     def focus_client_window(self, client_id):
@@ -176,6 +178,16 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(client.title, "Wizard101")
         self.assertEqual(tuple(client.window_rectangle), (810, 10, 20, 620))
+        self.assertEqual(
+            client.overlay_geometry,
+            {
+                "left": 12,
+                "top": 42,
+                "width": 796,
+                "height": 576,
+                "is_foreground": False,
+            },
+        )
         self.assertFalse(client.is_foreground)
         client.title = "Balance"
         client.is_foreground = True
