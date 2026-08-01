@@ -197,6 +197,7 @@ fn host_hotkey_error(py: Python<'_>, operation: &str, error: NativeHostHotkeyErr
             "hotkey_unsupported_platform",
             "Global hotkeys are available only on Windows and macOS.",
         ),
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         HostHotkeyErrorKind::Native => (
             "hotkey_native_failure",
             "Deimos could not update that global shortcut. Try another binding or restart Deimos.",

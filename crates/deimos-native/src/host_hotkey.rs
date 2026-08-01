@@ -35,6 +35,7 @@ pub enum HostHotkeyErrorKind {
     PermissionRequired,
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     UnsupportedPlatform,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     Native,
 }
 
