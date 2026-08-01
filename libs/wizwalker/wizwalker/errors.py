@@ -184,6 +184,66 @@ class CardAlreadyEnchanted(WizWalkerError):
 
 
 # TODO: remove in 2.0
-class HotkeyAlreadyRegistered(WizWalkerError):
-    def __init__(self, key: str):
-        super().__init__(f"{key} already registered")
+class HotkeyRegistrationError(WizWalkerError):
+    """A global shortcut could not be registered or removed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        keycode: int | None = None,
+        modifiers: int | None = None,
+        details=None,
+        technical_message: str | None = None,
+        operation: str | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.operation = operation or (
+            "hotkey.unregister"
+            if code == "hotkey_not_registered"
+            else "hotkey.register"
+        )
+        self.keycode = keycode
+        self.modifiers = modifiers
+        self.details = details or {}
+        self.technical_message = technical_message
+
+
+class HotkeyAlreadyRegistered(HotkeyRegistrationError):
+    def __init__(
+        self,
+        keycode,
+        modifiers=0,
+        *,
+        message=None,
+        details=None,
+        technical_message=None,
+    ):
+        raw_keycode = getattr(keycode, "value", keycode)
+        try:
+            numeric_keycode = int(raw_keycode)
+        except (TypeError, ValueError):
+            numeric_keycode = None
+        if message is None:
+            if numeric_keycode is None:
+                message = f"{keycode} already registered"
+            else:
+                message = (
+                    f"The shortcut using key {numeric_keycode} and modifiers "
+                    f"{int(modifiers)} is already registered."
+                )
+        super().__init__(
+            message,
+            code="hotkey_conflict",
+            keycode=numeric_keycode,
+            modifiers=int(modifiers),
+            details=details,
+            technical_message=technical_message,
+        )
+
+
+class HotkeyBackendUnavailable(HotkeyRegistrationError):
+    def __init__(self, message: str):
+        super().__init__(message, code="hotkey_backend_unavailable")

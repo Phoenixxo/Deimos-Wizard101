@@ -650,8 +650,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                         if com.data is not None:
                             if highlight_overlay[0] is None:
                                 highlight_overlay[0] = HighlightOverlay()
-                            game_hwnd, x1, y1, x2, y2 = com.data
-                            highlight_overlay[0].update_box(game_hwnd, x1, y1, x2, y2)
+                            overlay_target, x1, y1, x2, y2 = com.data
+                            highlight_overlay[0].update_box(overlay_target, x1, y1, x2, y2)
                         else:
                             if highlight_overlay[0] is not None:
                                 highlight_overlay[0].clear_box()
