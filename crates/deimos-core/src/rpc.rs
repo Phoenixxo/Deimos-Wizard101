@@ -977,12 +977,16 @@ mod tests {
 
     #[test]
     fn authenticated_connection_remains_usable_after_handshake_timeout() {
-        let config = RpcConfig {
+        let server_config = RpcConfig {
             io_timeout: Duration::from_millis(25),
             ..RpcConfig::default()
         };
-        let (address, token, thread) = start_server(|call| Ok(call.payload.clone()), config);
-        let mut client = RpcClient::connect(address, token, vec![], None, config)
+        let client_config = RpcConfig {
+            io_timeout: Duration::from_secs(1),
+            ..RpcConfig::default()
+        };
+        let (address, token, thread) = start_server(|call| Ok(call.payload.clone()), server_config);
+        let mut client = RpcClient::connect(address, token, vec![], None, client_config)
             .expect("client should complete the handshake");
 
         thread::sleep(Duration::from_millis(100));
