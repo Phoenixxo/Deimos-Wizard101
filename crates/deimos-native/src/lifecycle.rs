@@ -5,10 +5,14 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use deimos_core::client::ClientId;
 use deimos_core::client::{
     CAPABILITY_CLIENT_DISCOVERY, CAPABILITY_CLIENT_INPUT, CAPABILITY_CLIENT_WINDOW,
 };
-use deimos_core::game::CAPABILITY_GAME_PROCESS;
+use deimos_core::game::{
+    login_associated_data, GameLoginRequest, CAPABILITY_GAME_LOGIN, CAPABILITY_GAME_PROCESS,
+    OP_GAME_LOGIN,
+};
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -19,6 +23,7 @@ use deimos_core::memory::{
 };
 use deimos_core::process::{CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY};
 use deimos_core::rpc::{AuthToken, NativeContext, RpcClient, RpcClientError, RpcConfig};
+use deimos_core::secret::seal_credential;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -32,7 +37,7 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
 ];
-const REQUESTED_AGENT_CAPABILITIES: [&str; 12] = [
+const REQUESTED_AGENT_CAPABILITIES: [&str; 13] = [
     CAPABILITY_AGENT_LIFECYCLE,
     CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
@@ -45,6 +50,7 @@ const REQUESTED_AGENT_CAPABILITIES: [&str; 12] = [
     CAPABILITY_CLIENT_WINDOW,
     CAPABILITY_CLIENT_INPUT,
     CAPABILITY_GAME_PROCESS,
+    CAPABILITY_GAME_LOGIN,
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -235,6 +241,7 @@ pub enum AgentCallError {
         native_context: NativeContext,
         source: Box<RpcClientError>,
     },
+    CredentialTransfer(String),
 }
 
 impl fmt::Display for AgentCallError {
@@ -242,6 +249,7 @@ impl fmt::Display for AgentCallError {
         match self {
             Self::Lifecycle(error) => error.fmt(formatter),
             Self::Rpc { source, .. } => source.fmt(formatter),
+            Self::CredentialTransfer(message) => formatter.write_str(message),
         }
     }
 }
@@ -251,6 +259,7 @@ impl std::error::Error for AgentCallError {
         match self {
             Self::Lifecycle(error) => Some(error),
             Self::Rpc { source, .. } => Some(source),
+            Self::CredentialTransfer(_) => None,
         }
     }
 }
@@ -492,6 +501,81 @@ impl<R: AgentRuntime> AgentManager<R> {
         }
         result.map_err(|source| AgentCallError::Rpc {
             operation: operation.to_string(),
+            native_context,
+            source: Box::new(source),
+        })
+    }
+
+    pub fn login_with_credential(
+        &mut self,
+        bottle: &BottleId,
+        client_id: ClientId,
+        username: &[u8],
+        password: &[u8],
+        timeout: Duration,
+    ) -> Result<Value, AgentCallError> {
+        let managed = self.managed.get_mut(bottle).ok_or_else(|| {
+            LifecycleError::new(
+                LifecycleErrorCode::HealthCheckFailed,
+                bottle.as_str(),
+                "no managed agent exists for this bottle; call ensure_agent first",
+            )
+        })?;
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error.into());
+        }
+        let transfer_id = AuthToken::generate()
+            .map_err(|_| {
+                AgentCallError::CredentialTransfer(
+                    "a one-time credential transfer identifier could not be generated".to_string(),
+                )
+            })?
+            .as_str()
+            .to_string();
+        let agent_instance_id = managed.identity.instance_id.clone();
+        let associated_data = login_associated_data(&agent_instance_id, &client_id, &transfer_id);
+        let credential = seal_credential(
+            &managed.endpoint.token,
+            username,
+            password,
+            &associated_data,
+        )
+        .map_err(|_| {
+            AgentCallError::CredentialTransfer(
+                "secure account data could not be prepared for the helper agent".to_string(),
+            )
+        })?;
+        let timeout_ms = u32::try_from(timeout.as_millis()).map_err(|_| {
+            AgentCallError::CredentialTransfer(
+                "automatic login timeout exceeds the supported range".to_string(),
+            )
+        })?;
+        let payload = serde_json::to_value(GameLoginRequest {
+            client_id,
+            agent_instance_id,
+            transfer_id,
+            credential,
+            timeout_ms,
+        })
+        .map_err(|_| {
+            AgentCallError::CredentialTransfer(
+                "secure account data could not be encoded for the helper agent".to_string(),
+            )
+        })?;
+        let native_context = self.native_context.clone();
+        let result = managed.client.call_with_timeout(
+            OP_GAME_LOGIN,
+            payload,
+            Some(native_context.clone()),
+            timeout.saturating_add(Duration::from_secs(5)),
+        );
+        if result.is_err() {
+            if let Some(error) = poll_process_exit(bottle, managed)? {
+                return Err(error.into());
+            }
+        }
+        result.map_err(|source| AgentCallError::Rpc {
+            operation: OP_GAME_LOGIN.to_string(),
             native_context,
             source: Box::new(source),
         })

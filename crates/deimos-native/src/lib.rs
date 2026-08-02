@@ -1,5 +1,6 @@
 #![allow(clippy::useless_conversion, unexpected_cfgs)]
 
+mod account;
 mod host_hotkey;
 mod host_window;
 pub mod lifecycle;
@@ -60,6 +61,7 @@ mod tests {
                 "WindowError",
                 "InputError",
                 "GameProcessError",
+                "AccountError",
                 "HostHotkeyError",
                 "HostWindowError",
                 "NativePanicError",
@@ -113,6 +115,30 @@ mod tests {
                     "{forbidden} must not expose authentication material"
                 );
             }
+            for function in [
+                "prompt_save_account",
+                "delete_account",
+                "list_accounts",
+                "reorder_accounts",
+                "has_account",
+                "update_player_gid",
+                "get_player_gid",
+                "get_nickname_by_gid",
+            ] {
+                assert!(
+                    module
+                        .getattr(function)
+                        .unwrap_or_else(|_| panic!("{function} should be exported"))
+                        .is_callable(),
+                    "{function} should be callable"
+                );
+            }
+            assert!(
+                !module
+                    .hasattr("read_credential")
+                    .expect("module attribute lookup should succeed"),
+                "Python must not expose stored credential values"
+            );
             for method in [
                 "start",
                 "status",
@@ -121,6 +147,15 @@ mod tests {
                 "list_clients",
                 "launch_game",
                 "terminate_game",
+                "prompt_save_account",
+                "delete_account",
+                "list_accounts",
+                "reorder_accounts",
+                "has_account",
+                "update_player_gid",
+                "get_player_gid",
+                "get_nickname_by_gid",
+                "login_account",
                 "client_window_state",
                 "focus_client_window",
                 "set_client_window_title",
