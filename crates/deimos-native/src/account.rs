@@ -26,6 +26,7 @@ pub struct StoredCredential {
 }
 
 impl StoredCredential {
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     pub fn new(username: Vec<u8>, password: Vec<u8>) -> Result<Self, AccountError> {
         let username = Zeroizing::new(username);
         let password = Zeroizing::new(password);
@@ -51,7 +52,9 @@ impl fmt::Debug for StoredCredential {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountErrorKind {
     InvalidInput,
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     Cancelled,
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     NotFound,
     Storage,
     Metadata,
@@ -957,6 +960,7 @@ fn validate_nickname(nickname: &str) -> Result<(), AccountError> {
     Ok(())
 }
 
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn validate_secret_fields(username: &[u8], password: &[u8]) -> Result<(), AccountError> {
     let valid_text = std::str::from_utf8(username)
         .ok()
@@ -1018,6 +1022,7 @@ fn decode_credential(bytes: &[u8]) -> Result<StoredCredential, AccountError> {
     )
 }
 
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn invalid_stored_credential() -> AccountError {
     AccountError::new(
         AccountErrorKind::Storage,
