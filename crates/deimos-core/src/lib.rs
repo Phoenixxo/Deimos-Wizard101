@@ -1,6 +1,7 @@
 use std::fmt;
 
 pub mod client;
+pub mod game;
 pub mod lifecycle;
 pub mod memory;
 pub mod process;

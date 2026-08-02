@@ -8,11 +8,13 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - "libs/wizwalker/**"
+      - "libs/wizlaunch/**"
       - "src/gui/**"
       - "Deimos.py"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
+      - "scripts/test-deimos-launch-live.py"
       - "scripts/test-deimos-telemetry-live.py"
       - "scripts/test-deimos-window-input-live.py"
       - "tests/client_discovery/**"
@@ -20,6 +22,7 @@ on:
       - "tests/hooks/**"
       - "tests/telemetry/**"
       - "tests/host_integration/**"
+      - "tests/launch/**"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
@@ -27,11 +30,13 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - "libs/wizwalker/**"
+      - "libs/wizlaunch/**"
       - "src/gui/**"
       - "Deimos.py"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
+      - "scripts/test-deimos-launch-live.py"
       - "scripts/test-deimos-telemetry-live.py"
       - "scripts/test-deimos-window-input-live.py"
       - "tests/client_discovery/**"
@@ -39,6 +44,7 @@ on:
       - "tests/hooks/**"
       - "tests/telemetry/**"
       - "tests/host_integration/**"
+      - "tests/launch/**"
       - ".github/workflows/deimos-rust.yml"
 
 env:
@@ -70,6 +76,7 @@ jobs:
         run: >-
           python -m py_compile
           scripts/test-deimos-native-live.py
+          scripts/test-deimos-launch-live.py
           scripts/test-deimos-telemetry-live.py
           scripts/test-deimos-window-input-live.py
 
@@ -79,6 +86,7 @@ jobs:
           python -m unittest discover -s tests/hooks -p "test_*.py" -v
           python -m unittest discover -s tests/telemetry -p "test_*.py" -v
           python -m unittest discover -s tests/host_integration -p "test_*.py" -v
+          python -m unittest discover -s tests/launch -p "test_*.py" -v
 
       - name: Run portable tests
         env:
@@ -126,6 +134,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
+      - name: Build and smoke test independent wizlaunch package
+        run: |
+          python -m pip install --disable-pip-version-check "maturin>=1.0,<2.0"
+          python -m pip install --disable-pip-version-check ./libs/wizlaunch
+          python -c "import wizlaunch; assert wizlaunch.__version__ == '0.2.0'; assert callable(wizlaunch.launch_instance)"
 
       - name: Install WizWalker adapter test dependencies
         run: python -m pip install --disable-pip-version-check -e ./libs/wizwalker
@@ -181,6 +195,7 @@ jobs:
           python -m unittest discover -s tests/hooks -p "test_*.py" -v
           python -m unittest discover -s tests/telemetry -p "test_*.py" -v
           python -m unittest discover -s tests/host_integration -p "test_*.py" -v
+          python -m unittest discover -s tests/launch -p "test_*.py" -v
 
       - name: Reject unsupported Wine agent imports
         if: runner.os == 'Windows'

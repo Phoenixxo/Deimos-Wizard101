@@ -7,8 +7,10 @@ use std::collections::HashMap;
 #[pyfunction]
 fn prompt_save_account(py: Python<'_>, nickname: String) -> PyResult<()> {
     py.allow_threads(|| {
-        let (username, password) =
-            credui::prompt_credentials("Deimos — Save Account", &format!("Enter credentials for '{nickname}'"))?;
+        let (username, password) = credui::prompt_credentials(
+            "Deimos — Save Account",
+            &format!("Enter credentials for '{nickname}'"),
+        )?;
         credential_store::write_credential(&nickname, &username, &password)?;
         metadata::ensure_nickname(&nickname)?;
         Ok::<(), VaultError>(())
@@ -152,7 +154,7 @@ fn get_wizard_handles() -> PyResult<Vec<isize>> {
 // ── Module ─────────────────────────────────────────────────────────
 
 #[pymodule]
-pub fn wizlaunch(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", "0.2.0")?;
     m.add_function(wrap_pyfunction!(prompt_save_account, m)?)?;
     m.add_function(wrap_pyfunction!(delete_account, m)?)?;

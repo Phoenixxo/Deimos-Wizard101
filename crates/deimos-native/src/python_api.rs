@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::Duration;
 
 use deimos_core::client::{
@@ -12,6 +11,10 @@ use deimos_core::client::{
     OP_CLIENT_KEY_EVENT, OP_CLIENT_LIST, OP_CLIENT_MOUSE_CLICK, OP_CLIENT_MOUSE_MOVE,
     OP_CLIENT_TIMED_KEY, OP_CLIENT_TO_SCREEN, OP_CLIENT_WINDOW_FOCUS, OP_CLIENT_WINDOW_SET_TITLE,
     OP_CLIENT_WINDOW_STATE,
+};
+use deimos_core::game::{
+    GameLaunchRequest, GameTerminateRequest, DEFAULT_GAME_OPERATION_TIMEOUT_MS,
+    MAX_GAME_OPERATION_TIMEOUT_MS, OP_GAME_LAUNCH, OP_GAME_TERMINATE,
 };
 use deimos_core::memory::{
     ByteOrder, CoreHook, CoreHookBaseResponse, CoreHookRequest, CoreHookSessionRequest,
@@ -61,6 +64,7 @@ create_exception!(deimos_native, ProcessError, AgentProtocolError);
 create_exception!(deimos_native, MemoryError, AgentProtocolError);
 create_exception!(deimos_native, WindowError, AgentProtocolError);
 create_exception!(deimos_native, InputError, AgentProtocolError);
+create_exception!(deimos_native, GameProcessError, AgentProtocolError);
 create_exception!(deimos_native, HostHotkeyError, DeimosNativeError);
 create_exception!(deimos_native, HostWindowError, DeimosNativeError);
 create_exception!(deimos_native, NativePanicError, DeimosNativeError);
@@ -411,6 +415,8 @@ impl BindingError {
                     PyErr::new::<InputError, _>(user_message)
                 } else if code.starts_with("window_") || code == "client_not_found" {
                     PyErr::new::<WindowError, _>(user_message)
+                } else if code.starts_with("game_") {
+                    PyErr::new::<GameProcessError, _>(user_message)
                 } else {
                     PyErr::new::<AgentProtocolError, _>(user_message)
                 };
@@ -477,6 +483,9 @@ fn configuration_user_message(code: &str, details: &Value) -> String {
         }
         "invalid_timeout" => {
             "The agent timeout must be greater than zero milliseconds.".to_string()
+        }
+        "invalid_game_timeout" => {
+            "The game launch timeout must be between 1 and 120 seconds.".to_string()
         }
         "invalid_input_duration" => {
             "Input durations must be finite, non-negative, and no longer than 30 seconds."
@@ -608,6 +617,15 @@ fn protocol_user_message(code: &RpcErrorCode) -> &'static str {
         }
         RpcErrorCode::InputFailed => {
             "Deimos could not deliver input to the selected Wizard101 client. Rediscover the client and try again."
+        }
+        RpcErrorCode::GameLaunchFailed => {
+            "Deimos could not start Wizard101 in the selected bottle. Check the game path and Wine runtime, then try again."
+        }
+        RpcErrorCode::GameLaunchTimeout => {
+            "Wizard101 started but did not open a usable game window before the timeout. Check the game logs and try again."
+        }
+        RpcErrorCode::GameTerminationFailed => {
+            "Deimos could not close the selected Wizard101 client. Make sure it is still running, then try again."
         }
         RpcErrorCode::MemoryInvalidAddress => {
             "That memory address is not valid for the connected Wizard101 process. Refresh the game state and try again."
@@ -1032,6 +1050,49 @@ impl PyAgentManager {
         let request = serialize_request(OP_CLIENT_LIST, ListClientsRequest::default())
             .map_err(|error| error.into_pyerr(py))?;
         self.call_as_python(py, OP_CLIENT_LIST, request)
+    }
+
+    #[pyo3(signature = (game_path, login_server = None, timeout_secs = 30))]
+    fn launch_game(
+        &self,
+        py: Python<'_>,
+        game_path: String,
+        login_server: Option<String>,
+        timeout_secs: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let timeout_ms =
+            game_timeout_milliseconds(timeout_secs).map_err(|error| error.into_pyerr(py))?;
+        let request = serialize_request(
+            OP_GAME_LAUNCH,
+            GameLaunchRequest {
+                game_path,
+                login_server: login_server
+                    .unwrap_or_else(|| "login.us.wizard101.com:12000".to_string()),
+                timeout_ms,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_with_timeout(py, OP_GAME_LAUNCH, request, timeout_ms)
+    }
+
+    #[pyo3(signature = (client_id, timeout_secs = 30))]
+    fn terminate_game(
+        &self,
+        py: Python<'_>,
+        client_id: String,
+        timeout_secs: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let timeout_ms =
+            game_timeout_milliseconds(timeout_secs).map_err(|error| error.into_pyerr(py))?;
+        let request = serialize_request(
+            OP_GAME_TERMINATE,
+            GameTerminateRequest {
+                client_id: ClientId(client_id),
+                timeout_ms,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_with_timeout(py, OP_GAME_TERMINATE, request, timeout_ms)
     }
 
     fn client_window_state(&self, py: Python<'_>, client_id: String) -> PyResult<Py<PyAny>> {
@@ -1761,6 +1822,24 @@ impl PyAgentManager {
         json_to_python(py, &response)
     }
 
+    fn call_as_python_with_timeout(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        request: Value,
+        operation_timeout_ms: u32,
+    ) -> PyResult<Py<PyAny>> {
+        let owned_operation = operation.to_string();
+        let timeout = Duration::from_millis(u64::from(operation_timeout_ms))
+            .saturating_add(Duration::from_secs(5));
+        let response = self.with_manager(py, operation, move |manager, bottle| {
+            manager
+                .call_with_timeout(bottle, &owned_operation, request, timeout)
+                .map_err(agent_call_error)
+        })?;
+        json_to_python(py, &response)
+    }
+
     fn call_value(&self, py: Python<'_>, operation: &str, request: Value) -> PyResult<Value> {
         let owned_operation = operation.to_string();
         self.with_manager(py, operation, move |manager, bottle| {
@@ -1802,6 +1881,24 @@ fn seconds_to_milliseconds(seconds: f64, name: &str) -> Result<u32, BindingError
     } else {
         milliseconds as u32
     })
+}
+
+fn game_timeout_milliseconds(timeout_secs: u64) -> Result<u32, BindingError> {
+    let maximum_seconds = u64::from(MAX_GAME_OPERATION_TIMEOUT_MS / 1000);
+    if timeout_secs == 0 || timeout_secs > maximum_seconds {
+        return Err(BindingError::Configuration {
+            code: "invalid_game_timeout",
+            message: format!(
+                "game operation timeout must be between 1 and {maximum_seconds} seconds"
+            ),
+            details: json!({
+                "timeout_secs": timeout_secs,
+                "maximum_secs": maximum_seconds,
+                "default_ms": DEFAULT_GAME_OPERATION_TIMEOUT_MS,
+            }),
+        });
+    }
+    Ok((timeout_secs * 1000) as u32)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1888,6 +1985,10 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("MemoryError", module.py().get_type_bound::<MemoryError>())?;
     module.add("WindowError", module.py().get_type_bound::<WindowError>())?;
     module.add("InputError", module.py().get_type_bound::<InputError>())?;
+    module.add(
+        "GameProcessError",
+        module.py().get_type_bound::<GameProcessError>(),
+    )?;
     module.add(
         "HostHotkeyError",
         module.py().get_type_bound::<HostHotkeyError>(),

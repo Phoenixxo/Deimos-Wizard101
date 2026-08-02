@@ -172,6 +172,9 @@ pub enum RpcErrorCode {
     ClientNotFound,
     WindowOperationFailed,
     InputFailed,
+    GameLaunchFailed,
+    GameLaunchTimeout,
+    GameTerminationFailed,
     MemoryInvalidAddress,
     MemoryReadFailed,
     MemoryWriteFailed,
@@ -663,6 +666,9 @@ impl fmt::Display for RpcErrorCode {
             Self::ClientNotFound => "client_not_found",
             Self::WindowOperationFailed => "window_operation_failed",
             Self::InputFailed => "input_failed",
+            Self::GameLaunchFailed => "game_launch_failed",
+            Self::GameLaunchTimeout => "game_launch_timeout",
+            Self::GameTerminationFailed => "game_termination_failed",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
             Self::MemoryWriteFailed => "memory_write_failed",
@@ -804,6 +810,40 @@ impl RpcClient {
             )),
         }
     }
+
+    pub fn call_with_timeout(
+        &mut self,
+        operation: impl Into<String>,
+        payload: Value,
+        native_context: Option<NativeContext>,
+        timeout: Duration,
+    ) -> Result<Value, RpcClientError> {
+        if timeout.is_zero() {
+            return Err(RpcClientError::Io(io::Error::new(
+                ErrorKind::InvalidInput,
+                "RPC call timeout must be greater than zero",
+            )));
+        }
+        self.stream.set_read_timeout(Some(timeout))?;
+        if let Err(error) = self.stream.set_write_timeout(Some(timeout)) {
+            let _ = self.stream.set_read_timeout(Some(self.config.io_timeout));
+            return Err(error.into());
+        }
+        let result = self.call(operation, payload, native_context);
+        match result {
+            Err(error) => {
+                let _ = self.stream.set_read_timeout(Some(self.config.io_timeout));
+                let _ = self.stream.set_write_timeout(Some(self.config.io_timeout));
+                Err(error)
+            }
+            Ok(value) => {
+                self.stream.set_read_timeout(Some(self.config.io_timeout))?;
+                self.stream
+                    .set_write_timeout(Some(self.config.io_timeout))?;
+                Ok(value)
+            }
+        }
+    }
 }
 
 fn read_response(stream: &mut TcpStream, maximum: usize) -> Result<RpcResponse, RpcClientError> {
@@ -912,6 +952,61 @@ mod tests {
                 .call("echo", payload.clone(), Some(context()))
                 .unwrap(),
             payload
+        );
+        drop(client);
+        thread
+            .join()
+            .expect("server should not panic")
+            .expect("server should finish");
+    }
+
+    #[test]
+    fn call_with_timeout_restores_socket_timeouts_after_protocol_error() {
+        let config = RpcConfig {
+            io_timeout: Duration::from_secs(2),
+            ..RpcConfig::default()
+        };
+        let (address, token, thread) = start_server(
+            |call| {
+                Err(Box::new(RpcError::new(
+                    RpcErrorCode::InvalidRequest,
+                    "test protocol error",
+                    call.request_id,
+                    call.operation.clone(),
+                    call.native_context.clone(),
+                )))
+            },
+            config,
+        );
+        let mut client = RpcClient::connect(address, token, vec![], None, config)
+            .expect("client should complete the handshake");
+
+        let error = client
+            .call_with_timeout(
+                "fail",
+                Value::Null,
+                Some(context()),
+                Duration::from_millis(50),
+            )
+            .expect_err("operation should return its protocol error");
+
+        assert!(matches!(
+            error,
+            RpcClientError::Protocol(error) if error.code == RpcErrorCode::InvalidRequest
+        ));
+        assert_eq!(
+            client
+                .stream
+                .read_timeout()
+                .expect("read timeout should query"),
+            Some(config.io_timeout)
+        );
+        assert_eq!(
+            client
+                .stream
+                .write_timeout()
+                .expect("write timeout should query"),
+            Some(config.io_timeout)
         );
         drop(client);
         thread

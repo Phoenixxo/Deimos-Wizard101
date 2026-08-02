@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle;
+use std::path::Path;
+use std::process::{Child, Command};
 
 use deimos_core::client::{
     KeyAction, MessageDelivery, MouseButton, WindowPoint, WindowRectangle, WindowSize,
@@ -34,9 +37,9 @@ use windows::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread, GetProcessId, GetProcessTimes,
     OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread, SuspendThread,
     WaitForSingleObject, LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
-    THREAD_SUSPEND_RESUME,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, THREAD_GET_CONTEXT,
+    THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowRect,
@@ -169,6 +172,114 @@ impl ProcessBackend for WindowsProcessBackend {
 
     fn list_client_windows(&self) -> Result<Vec<ClientWindowCandidate>, ProcessBackendError> {
         enumerate_client_windows()
+    }
+
+    fn launch_game(
+        &self,
+        game_path: &str,
+        login_server: &str,
+    ) -> Result<ProcessIdentity, ProcessBackendError> {
+        let bin_directory = Path::new(game_path).join("Bin");
+        let executable = bin_directory.join("WizardGraphicalClient.exe");
+        if !executable.is_file() {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::NotFound,
+                format!(
+                    "Wizard101 executable was not found at {}",
+                    executable.display()
+                ),
+            ));
+        }
+        let (host, port) = login_server.rsplit_once(':').ok_or_else(|| {
+            ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                "login server must use host:port format",
+            )
+        })?;
+        let mut child = Command::new(&executable)
+            .arg("-L")
+            .arg(host)
+            .arg(port)
+            .current_dir(&bin_directory)
+            .spawn()
+            .map_err(|error| {
+                ProcessBackendError::new(
+                    ProcessBackendErrorKind::Native,
+                    format!("Windows could not create the Wizard101 process: {error}"),
+                )
+                .with_native_code(error.raw_os_error().unwrap_or_default())
+            })?;
+        match process_identity(HANDLE(child.as_raw_handle()), child.id()) {
+            Ok(identity) => Ok(identity),
+            Err(mut error) => {
+                if let Some(cleanup_error) = stop_spawned_child(&mut child) {
+                    error.message = format!(
+                        "{}; the unconfirmed process could not be cleaned up: {cleanup_error}",
+                        error.message
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn terminate_process_and_wait(
+        &self,
+        expected: &ProcessIdentity,
+        timeout_ms: u32,
+    ) -> Result<(), ProcessBackendError> {
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                expected.pid,
+            )
+        }
+        .map(OwnedHandle)
+        .map_err(|error| open_error(expected.pid, error))?;
+        let actual = process_identity(process.0, expected.pid)?;
+        if actual.pid != expected.pid
+            || actual.creation_time_100ns != expected.creation_time_100ns
+            || !actual
+                .executable_path
+                .eq_ignore_ascii_case(&expected.executable_path)
+        {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::IdentityMismatch,
+                format!(
+                    "process {} changed identity before it could be terminated",
+                    expected.pid
+                ),
+            ));
+        }
+        unsafe { windows::Win32::System::Threading::TerminateProcess(process.0, 1) }
+            .map_err(|error| native_error("TerminateProcess failed", error))?;
+        let wait = unsafe { WaitForSingleObject(process.0, timeout_ms) };
+        if wait == WAIT_TIMEOUT {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "timed out after {timeout_ms} ms waiting for process {} to exit",
+                    expected.pid
+                ),
+            ));
+        }
+        if wait == WAIT_FAILED {
+            return Err(last_error(format!(
+                "WaitForSingleObject failed while waiting for process {} to exit",
+                expected.pid
+            )));
+        }
+        if wait != WAIT_OBJECT_0 {
+            return Err(ProcessBackendError::new(
+                ProcessBackendErrorKind::Native,
+                format!(
+                    "process {} returned unexpected wait status {:#x}",
+                    expected.pid, wait.0
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError> {
@@ -434,6 +545,19 @@ impl ProcessBackend for WindowsProcessBackend {
             delivery,
         )
     }
+}
+
+fn stop_spawned_child(child: &mut Child) -> Option<String> {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return None;
+    }
+    if let Err(error) = child.kill() {
+        return Some(format!("termination failed: {error}"));
+    }
+    child
+        .wait()
+        .err()
+        .map(|error| format!("exit confirmation failed: {error}"))
 }
 
 fn validate_client_window(target: &ClientWindowTarget) -> Result<HWND, ProcessBackendError> {
