@@ -30,7 +30,10 @@ class FakeAgentManager:
         self.launch_results = list(launch_results)
         self.launch_calls = []
         self.terminate_calls = []
+        self.login_calls = []
         self.clients = []
+        self.accounts = []
+        self.gids = {}
 
     def launch_game(self, game_path, login_server, timeout_secs):
         self.launch_calls.append((game_path, login_server, timeout_secs))
@@ -55,6 +58,39 @@ class FakeAgentManager:
 
     def list_clients(self):
         return {"clients": list(self.clients)}
+
+    def login_account(self, nickname, client_id, timeout_secs):
+        self.login_calls.append((nickname, client_id, timeout_secs))
+        return {"client_id": client_id, "authenticated": True}
+
+    def prompt_save_account(self, nickname):
+        if nickname not in self.accounts:
+            self.accounts.append(nickname)
+
+    def delete_account(self, nickname):
+        self.accounts.remove(nickname)
+        self.gids.pop(nickname, None)
+
+    def list_accounts(self):
+        return list(self.accounts)
+
+    def reorder_accounts(self, ordered):
+        self.accounts = list(ordered)
+
+    def has_account(self, nickname):
+        return nickname in self.accounts
+
+    def update_player_gid(self, nickname, gid):
+        self.gids[nickname] = gid
+
+    def get_player_gid(self, nickname):
+        return self.gids.get(nickname)
+
+    def get_nickname_by_gid(self, gid):
+        return next(
+            (nickname for nickname, value in self.gids.items() if value == gid),
+            None,
+        )
 
 
 class FakeNativeBackend:
@@ -146,6 +182,10 @@ class WizlaunchRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result, {"first": "client-1", "third": "client-3"})
         self.assertEqual(len(agent.launch_calls), 3)
+        self.assertEqual(
+            agent.login_calls,
+            [("first", "client-1", 30), ("third", "client-3", 30)],
+        )
 
     def test_non_timeout_launch_failures_remain_actionable(self):
         agent = FakeAgentManager([coded_error("game_launch_failed")])
@@ -173,7 +213,21 @@ class WizlaunchRuntimeTests(unittest.TestCase):
             wizlaunch.kill_instance(123)
         self.assertEqual(raised.exception.code, "client_identity_invalid")
 
-    def test_account_secrets_are_not_available_on_portable_route(self):
+    def test_account_management_routes_to_native_manager_without_secret_api(self):
+        agent = FakeAgentManager()
+        wizlaunch.configure_runtime(agent)
+        wizlaunch.prompt_save_account("main")
+        wizlaunch.update_player_gid("main", 42)
+        self.assertEqual(wizlaunch.list_accounts(), ["main"])
+        self.assertTrue(wizlaunch.has_account("main"))
+        self.assertEqual(wizlaunch.get_player_gid("main"), 42)
+        self.assertEqual(wizlaunch.get_nickname_by_gid(42), "main")
+        self.assertFalse(hasattr(wizlaunch, "read_credential"))
+        self.assertFalse(hasattr(agent, "read_credential"))
+        wizlaunch.delete_account("main")
+        self.assertEqual(wizlaunch.list_accounts(), [])
+
+    def test_account_storage_requires_a_native_backend(self):
         with patch.object(wizlaunch.sys, "platform", "darwin"):
             self.assertEqual(wizlaunch.list_accounts(), [])
             self.assertFalse(wizlaunch.has_account("main"))
@@ -182,6 +236,15 @@ class WizlaunchRuntimeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "account_storage_unavailable")
         self.assertNotIn("password", vars(raised.exception))
+
+    def test_automatic_login_receives_only_nickname_and_opaque_client_id(self):
+        agent = FakeAgentManager([client_response("client-1", 101)])
+        wizlaunch.configure_runtime(agent)
+
+        result = wizlaunch.launch_instance("main", r"C:\Wizard101", timeout_secs=18)
+
+        self.assertEqual(result, "client-1")
+        self.assertEqual(agent.login_calls, [("main", "client-1", 18)])
 
     def test_windows_calls_remain_on_legacy_native_backend(self):
         native = FakeNativeBackend()

@@ -14,7 +14,7 @@ use deimos_core::client::{
 };
 use deimos_core::game::{
     GameLaunchRequest, GameTerminateRequest, DEFAULT_GAME_OPERATION_TIMEOUT_MS,
-    MAX_GAME_OPERATION_TIMEOUT_MS, OP_GAME_LAUNCH, OP_GAME_TERMINATE,
+    MAX_GAME_OPERATION_TIMEOUT_MS, OP_GAME_LAUNCH, OP_GAME_LOGIN, OP_GAME_TERMINATE,
 };
 use deimos_core::memory::{
     ByteOrder, CoreHook, CoreHookBaseResponse, CoreHookRequest, CoreHookSessionRequest,
@@ -45,6 +45,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::account::{platform_service, AccountError as NativeAccountError, AccountErrorKind};
 use crate::host_hotkey::{
     HostHotkeyError as NativeHostHotkeyError, HostHotkeyErrorKind, HostHotkeyService,
 };
@@ -65,6 +66,7 @@ create_exception!(deimos_native, MemoryError, AgentProtocolError);
 create_exception!(deimos_native, WindowError, AgentProtocolError);
 create_exception!(deimos_native, InputError, AgentProtocolError);
 create_exception!(deimos_native, GameProcessError, AgentProtocolError);
+create_exception!(deimos_native, AccountError, DeimosNativeError);
 create_exception!(deimos_native, HostHotkeyError, DeimosNativeError);
 create_exception!(deimos_native, HostWindowError, DeimosNativeError);
 create_exception!(deimos_native, NativePanicError, DeimosNativeError);
@@ -107,6 +109,47 @@ fn host_window_error(py: Python<'_>, operation: &str, error: NativeHostWindowErr
         operation,
         None,
         json!({ "native_code": error.native_code }),
+        None,
+        &error.message,
+    )
+}
+
+fn account_error(py: Python<'_>, operation: &str, error: NativeAccountError) -> PyErr {
+    let code = match error.kind {
+        AccountErrorKind::InvalidInput => "account_invalid_input",
+        AccountErrorKind::Cancelled => "account_cancelled",
+        AccountErrorKind::NotFound => "account_not_found",
+        AccountErrorKind::Storage => "account_storage_failed",
+        AccountErrorKind::Metadata => "account_metadata_failed",
+        #[cfg(not(any(target_os = "macos", windows)))]
+        AccountErrorKind::Unsupported => "account_storage_unavailable",
+    };
+    let user_message = match error.kind {
+        AccountErrorKind::InvalidInput => {
+            "The account nickname or credential fields are invalid. Check them and try again."
+        }
+        AccountErrorKind::Cancelled => "Account entry was cancelled.",
+        AccountErrorKind::NotFound => {
+            "That saved account was not found. Add it again and retry."
+        }
+        AccountErrorKind::Storage => {
+            "Deimos could not access secure account storage. Unlock macOS Keychain and try again."
+        }
+        AccountErrorKind::Metadata => {
+            "Deimos could not update account ordering or player metadata. Check the Deimos application-data folder and try again."
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        AccountErrorKind::Unsupported => {
+            "Secure account storage is not available on this host platform."
+        }
+    };
+    decorate_error(
+        py,
+        PyErr::new::<AccountError, _>(user_message),
+        code,
+        operation,
+        None,
+        json!({}),
         None,
         &error.message,
     )
@@ -627,6 +670,12 @@ fn protocol_user_message(code: &RpcErrorCode) -> &'static str {
         RpcErrorCode::GameTerminationFailed => {
             "Deimos could not close the selected Wizard101 client. Make sure it is still running, then try again."
         }
+        RpcErrorCode::GameLoginFailed => {
+            "Deimos could not sign in to the selected Wizard101 client. Verify the saved account and try again."
+        }
+        RpcErrorCode::GameLoginTimeout => {
+            "Wizard101 did not finish the automatic login operation before the timeout. Try again after the login screen is ready."
+        }
         RpcErrorCode::MemoryInvalidAddress => {
             "That memory address is not valid for the connected Wizard101 process. Refresh the game state and try again."
         }
@@ -1044,6 +1093,86 @@ impl PyAgentManager {
                 .capabilities(bottle)
                 .map_err(BindingError::Lifecycle)
         })
+    }
+
+    fn prompt_save_account(&self, py: Python<'_>, nickname: String) -> PyResult<()> {
+        let operation = "account.save";
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            platform_service()?.prompt_save(&nickname)
+        }))
+        .map_err(|payload| {
+            BindingError::Panic {
+                operation: operation.to_string(),
+                message: panic_message(payload),
+            }
+            .into_pyerr(py)
+        })?;
+        result.map_err(|error| account_error(py, operation, error))
+    }
+
+    fn delete_account(&self, py: Python<'_>, nickname: String) -> PyResult<()> {
+        py.allow_threads(|| platform_service().and_then(|service| service.delete(&nickname)))
+            .map_err(|error| account_error(py, "account.delete", error))
+    }
+
+    fn list_accounts(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.allow_threads(|| platform_service().and_then(|service| service.list()))
+            .map_err(|error| account_error(py, "account.list", error))
+    }
+
+    fn reorder_accounts(&self, py: Python<'_>, ordered: Vec<String>) -> PyResult<()> {
+        py.allow_threads(|| platform_service().and_then(|service| service.reorder(&ordered)))
+            .map_err(|error| account_error(py, "account.reorder", error))
+    }
+
+    fn has_account(&self, py: Python<'_>, nickname: String) -> PyResult<bool> {
+        py.allow_threads(|| platform_service().map(|service| service.contains(&nickname)))
+            .map_err(|error| account_error(py, "account.has", error))
+    }
+
+    fn update_player_gid(&self, py: Python<'_>, nickname: String, gid: u64) -> PyResult<()> {
+        py.allow_threads(|| {
+            platform_service().and_then(|service| service.update_gid(&nickname, gid))
+        })
+        .map_err(|error| account_error(py, "account.update_gid", error))
+    }
+
+    fn get_player_gid(&self, py: Python<'_>, nickname: String) -> PyResult<Option<u64>> {
+        py.allow_threads(|| platform_service().and_then(|service| service.gid(&nickname)))
+            .map_err(|error| account_error(py, "account.get_gid", error))
+    }
+
+    fn get_nickname_by_gid(&self, py: Python<'_>, gid: u64) -> PyResult<Option<String>> {
+        py.allow_threads(|| platform_service().and_then(|service| service.nickname_for_gid(gid)))
+            .map_err(|error| account_error(py, "account.nickname_by_gid", error))
+    }
+
+    #[pyo3(signature = (nickname, client_id, timeout_secs = 30))]
+    fn login_account(
+        &self,
+        py: Python<'_>,
+        nickname: String,
+        client_id: String,
+        timeout_secs: u64,
+    ) -> PyResult<Py<PyAny>> {
+        let timeout_ms =
+            game_timeout_milliseconds(timeout_secs).map_err(|error| error.into_pyerr(py))?;
+        let credential = py
+            .allow_threads(|| platform_service().and_then(|service| service.read(&nickname)))
+            .map_err(|error| account_error(py, "account.read", error))?;
+        let client_id = ClientId(client_id);
+        let response = self.with_manager(py, OP_GAME_LOGIN, move |manager, bottle| {
+            manager
+                .login_with_credential(
+                    bottle,
+                    client_id,
+                    credential.username(),
+                    credential.password(),
+                    Duration::from_millis(u64::from(timeout_ms)),
+                )
+                .map_err(agent_call_error)
+        })?;
+        json_to_python(py, &response)
     }
 
     fn list_clients(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -1917,6 +2046,13 @@ fn wine_configuration_error(py: Python<'_>, error: WineRuntimeError) -> PyErr {
 fn agent_call_error(error: crate::lifecycle::AgentCallError) -> BindingError {
     match error {
         crate::lifecycle::AgentCallError::Lifecycle(error) => BindingError::Lifecycle(error),
+        crate::lifecycle::AgentCallError::CredentialTransfer(message) => {
+            BindingError::Configuration {
+                code: "credential_transfer_failed",
+                message,
+                details: json!({}),
+            }
+        }
         crate::lifecycle::AgentCallError::Rpc {
             operation,
             native_context,
@@ -1957,7 +2093,64 @@ fn agent_call_error(error: crate::lifecycle::AgentCallError) -> BindingError {
     }
 }
 
+#[pyfunction(name = "prompt_save_account")]
+fn native_prompt_save_account(py: Python<'_>, nickname: String) -> PyResult<()> {
+    platform_service()
+        .and_then(|service| service.prompt_save(&nickname))
+        .map_err(|error| account_error(py, "account.save", error))
+}
+
+#[pyfunction(name = "delete_account")]
+fn native_delete_account(py: Python<'_>, nickname: String) -> PyResult<()> {
+    py.allow_threads(|| platform_service().and_then(|service| service.delete(&nickname)))
+        .map_err(|error| account_error(py, "account.delete", error))
+}
+
+#[pyfunction(name = "list_accounts")]
+fn native_list_accounts(py: Python<'_>) -> PyResult<Vec<String>> {
+    py.allow_threads(|| platform_service().and_then(|service| service.list()))
+        .map_err(|error| account_error(py, "account.list", error))
+}
+
+#[pyfunction(name = "reorder_accounts")]
+fn native_reorder_accounts(py: Python<'_>, ordered: Vec<String>) -> PyResult<()> {
+    py.allow_threads(|| platform_service().and_then(|service| service.reorder(&ordered)))
+        .map_err(|error| account_error(py, "account.reorder", error))
+}
+
+#[pyfunction(name = "has_account")]
+fn native_has_account(py: Python<'_>, nickname: String) -> PyResult<bool> {
+    py.allow_threads(|| platform_service().map(|service| service.contains(&nickname)))
+        .map_err(|error| account_error(py, "account.has", error))
+}
+
+#[pyfunction(name = "update_player_gid")]
+fn native_update_player_gid(py: Python<'_>, nickname: String, gid: u64) -> PyResult<()> {
+    py.allow_threads(|| platform_service().and_then(|service| service.update_gid(&nickname, gid)))
+        .map_err(|error| account_error(py, "account.update_gid", error))
+}
+
+#[pyfunction(name = "get_player_gid")]
+fn native_get_player_gid(py: Python<'_>, nickname: String) -> PyResult<Option<u64>> {
+    py.allow_threads(|| platform_service().and_then(|service| service.gid(&nickname)))
+        .map_err(|error| account_error(py, "account.get_gid", error))
+}
+
+#[pyfunction(name = "get_nickname_by_gid")]
+fn native_get_nickname_by_gid(py: Python<'_>, gid: u64) -> PyResult<Option<String>> {
+    py.allow_threads(|| platform_service().and_then(|service| service.nickname_for_gid(gid)))
+        .map_err(|error| account_error(py, "account.nickname_by_gid", error))
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(native_prompt_save_account, module)?)?;
+    module.add_function(wrap_pyfunction!(native_delete_account, module)?)?;
+    module.add_function(wrap_pyfunction!(native_list_accounts, module)?)?;
+    module.add_function(wrap_pyfunction!(native_reorder_accounts, module)?)?;
+    module.add_function(wrap_pyfunction!(native_has_account, module)?)?;
+    module.add_function(wrap_pyfunction!(native_update_player_gid, module)?)?;
+    module.add_function(wrap_pyfunction!(native_get_player_gid, module)?)?;
+    module.add_function(wrap_pyfunction!(native_get_nickname_by_gid, module)?)?;
     module.add_class::<PyAgentManager>()?;
     module.add_class::<PyHostHotkeyManager>()?;
     module.add_class::<PyHostWindowManager>()?;
@@ -1989,6 +2182,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "GameProcessError",
         module.py().get_type_bound::<GameProcessError>(),
     )?;
+    module.add("AccountError", module.py().get_type_bound::<AccountError>())?;
     module.add(
         "HostHotkeyError",
         module.py().get_type_bound::<HostHotkeyError>(),

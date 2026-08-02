@@ -8,14 +8,14 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
 };
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
-    PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
+    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-    PROCESS_VM_WRITE,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+use zeroize::Zeroizing;
 
 // Pattern to locate the game's internal command dispatcher.
 // Matches: mov r9b,1 / xor r8d,r8d / lea rdx,[rbp-31h] / mov rcx,[rip+??]
@@ -26,10 +26,27 @@ const LOGIN_PATTERN: &[u8] = &[
 // RootWindowHook injection-point pattern (wildcards = None).
 // 7 ?? bytes | 48 8B 01 | 7 ?? bytes | FF 50 70 84
 const HOOK_PATTERN: &[Option<u8>] = &[
-    None, None, None, None, None, None, None,
-    Some(0x48), Some(0x8B), Some(0x01),
-    None, None, None, None, None, None, None,
-    Some(0xFF), Some(0x50), Some(0x70), Some(0x84),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(0x48),
+    Some(0x8B),
+    Some(0x01),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(0xFF),
+    Some(0x50),
+    Some(0x70),
+    Some(0x84),
 ];
 const HOOK_INSTR_LEN: usize = 7;
 
@@ -41,7 +58,8 @@ struct RemoteProcess {
 
 impl RemoteProcess {
     fn open(pid: u32) -> Result<Self, VaultError> {
-        let access = PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+        let access =
+            PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
         let handle = unsafe {
             OpenProcess(access, false, pid)
                 .map_err(|e| VaultError::LoginFailed(format!("OpenProcess: {e}")))?
@@ -79,18 +97,17 @@ impl RemoteProcess {
     }
 
     fn alloc(&self, size: usize, executable: bool) -> Result<u64, VaultError> {
-        let protect = if executable { PAGE_EXECUTE_READWRITE } else { PAGE_READWRITE };
-        let ptr = unsafe {
-            VirtualAllocEx(
-                self.handle,
-                None,
-                size,
-                MEM_COMMIT | MEM_RESERVE,
-                protect,
-            )
+        let protect = if executable {
+            PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READWRITE
         };
+        let ptr =
+            unsafe { VirtualAllocEx(self.handle, None, size, MEM_COMMIT | MEM_RESERVE, protect) };
         if ptr.is_null() {
-            return Err(VaultError::LoginFailed("VirtualAllocEx returned NULL".into()));
+            return Err(VaultError::LoginFailed(
+                "VirtualAllocEx returned NULL".into(),
+            ));
         }
         Ok(ptr as u64)
     }
@@ -134,7 +151,9 @@ impl RemoteProcess {
 
 impl Drop for RemoteProcess {
     fn drop(&mut self) {
-        unsafe { let _ = CloseHandle(self.handle); }
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
     }
 }
 
@@ -168,24 +187,28 @@ fn find_module(pid: u32, name: &str) -> Result<(u64, u32), VaultError> {
         }
         let _ = CloseHandle(snap);
     }
-    Err(VaultError::LoginFailed(format!("Module '{name}' not found")))
+    Err(VaultError::LoginFailed(format!(
+        "Module '{name}' not found"
+    )))
 }
 
 // ── Pattern scanning ───────────────────────────────────────────────
 
 /// Exact-byte pattern scan.  Returns offset within `data`.
 fn scan_exact(data: &[u8], pattern: &[u8]) -> Option<usize> {
-    data.windows(pattern.len())
-        .position(|w| w == pattern)
+    data.windows(pattern.len()).position(|w| w == pattern)
 }
 
 /// Wildcard pattern scan (None = any byte).  Returns offset within `data`.
 fn scan_wild(data: &[u8], pattern: &[Option<u8>]) -> Option<usize> {
     data.windows(pattern.len()).position(|window| {
-        window.iter().zip(pattern.iter()).all(|(&b, pat)| match pat {
-            Some(expected) => b == *expected,
-            None => true,
-        })
+        window
+            .iter()
+            .zip(pattern.iter())
+            .all(|(&b, pat)| match pat {
+                Some(expected) => b == *expected,
+                None => true,
+            })
     })
 }
 
@@ -226,7 +249,9 @@ fn build_login_bytecode(
 
     // ── Login code (only executes when flag == 1) ──
     // push rax, rcx, rdx, r8, r9, r10, r11
-    bc.extend_from_slice(&[0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53]);
+    bc.extend_from_slice(&[
+        0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+    ]);
     // sub rsp, 0x28  (shadow space for x64 calling convention)
     bc.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
     // mov r9b, 1
@@ -254,7 +279,9 @@ fn build_login_bytecode(
     // add rsp, 0x28
     bc.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
     // pop r11, r10, r9, r8, rdx, rcx, rax
-    bc.extend_from_slice(&[0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58]);
+    bc.extend_from_slice(&[
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58,
+    ]);
 
     // ── Fix up jne offset ──
     let skip_target = bc.len();
@@ -304,7 +331,9 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
         );
     }
     if pid == 0 {
-        return Err(VaultError::LoginFailed("Could not get PID from window handle".into()));
+        return Err(VaultError::LoginFailed(
+            "Could not get PID from window handle".into(),
+        ));
     }
 
     // 2. Open the game process
@@ -340,8 +369,8 @@ pub fn login_to_instance(hwnd: isize, username: &str, password: &str) -> Result<
     let orig_instr = proc.read(hook_addr, HOOK_INSTR_LEN)?;
 
     // 8. Build the login command string
-    let cmd = format!("login {} {}", username, password);
-    let cmd_bytes: Vec<u8> = cmd.bytes().chain(std::iter::once(0)).collect();
+    let cmd = Zeroizing::new(format!("login {} {}", username, password));
+    let cmd_bytes = Zeroizing::new(cmd.bytes().chain(std::iter::once(0)).collect::<Vec<u8>>());
     let cmd_len = cmd.len(); // length without null
 
     // 9. Allocate remote memory

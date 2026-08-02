@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use crate::lifecycle::AgentIdentity;
 
@@ -70,6 +71,12 @@ impl AuthToken {
 impl fmt::Debug for AuthToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthToken([REDACTED])")
+    }
+}
+
+impl Drop for AuthToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -175,6 +182,8 @@ pub enum RpcErrorCode {
     GameLaunchFailed,
     GameLaunchTimeout,
     GameTerminationFailed,
+    GameLoginFailed,
+    GameLoginTimeout,
     MemoryInvalidAddress,
     MemoryReadFailed,
     MemoryWriteFailed,
@@ -497,6 +506,10 @@ impl RpcServer {
             }),
             self.config.max_message_size,
         )?;
+        // The handshake timeout protects the listener from unauthenticated
+        // half-open connections. Once authenticated, the host may remain idle
+        // while a user interacts with native UI; shutdown closes these streams.
+        stream.set_read_timeout(None)?;
 
         loop {
             let payload = match read_frame(&mut stream, self.config.max_message_size) {
@@ -669,6 +682,8 @@ impl fmt::Display for RpcErrorCode {
             Self::GameLaunchFailed => "game_launch_failed",
             Self::GameLaunchTimeout => "game_launch_timeout",
             Self::GameTerminationFailed => "game_termination_failed",
+            Self::GameLoginFailed => "game_login_failed",
+            Self::GameLoginTimeout => "game_login_timeout",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
             Self::MemoryWriteFailed => "memory_write_failed",
@@ -953,6 +968,36 @@ mod tests {
                 .unwrap(),
             payload
         );
+        drop(client);
+        thread
+            .join()
+            .expect("server should not panic")
+            .expect("server should finish");
+    }
+
+    #[test]
+    fn authenticated_connection_remains_usable_after_handshake_timeout() {
+        let server_config = RpcConfig {
+            io_timeout: Duration::from_millis(25),
+            ..RpcConfig::default()
+        };
+        let client_config = RpcConfig {
+            io_timeout: Duration::from_secs(1),
+            ..RpcConfig::default()
+        };
+        let (address, token, thread) = start_server(|call| Ok(call.payload.clone()), server_config);
+        let mut client = RpcClient::connect(address, token, vec![], None, client_config)
+            .expect("client should complete the handshake");
+
+        thread::sleep(Duration::from_millis(100));
+        let payload = serde_json::json!({"message": "still-connected"});
+        assert_eq!(
+            client
+                .call("echo", payload.clone(), Some(context()))
+                .expect("authenticated idle connection should remain usable"),
+            payload
+        );
+
         drop(client);
         thread
             .join()

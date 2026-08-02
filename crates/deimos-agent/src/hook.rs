@@ -1221,7 +1221,7 @@ fn signature_matches(bytes: &[u8], signature: &[Option<u8>]) -> bool {
 /// or on a relative branch target.  This compact decoder intentionally accepts
 /// only common, position-independent x64 instructions and rejects everything
 /// else rather than risking a subtly incorrect detour.
-fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
+pub(crate) fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError> {
     let mut offset = 0;
     while offset < bytes.len() {
         let instruction_start = offset;

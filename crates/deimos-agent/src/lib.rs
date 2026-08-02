@@ -16,8 +16,8 @@ use deimos_core::client::{
     OP_CLIENT_WINDOW_STATE,
 };
 use deimos_core::game::{
-    GameLaunchRequest, GameTerminateRequest, CAPABILITY_GAME_PROCESS, OP_GAME_LAUNCH,
-    OP_GAME_TERMINATE,
+    GameLaunchRequest, GameLoginRequest, GameTerminateRequest, CAPABILITY_GAME_LOGIN,
+    CAPABILITY_GAME_PROCESS, OP_GAME_LAUNCH, OP_GAME_LOGIN, OP_GAME_TERMINATE,
 };
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
@@ -62,6 +62,7 @@ const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod core_hook;
 pub mod feature_hook;
+pub mod game_login;
 pub mod game_process;
 pub mod hook;
 pub mod instance;
@@ -101,7 +102,10 @@ pub fn run(request: &ProbeRequest) -> ProbeReport {
 }
 
 pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::Result<()> {
-    let service = Arc::new(AgentService::try_new(PlatformProcessBackend)?);
+    let service = Arc::new(AgentService::try_new_with_token(
+        PlatformProcessBackend,
+        token.clone(),
+    )?);
     let server = Arc::new(RpcServer::with_agent_identity(
         token,
         vec![
@@ -111,6 +115,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_CLIENT_WINDOW.to_string(),
             CAPABILITY_CLIENT_INPUT.to_string(),
             CAPABILITY_GAME_PROCESS.to_string(),
+            CAPABILITY_GAME_LOGIN.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
             CAPABILITY_PROCESS_MUTATION.to_string(),
@@ -268,11 +273,13 @@ fn stop_and_join_workers(workers: &mut Vec<ConnectionWorker>) -> io::Result<()> 
 pub struct AgentService<B: MutationBackend> {
     backend: B,
     identity: AgentIdentity,
+    auth_token: AuthToken,
     clients: Mutex<ClientRegistry>,
     input_locks: Mutex<HashMap<ClientId, Weak<Mutex<()>>>>,
     sessions: Mutex<ProcessSessionRegistry<B::Handle>>,
     mutations: Mutex<mutation::MutationState<B::ThreadHandle>>,
     hooks: Mutex<hook::HookState>,
+    logins: Mutex<game_login::LoginState<B::Handle>>,
     mutation_gate: Mutex<()>,
     shutting_down: AtomicBool,
     shutdown_complete: AtomicBool,
@@ -280,8 +287,12 @@ pub struct AgentService<B: MutationBackend> {
 
 impl<B: MutationBackend> AgentService<B> {
     pub fn try_new(backend: B) -> io::Result<Self> {
+        Self::try_new_with_token(backend, AuthToken::generate()?)
+    }
+
+    pub fn try_new_with_token(backend: B, auth_token: AuthToken) -> io::Result<Self> {
         let instance_id = AuthToken::generate()?.as_str().to_string();
-        Ok(Self::with_identity(
+        Ok(Self::with_identity_and_token(
             backend,
             AgentIdentity {
                 instance_id,
@@ -289,18 +300,33 @@ impl<B: MutationBackend> AgentService<B> {
                 build_id: deimos_core::BUILD_ID.to_string(),
                 process_id: std::process::id(),
             },
+            auth_token,
         ))
     }
 
     pub fn with_identity(backend: B, identity: AgentIdentity) -> Self {
+        Self::with_identity_and_token(
+            backend,
+            identity,
+            AuthToken::generate().expect("test and local agent authentication token"),
+        )
+    }
+
+    pub fn with_identity_and_token(
+        backend: B,
+        identity: AgentIdentity,
+        auth_token: AuthToken,
+    ) -> Self {
         Self {
             backend,
             identity,
+            auth_token,
             clients: Mutex::new(ClientRegistry::new()),
             input_locks: Mutex::new(HashMap::new()),
             sessions: Mutex::new(ProcessSessionRegistry::new()),
             mutations: Mutex::new(mutation::MutationState::new()),
             hooks: Mutex::new(hook::HookState::default()),
+            logins: Mutex::new(game_login::LoginState::default()),
             mutation_gate: Mutex::new(()),
             shutting_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
@@ -375,8 +401,12 @@ impl<B: MutationBackend> AgentService<B> {
                 self.shutting_down.store(true, Ordering::Release);
                 let _gate = self.lock_mutation_gate(call)?;
                 let mut hooks = self.lock_hooks(call)?;
+                let mut logins = self.lock_logins(call)?;
                 let mut sessions = self.lock_sessions(call)?;
                 let mut mutations = self.lock_mutations(call)?;
+                game_login::cleanup_all(&mut logins, &self.backend).map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
                 hook::cleanup_all(&mut sessions, &self.backend, &mut mutations, &mut hooks)
                     .map_err(|error| {
                         Box::new(error.into_rpc_error(call.request_id, &call.operation))
@@ -432,6 +462,35 @@ impl<B: MutationBackend> AgentService<B> {
                     .map_err(|error| {
                         Box::new(error.into_rpc_error(call.request_id, &call.operation))
                     })?;
+                encode_payload(call, response)
+            }
+            OP_GAME_LOGIN => {
+                require_capabilities(call, capabilities, &[CAPABILITY_GAME_LOGIN])?;
+                let request: GameLoginRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                if self.is_shutting_down() {
+                    return Err(Box::new(RpcError::new(
+                        RpcErrorCode::InvalidRequest,
+                        "agent is shutting down; automatic login was not started",
+                        call.request_id,
+                        call.operation.clone(),
+                        call.native_context.clone(),
+                    )));
+                }
+                let mut clients = self.lock_clients(call)?;
+                let mut logins = self.lock_logins(call)?;
+                let response = game_login::login(
+                    &mut logins,
+                    &mut clients,
+                    &self.backend,
+                    &self.auth_token,
+                    &self.identity,
+                    &request,
+                    || self.is_shutting_down(),
+                )
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
                 encode_payload(call, response)
             }
             OP_CLIENT_WINDOW_STATE => {
@@ -1225,6 +1284,21 @@ impl<B: MutationBackend> AgentService<B> {
         })
     }
 
+    fn lock_logins(
+        &self,
+        call: &RpcCall,
+    ) -> Result<std::sync::MutexGuard<'_, game_login::LoginState<B::Handle>>, Box<RpcError>> {
+        self.logins.lock().map_err(|_| {
+            Box::new(RpcError::new(
+                RpcErrorCode::Internal,
+                "automatic login registry lock was poisoned",
+                call.request_id,
+                call.operation.clone(),
+                call.native_context.clone(),
+            ))
+        })
+    }
+
     fn lock_mutation_gate(
         &self,
         call: &RpcCall,
@@ -1491,6 +1565,7 @@ mod tests {
         )
         .expect("response should be a probe report");
         assert_eq!(report.schema_version, PROTOCOL_SCHEMA_VERSION);
+        drop(client);
         server_thread.join().expect("server should not panic");
     }
 

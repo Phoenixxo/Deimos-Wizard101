@@ -7,6 +7,7 @@ use windows::Win32::Security::Credentials::{
     CredDeleteW, CredEnumerateW, CredFree, CredReadW, CredWriteW, CREDENTIALW,
     CRED_ENUMERATE_FLAGS, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
+use zeroize::Zeroizing;
 
 pub const TARGET_PREFIX: &str = "Deimos/account/";
 
@@ -31,15 +32,11 @@ pub fn target_name(nickname: &str) -> String {
     format!("{TARGET_PREFIX}{nickname}")
 }
 
-pub fn write_credential(
-    nickname: &str,
-    username: &str,
-    password: &str,
-) -> Result<(), VaultError> {
+pub fn write_credential(nickname: &str, username: &str, password: &str) -> Result<(), VaultError> {
     let target = target_name(nickname);
     let mut target_wide = to_wide_null(&target);
-    let mut username_wide = to_wide_null(username);
-    let password_bytes: Vec<u8> = password.as_bytes().to_vec();
+    let mut username_wide = Zeroizing::new(to_wide_null(username));
+    let password_bytes = Zeroizing::new(password.as_bytes().to_vec());
 
     let cred = CREDENTIALW {
         Flags: CRED_FLAGS(0),
@@ -59,7 +56,9 @@ pub fn write_credential(
     unsafe { CredWriteW(&cred, 0).map_err(|e| VaultError::CredentialWrite(e.to_string())) }
 }
 
-pub fn read_credential(nickname: &str) -> Result<(String, String), VaultError> {
+pub fn read_credential(
+    nickname: &str,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), VaultError> {
     let target = target_name(nickname);
     let target_wide = to_wide_null(&target);
     let mut cred_ptr: *mut CREDENTIALW = std::ptr::null_mut();
@@ -74,13 +73,12 @@ pub fn read_credential(nickname: &str) -> Result<(String, String), VaultError> {
         .map_err(|_| VaultError::CredentialNotFound(nickname.to_string()))?;
 
         let cred = &*cred_ptr;
-        let username = from_wide_ptr(cred.UserName.0);
+        let username = Zeroizing::new(from_wide_ptr(cred.UserName.0));
         let password = if cred.CredentialBlobSize > 0 && !cred.CredentialBlob.is_null() {
-            let blob =
-                slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
-            String::from_utf8_lossy(blob).into_owned()
+            let blob = slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
+            Zeroizing::new(String::from_utf8_lossy(blob).into_owned())
         } else {
-            String::new()
+            Zeroizing::new(String::new())
         };
 
         CredFree(cred_ptr as *const c_void);
