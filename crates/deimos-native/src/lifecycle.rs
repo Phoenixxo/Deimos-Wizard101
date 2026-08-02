@@ -606,9 +606,29 @@ impl<R: AgentRuntime> AgentManager<R> {
         let Some(mut managed) = self.managed.remove(bottle) else {
             return Ok(());
         };
-        let shutdown =
+        let initial_shutdown =
             self.request_shutdown(bottle, &mut managed.client, &managed.identity, &reason);
         drop(managed.client);
+        let shutdown = match initial_shutdown {
+            Ok(()) => Ok(()),
+            Err(initial_error) => self
+                .reconnect_and_request_shutdown(
+                    bottle,
+                    &managed.endpoint,
+                    &managed.identity,
+                    &reason,
+                )
+                .map_err(|reconnect_error| {
+                    LifecycleError::new(
+                        LifecycleErrorCode::ShutdownFailed,
+                        bottle.as_str(),
+                        "the managed agent connection was lost and shutdown recovery failed",
+                    )
+                    .with_instance(&managed.identity)
+                    .with_detail("initial_error", initial_error.message)
+                    .with_detail("reconnect_error", reconnect_error.message)
+                }),
+        };
         let retired = self.retire(bottle, &managed.endpoint, &reason);
         shutdown.and(retired)
     }
@@ -888,6 +908,35 @@ impl<R: AgentRuntime> AgentManager<R> {
             .with_instance(identity));
         }
         Ok(())
+    }
+
+    fn reconnect_and_request_shutdown(
+        &self,
+        bottle: &BottleId,
+        endpoint: &AgentEndpoint,
+        expected_identity: &AgentIdentity,
+        reason: &str,
+    ) -> Result<(), LifecycleError> {
+        let (mut client, identity) = match self.connect_candidate(bottle, endpoint)? {
+            Candidate::Ready { client, identity } => (client, identity),
+            Candidate::VersionMismatch { identity, .. } => {
+                return Err(LifecycleError::new(
+                    LifecycleErrorCode::IdentityMismatch,
+                    bottle.as_str(),
+                    "shutdown recovery connected to an incompatible agent",
+                )
+                .with_instance(&identity));
+            }
+        };
+        if identity != *expected_identity {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::IdentityMismatch,
+                bottle.as_str(),
+                "shutdown recovery connected to a different agent instance",
+            )
+            .with_instance(&identity));
+        }
+        self.request_shutdown(bottle, &mut client, &identity, reason)
     }
 
     fn retire(
@@ -1198,10 +1247,14 @@ mod tests {
 
         fn install_existing(&self, version: &str, build_id: &str) -> AgentEndpoint {
             let (endpoint, shutdown) = start_test_agent(version, build_id);
+            self.install_endpoint(endpoint.clone(), shutdown);
+            endpoint
+        }
+
+        fn install_endpoint(&self, endpoint: AgentEndpoint, shutdown: Arc<AtomicBool>) {
             let mut state = self.state.lock().expect("runtime state should lock");
             state.current = Some(endpoint.clone());
             state.agents.insert(endpoint.address, shutdown);
-            endpoint
         }
 
         fn install_stale(&self) {
@@ -1422,6 +1475,15 @@ mod tests {
         build_id: &str,
         capabilities: Vec<String>,
     ) -> (AgentEndpoint, Arc<AtomicBool>) {
+        start_test_agent_with_behavior(version, build_id, capabilities, false)
+    }
+
+    fn start_test_agent_with_behavior(
+        version: &str,
+        build_id: &str,
+        capabilities: Vec<String>,
+        disconnect_first_after_health: bool,
+    ) -> (AgentEndpoint, Arc<AtomicBool>) {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
         let identity = AgentIdentity {
@@ -1447,6 +1509,7 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
+            let mut accepted_connections = 0usize;
             listener
                 .set_nonblocking(true)
                 .expect("listener should become nonblocking");
@@ -1459,11 +1522,20 @@ mod tests {
                         let identity = identity.clone();
                         let shutdown = Arc::clone(&thread_shutdown);
                         let server = &server;
+                        let close_after_health =
+                            disconnect_first_after_health && accepted_connections == 0;
+                        accepted_connections += 1;
                         thread::scope(|scope| {
                             scope.spawn(move || {
-                                let _ = server.serve_connection(stream, |call| {
-                                    handle_test_agent_call(call, &identity, &shutdown)
-                                });
+                                let _ = server.serve_connection_with_after_response(
+                                    stream,
+                                    |call| handle_test_agent_call(call, &identity, &shutdown),
+                                    |operation, response_written| {
+                                        close_after_health
+                                            && response_written
+                                            && operation == OP_AGENT_HEALTH
+                                    },
+                                );
                             });
                         });
                     }
@@ -2082,6 +2154,32 @@ mod tests {
                 .code,
             LifecycleErrorCode::HealthCheckFailed
         );
+    }
+
+    #[test]
+    fn shutdown_reconnects_when_the_managed_channel_is_stale() {
+        let runtime = TestRuntime::new("1.2.3");
+        let (endpoint, shutdown) = start_test_agent_with_behavior(
+            "1.2.3",
+            "test-build-current",
+            REQUIRED_AGENT_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+            true,
+        );
+        runtime.install_endpoint(endpoint, Arc::clone(&shutdown));
+        let mut manager = manager(runtime.clone(), "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready before its first channel closes");
+
+        manager
+            .shutdown(&bottle(), "recover stale channel")
+            .expect("shutdown should reconnect and receive an acknowledgement");
+
+        assert!(shutdown.load(Ordering::Acquire));
+        assert_eq!(runtime.retire_count(), 1);
     }
 
     #[test]

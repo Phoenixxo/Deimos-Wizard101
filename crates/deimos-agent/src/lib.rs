@@ -1565,6 +1565,7 @@ mod tests {
         )
         .expect("response should be a probe report");
         assert_eq!(report.schema_version, PROTOCOL_SCHEMA_VERSION);
+        drop(client);
         server_thread.join().expect("server should not panic");
     }
 

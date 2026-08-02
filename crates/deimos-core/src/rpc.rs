@@ -506,6 +506,10 @@ impl RpcServer {
             }),
             self.config.max_message_size,
         )?;
+        // The handshake timeout protects the listener from unauthenticated
+        // half-open connections. Once authenticated, the host may remain idle
+        // while a user interacts with native UI; shutdown closes these streams.
+        stream.set_read_timeout(None)?;
 
         loop {
             let payload = match read_frame(&mut stream, self.config.max_message_size) {
@@ -964,6 +968,32 @@ mod tests {
                 .unwrap(),
             payload
         );
+        drop(client);
+        thread
+            .join()
+            .expect("server should not panic")
+            .expect("server should finish");
+    }
+
+    #[test]
+    fn authenticated_connection_remains_usable_after_handshake_timeout() {
+        let config = RpcConfig {
+            io_timeout: Duration::from_millis(25),
+            ..RpcConfig::default()
+        };
+        let (address, token, thread) = start_server(|call| Ok(call.payload.clone()), config);
+        let mut client = RpcClient::connect(address, token, vec![], None, config)
+            .expect("client should complete the handshake");
+
+        thread::sleep(Duration::from_millis(100));
+        let payload = serde_json::json!({"message": "still-connected"});
+        assert_eq!(
+            client
+                .call("echo", payload.clone(), Some(context()))
+                .expect("authenticated idle connection should remain usable"),
+            payload
+        );
+
         drop(client);
         thread
             .join()
