@@ -82,7 +82,11 @@ def _windows_native():
     return None
 
 
-def _account_backend(operation: str):
+def _account_backend(operation: str, method: str):
+    if _agent_manager is not None and callable(
+        getattr(_agent_manager, method, None)
+    ):
+        return _agent_manager
     backend = _windows_native()
     if backend is None:
         raise _error(
@@ -106,37 +110,59 @@ def _runtime(operation: str):
 
 
 def prompt_save_account(nickname: str) -> None:
-    _account_backend("account.save").prompt_save_account(nickname)
+    _account_backend("account.save", "prompt_save_account").prompt_save_account(
+        nickname
+    )
 
 
 def delete_account(nickname: str) -> None:
-    _account_backend("account.delete").delete_account(nickname)
+    _account_backend("account.delete", "delete_account").delete_account(nickname)
 
 
 def list_accounts() -> list[str]:
+    if _agent_manager is not None and callable(
+        getattr(_agent_manager, "list_accounts", None)
+    ):
+        return list(_agent_manager.list_accounts())
     backend = _windows_native()
     return backend.list_accounts() if backend is not None else []
 
 
 def reorder_accounts(ordered: Iterable[str]) -> None:
-    _account_backend("account.reorder").reorder_accounts(list(ordered))
+    _account_backend("account.reorder", "reorder_accounts").reorder_accounts(
+        list(ordered)
+    )
 
 
 def has_account(nickname: str) -> bool:
+    if _agent_manager is not None and callable(
+        getattr(_agent_manager, "has_account", None)
+    ):
+        return bool(_agent_manager.has_account(nickname))
     backend = _windows_native()
     return bool(backend and backend.has_account(nickname))
 
 
 def update_player_gid(nickname: str, gid: int) -> None:
-    _account_backend("account.update_gid").update_player_gid(nickname, gid)
+    _account_backend("account.update_gid", "update_player_gid").update_player_gid(
+        nickname, gid
+    )
 
 
 def get_player_gid(nickname: str) -> int | None:
+    if _agent_manager is not None and callable(
+        getattr(_agent_manager, "get_player_gid", None)
+    ):
+        return _agent_manager.get_player_gid(nickname)
     backend = _windows_native()
     return backend.get_player_gid(nickname) if backend is not None else None
 
 
 def get_nickname_by_gid(gid: int) -> str | None:
+    if _agent_manager is not None and callable(
+        getattr(_agent_manager, "get_nickname_by_gid", None)
+    ):
+        return _agent_manager.get_nickname_by_gid(gid)
     backend = _windows_native()
     return backend.get_nickname_by_gid(gid) if backend is not None else None
 
@@ -182,6 +208,8 @@ def launch_instance(
     client = _confirmed_client(response)
     if _login_router is not None:
         _login_router(nickname, client)
+    elif callable(getattr(_agent_manager, "login_account", None)):
+        _agent_manager.login_account(nickname, client["client_id"], timeout_secs)
     return client["client_id"]
 
 

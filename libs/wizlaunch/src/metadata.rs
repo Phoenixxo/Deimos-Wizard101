@@ -2,7 +2,16 @@ use crate::errors::VaultError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
+
+const MAX_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_ACCOUNTS: usize = 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AccountMetadata {
@@ -34,16 +43,57 @@ pub fn load() -> Result<AccountMetadata, VaultError> {
     if !path.exists() {
         return Ok(AccountMetadata::default());
     }
-    let data = fs::read_to_string(&path)?;
-    let meta: AccountMetadata = serde_json::from_str(&data)?;
+    let data = fs::read(&path)?;
+    if data.len() > MAX_METADATA_BYTES {
+        return Err(VaultError::MetadataIo(
+            "account metadata exceeds the one-megabyte safety limit".to_string(),
+        ));
+    }
+    let meta: AccountMetadata = serde_json::from_slice(&data)?;
     Ok(meta)
 }
 
 pub fn save(meta: &AccountMetadata) -> Result<(), VaultError> {
+    if meta.nicknames_order.len() > MAX_ACCOUNTS {
+        return Err(VaultError::MetadataIo(
+            "account metadata contains too many accounts".to_string(),
+        ));
+    }
     let path = metadata_path()?;
     let data = serde_json::to_string_pretty(meta)?;
-    fs::write(&path, data)?;
+    let mut random = [0u8; 8];
+    getrandom::getrandom(&mut random).map_err(|error| {
+        VaultError::MetadataIo(format!("could not create temporary metadata name: {error}"))
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", u64::from_le_bytes(random)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        let source = to_wide_null(&temporary.to_string_lossy());
+        let destination = to_wide_null(&path.to_string_lossy());
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(destination.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| VaultError::MetadataIo(format!("could not replace metadata: {error}")))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
     Ok(())
+}
+
+fn to_wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Ensure a nickname is in the order list (appended if missing).
