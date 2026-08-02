@@ -98,6 +98,22 @@ pub trait ProcessBackend: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    fn launch_game(
+        &self,
+        _game_path: &str,
+        _login_server: &str,
+    ) -> Result<ProcessIdentity, ProcessBackendError> {
+        Err(unsupported_game_process_operation())
+    }
+
+    fn terminate_process_and_wait(
+        &self,
+        _expected: &ProcessIdentity,
+        _timeout_ms: u32,
+    ) -> Result<(), ProcessBackendError> {
+        Err(unsupported_game_process_operation())
+    }
+
     fn open_process(&self, pid: u32) -> Result<OpenedProcess<Self::Handle>, ProcessBackendError>;
 
     fn open_process_for_access(
@@ -206,6 +222,13 @@ fn unsupported_input_operation() -> ProcessBackendError {
     ProcessBackendError::new(
         ProcessBackendErrorKind::AccessDenied,
         "input operations require the Windows agent running natively or inside Wine/CrossOver",
+    )
+}
+
+fn unsupported_game_process_operation() -> ProcessBackendError {
+    ProcessBackendError::new(
+        ProcessBackendErrorKind::AccessDenied,
+        "game process operations require the Windows agent running natively or inside Wine/CrossOver",
     )
 }
 

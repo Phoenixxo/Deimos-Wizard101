@@ -15,6 +15,10 @@ use deimos_core::client::{
     OP_CLIENT_TIMED_KEY, OP_CLIENT_TO_SCREEN, OP_CLIENT_WINDOW_FOCUS, OP_CLIENT_WINDOW_SET_TITLE,
     OP_CLIENT_WINDOW_STATE,
 };
+use deimos_core::game::{
+    GameLaunchRequest, GameTerminateRequest, CAPABILITY_GAME_PROCESS, OP_GAME_LAUNCH,
+    OP_GAME_TERMINATE,
+};
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -58,6 +62,7 @@ const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod core_hook;
 pub mod feature_hook;
+pub mod game_process;
 pub mod hook;
 pub mod instance;
 pub mod memory;
@@ -105,6 +110,7 @@ pub fn serve(listener: TcpListener, token: AuthToken, config: RpcConfig) -> io::
             CAPABILITY_CLIENT_DISCOVERY.to_string(),
             CAPABILITY_CLIENT_WINDOW.to_string(),
             CAPABILITY_CLIENT_INPUT.to_string(),
+            CAPABILITY_GAME_PROCESS.to_string(),
             CAPABILITY_PROCESS_READ_ONLY.to_string(),
             CAPABILITY_MEMORY_READ_ONLY.to_string(),
             CAPABILITY_PROCESS_MUTATION.to_string(),
@@ -401,6 +407,31 @@ impl<B: MutationBackend> AgentService<B> {
                             .into_rpc_error(call.request_id, &call.operation),
                     )
                 })?;
+                encode_payload(call, response)
+            }
+            OP_GAME_LAUNCH => {
+                require_capabilities(call, capabilities, &[CAPABILITY_GAME_PROCESS])?;
+                let request: GameLaunchRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response = game_process::launch(&mut clients, &self.backend, &request, || {
+                    self.is_shutting_down()
+                })
+                .map_err(|error| {
+                    Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                })?;
+                encode_payload(call, response)
+            }
+            OP_GAME_TERMINATE => {
+                require_capabilities(call, capabilities, &[CAPABILITY_GAME_PROCESS])?;
+                let request: GameTerminateRequest = decode_payload(call)?;
+                let mut clients = self.lock_clients(call)?;
+                let response =
+                    game_process::terminate(&mut clients, &self.backend, &request, || {
+                        self.is_shutting_down()
+                    })
+                    .map_err(|error| {
+                        Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                    })?;
                 encode_payload(call, response)
             }
             OP_CLIENT_WINDOW_STATE => {

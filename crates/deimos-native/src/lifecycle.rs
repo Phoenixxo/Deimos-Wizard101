@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use deimos_core::client::{
     CAPABILITY_CLIENT_DISCOVERY, CAPABILITY_CLIENT_INPUT, CAPABILITY_CLIENT_WINDOW,
 };
+use deimos_core::game::CAPABILITY_GAME_PROCESS;
 use deimos_core::lifecycle::{
     AgentHealth, AgentHealthRequest, AgentIdentity, AgentShutdownRequest, AgentShutdownResponse,
     AgentState, CAPABILITY_AGENT_LIFECYCLE, OP_AGENT_HEALTH, OP_AGENT_SHUTDOWN,
@@ -31,7 +32,7 @@ const REQUIRED_AGENT_CAPABILITIES: [&str; 4] = [
     CAPABILITY_PROCESS_READ_ONLY,
     CAPABILITY_MEMORY_READ_ONLY,
 ];
-const REQUESTED_AGENT_CAPABILITIES: [&str; 11] = [
+const REQUESTED_AGENT_CAPABILITIES: [&str; 12] = [
     CAPABILITY_AGENT_LIFECYCLE,
     CAPABILITY_CLIENT_DISCOVERY,
     CAPABILITY_PROCESS_READ_ONLY,
@@ -43,6 +44,7 @@ const REQUESTED_AGENT_CAPABILITIES: [&str; 11] = [
     CAPABILITY_FEATURE_HOOK,
     CAPABILITY_CLIENT_WINDOW,
     CAPABILITY_CLIENT_INPUT,
+    CAPABILITY_GAME_PROCESS,
 ];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -447,6 +449,42 @@ impl<R: AgentRuntime> AgentManager<R> {
         let result = managed
             .client
             .call(operation, payload, Some(native_context.clone()));
+        if result.is_err() {
+            if let Some(error) = poll_process_exit(bottle, managed)? {
+                return Err(error.into());
+            }
+        }
+        result.map_err(|source| AgentCallError::Rpc {
+            operation: operation.to_string(),
+            native_context,
+            source: Box::new(source),
+        })
+    }
+
+    pub fn call_with_timeout(
+        &mut self,
+        bottle: &BottleId,
+        operation: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value, AgentCallError> {
+        let managed = self.managed.get_mut(bottle).ok_or_else(|| {
+            LifecycleError::new(
+                LifecycleErrorCode::HealthCheckFailed,
+                bottle.as_str(),
+                "no managed agent exists for this bottle; call ensure_agent first",
+            )
+        })?;
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error.into());
+        }
+        let native_context = self.native_context.clone();
+        let result = managed.client.call_with_timeout(
+            operation,
+            payload,
+            Some(native_context.clone()),
+            timeout,
+        );
         if result.is_err() {
             if let Some(error) = poll_process_exit(bottle, managed)? {
                 return Err(error.into());
@@ -1825,6 +1863,57 @@ mod tests {
         assert_eq!(
             error.details.get("stderr"),
             Some(&"agent exited during call".to_string())
+        );
+    }
+
+    #[test]
+    fn managed_calls_with_timeout_preserve_post_rpc_process_exit() {
+        struct ExitAfterFirstPoll {
+            polled: bool,
+        }
+
+        impl AgentProcess for ExitAfterFirstPoll {
+            fn try_wait(&mut self) -> io::Result<Option<AgentExit>> {
+                if self.polled {
+                    Ok(Some(AgentExit {
+                        code: Some(29),
+                        stderr: "agent exited during timed call".to_string(),
+                    }))
+                } else {
+                    self.polled = true;
+                    Ok(None)
+                }
+            }
+        }
+
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime, "1.2.3");
+        manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+        manager
+            .managed
+            .get_mut(&bottle())
+            .expect("managed agent should exist")
+            .process = Box::new(ExitAfterFirstPoll { polled: false });
+
+        let error = manager
+            .call_with_timeout(
+                &bottle(),
+                "test.disconnect",
+                Value::Null,
+                Duration::from_millis(50),
+            )
+            .expect_err("disconnecting timed call should fail");
+
+        let AgentCallError::Lifecycle(error) = error else {
+            panic!("post-failure process exit should remain a lifecycle error");
+        };
+        assert_eq!(error.code, LifecycleErrorCode::AgentExited);
+        assert_eq!(error.details.get("exit_code"), Some(&"29".to_string()));
+        assert_eq!(
+            error.details.get("stderr"),
+            Some(&"agent exited during timed call".to_string())
         );
     }
 
