@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use crate::lifecycle::AgentIdentity;
 
@@ -70,6 +71,12 @@ impl AuthToken {
 impl fmt::Debug for AuthToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AuthToken([REDACTED])")
+    }
+}
+
+impl Drop for AuthToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -175,6 +182,8 @@ pub enum RpcErrorCode {
     GameLaunchFailed,
     GameLaunchTimeout,
     GameTerminationFailed,
+    GameLoginFailed,
+    GameLoginTimeout,
     MemoryInvalidAddress,
     MemoryReadFailed,
     MemoryWriteFailed,
@@ -669,6 +678,8 @@ impl fmt::Display for RpcErrorCode {
             Self::GameLaunchFailed => "game_launch_failed",
             Self::GameLaunchTimeout => "game_launch_timeout",
             Self::GameTerminationFailed => "game_termination_failed",
+            Self::GameLoginFailed => "game_login_failed",
+            Self::GameLoginTimeout => "game_login_timeout",
             Self::MemoryInvalidAddress => "memory_invalid_address",
             Self::MemoryReadFailed => "memory_read_failed",
             Self::MemoryWriteFailed => "memory_write_failed",
