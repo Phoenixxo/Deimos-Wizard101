@@ -13,12 +13,30 @@ use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.deimos.wizard101.account";
+#[cfg(target_os = "macos")]
+const APPKIT_PROMPT_CLASSES: [&str; 8] = [
+    "NSAlert",
+    "NSApplication",
+    "NSAutoreleasePool",
+    "NSSecureTextField",
+    "NSString",
+    "NSTextField",
+    "NSThread",
+    "NSView",
+];
 #[cfg(windows)]
 const WINDOWS_TARGET_PREFIX: &str = "Deimos/account/";
 const MAX_NICKNAME_BYTES: usize = 128;
 const MAX_ACCOUNTS: usize = 1024;
 const METADATA_VERSION: u32 = 1;
 static METADATA_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "macos")]
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    #[link_name = "NSApplicationLoad"]
+    fn ns_application_load() -> std::ffi::c_schar;
+}
 
 pub struct StoredCredential {
     username: Zeroizing<Vec<u8>>,
@@ -772,6 +790,7 @@ fn appkit_prompt(nickname: &str) -> Result<StoredCredential, AccountError> {
             "the account prompt must be opened from the main application thread",
         ));
     }
+    ensure_appkit_loaded()?;
 
     unsafe {
         let pool: *mut Object = msg_send![class!(NSAutoreleasePool), new];
@@ -848,6 +867,23 @@ fn appkit_prompt(nickname: &str) -> Result<StoredCredential, AccountError> {
         let _: () = msg_send![pool, drain];
         result
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_appkit_loaded() -> Result<(), AccountError> {
+    unsafe {
+        let _ = ns_application_load();
+    }
+    if let Some(class_name) = APPKIT_PROMPT_CLASSES
+        .iter()
+        .find(|class_name| objc::runtime::Class::get(class_name).is_none())
+    {
+        return Err(AccountError::new(
+            AccountErrorKind::Storage,
+            format!("macOS could not initialize the secure account dialog ({class_name})"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -1297,5 +1333,16 @@ mod tests {
         assert_eq!(format!("{credential:?}"), "StoredCredential([REDACTED])");
         let error = StoredCredential::new(Vec::new(), b"secret-value".to_vec()).unwrap_err();
         assert!(!error.to_string().contains("secret-value"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_prompt_classes_are_linked_into_the_native_library() {
+        for class_name in super::APPKIT_PROMPT_CLASSES {
+            assert!(
+                objc::runtime::Class::get(class_name).is_some(),
+                "{class_name} should be available"
+            );
+        }
     }
 }
