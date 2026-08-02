@@ -8,6 +8,8 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - "libs/wizwalker/**"
+      - "src/gui/**"
+      - "Deimos.py"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
@@ -17,6 +19,7 @@ on:
       - "tests/memory_adapter/**"
       - "tests/hooks/**"
       - "tests/telemetry/**"
+      - "tests/host_integration/**"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
@@ -24,6 +27,8 @@ on:
       - "Cargo.lock"
       - "crates/**"
       - "libs/wizwalker/**"
+      - "src/gui/**"
+      - "Deimos.py"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
       - "scripts/test-deimos-native-live.py"
@@ -33,6 +38,7 @@ on:
       - "tests/memory_adapter/**"
       - "tests/hooks/**"
       - "tests/telemetry/**"
+      - "tests/host_integration/**"
       - ".github/workflows/deimos-rust.yml"
 
 env:
@@ -72,6 +78,7 @@ jobs:
           python -m unittest discover -s tests/client_discovery -p "test_*.py" -v
           python -m unittest discover -s tests/hooks -p "test_*.py" -v
           python -m unittest discover -s tests/telemetry -p "test_*.py" -v
+          python -m unittest discover -s tests/host_integration -p "test_*.py" -v
 
       - name: Run portable tests
         env:
@@ -137,7 +144,7 @@ jobs:
           $destination = Join-Path $env:RUNNER_TEMP "deimos_native$suffix"
           Copy-Item -LiteralPath $source -Destination $destination
           $env:PYTHONPATH = $env:RUNNER_TEMP
-          python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager')"
+          python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager'); manager = deimos_native.HostHotkeyManager(); registration = manager.register_hotkey(0x87, 0x4000); manager.unregister_hotkey(registration)"
           "PYTHONPATH=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Smoke test macOS Python extension import
@@ -146,7 +153,7 @@ jobs:
         run: |
           suffix="$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")"
           cp "./target/${{ matrix.target }}/release/libdeimos_native.dylib" "$RUNNER_TEMP/deimos_native$suffix"
-          PYTHONPATH="$RUNNER_TEMP" python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager')"
+          PYTHONPATH="$RUNNER_TEMP" python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager'); assert hasattr(deimos_native, 'HostHotkeyManager')"
           echo "PYTHONPATH=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Upload Wine agent
@@ -173,6 +180,7 @@ jobs:
           python -m unittest discover -s tests/memory_adapter -p "test_*.py" -v
           python -m unittest discover -s tests/hooks -p "test_*.py" -v
           python -m unittest discover -s tests/telemetry -p "test_*.py" -v
+          python -m unittest discover -s tests/host_integration -p "test_*.py" -v
 
       - name: Reject unsupported Wine agent imports
         if: runner.os == 'Windows'

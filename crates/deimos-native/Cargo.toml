@@ -24,6 +24,14 @@ serde_json.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 pyo3-build-config = "0.22"
 

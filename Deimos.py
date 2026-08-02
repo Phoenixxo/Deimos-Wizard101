@@ -1257,6 +1257,11 @@ async def main():
 
 	async def handle_gui():
 
+		def _overlay_target(client):
+			if hasattr(type(client), "overlay_geometry"):
+				return client.overlay_geometry
+			return client.window_handle
+
 		async def handle_coord_error(error: wizwalker.errors.MemoryReadError):
 			if await is_visible_by_path(foreground_client, play_button_path):
 				return
@@ -1296,13 +1301,13 @@ async def main():
 								y2 = max(head[1], feet[1])
 								gui_send_queue.put(deimosgui.GUICommand(
 									deimosgui.GUICommandType.UpdateHighlightBox,
-									(client.window_handle, x1, y1, x2, y2)
+									(_overlay_target(client), x1, y1, x2, y2)
 								))
 							elif feet is not None:
 								# Head behind camera - just show small box at feet
 								gui_send_queue.put(deimosgui.GUICommand(
 									deimosgui.GUICommandType.UpdateHighlightBox,
-									(client.window_handle, feet[0] - 30, feet[1] - 60, feet[0] + 30, feet[1])
+									(_overlay_target(client), feet[0] - 30, feet[1] - 60, feet[0] + 30, feet[1])
 								))
 							else:
 								gui_send_queue.put(deimosgui.GUICommand(
@@ -1333,7 +1338,7 @@ async def main():
 							rect = await window.scale_to_client()
 							gui_send_queue.put(deimosgui.GUICommand(
 								deimosgui.GUICommandType.UpdateHighlightBox,
-								(client.window_handle, rect.x1, rect.y1, rect.x2, rect.y2)
+								(_overlay_target(client), rect.x1, rect.y1, rect.x2, rect.y2)
 							))
 						else:
 							gui_send_queue.put(deimosgui.GUICommand(

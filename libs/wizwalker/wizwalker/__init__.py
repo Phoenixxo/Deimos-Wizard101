@@ -2,6 +2,7 @@ import sys
 
 from .constants import *
 from .errors import *
+from .hotkey import *
 
 if sys.platform == "win32":
     import logging
@@ -16,7 +17,6 @@ if sys.platform == "win32":
     from .mouse_handler import MouseHandler
     from .client import Client
     from .client_handler import ClientHandler
-    from .hotkey import *
 
     logger.disable("wizwalker")
     logging.getLogger("pymem").setLevel(logging.FATAL)

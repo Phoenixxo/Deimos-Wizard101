@@ -279,6 +279,31 @@ class DiscoveredClient:
             rectangle["bottom"],
         )
 
+    @property
+    def overlay_geometry(self) -> dict[str, int | bool]:
+        state = self._window_state()
+        origin = state.get("client_origin")
+        size = state.get("client_size")
+        if not isinstance(origin, dict) or not all(
+            isinstance(origin.get(axis), int) and not isinstance(origin.get(axis), bool)
+            for axis in ("x", "y")
+        ):
+            raise ValueError("The native agent returned an invalid client-area origin.")
+        if not isinstance(size, dict) or not all(
+            isinstance(size.get(axis), int) and not isinstance(size.get(axis), bool)
+            for axis in ("width", "height")
+        ):
+            raise ValueError("The native agent returned an invalid client-area size.")
+        if size["width"] <= 0 or size["height"] <= 0:
+            raise ValueError("The native agent returned an empty client area.")
+        return {
+            "left": origin["x"],
+            "top": origin["y"],
+            "width": size["width"],
+            "height": size["height"],
+            "is_foreground": bool(state.get("is_foreground", False)),
+        }
+
     async def _agent_call(self, call, *args):
         return await asyncio.get_running_loop().run_in_executor(None, partial(call, *args))
 

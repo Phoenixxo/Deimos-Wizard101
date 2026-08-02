@@ -89,6 +89,12 @@ pub struct WindowRectangle {
     pub bottom: i32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WindowSize {
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientWindowRequest {
     pub client_id: ClientId,
@@ -100,6 +106,8 @@ pub struct ClientWindowStateResponse {
     pub title: String,
     pub is_foreground: bool,
     pub rectangle: WindowRectangle,
+    pub client_origin: WindowPoint,
+    pub client_size: WindowSize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

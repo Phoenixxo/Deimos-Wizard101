@@ -12,7 +12,6 @@ dependencies = [
     "appdirs>=1.4.4",
     "click>=8.1.7",
     "click-default-group>=1.2.4",
-    "janus>=1.0.0",
     "pefile>=2023.2.7",
     "regex>=2024.5.15",
 ]

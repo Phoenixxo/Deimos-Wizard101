@@ -1623,6 +1623,11 @@ mod tests {
                     right: 820,
                     bottom: 610,
                 },
+                client_origin: WindowPoint { x: 22, y: 32 },
+                client_size: deimos_core::client::WindowSize {
+                    width: 796,
+                    height: 576,
+                },
             })
         }
 
@@ -1865,6 +1870,10 @@ mod tests {
             .handle_call_with_capabilities(&state_call, &[CAPABILITY_CLIENT_WINDOW.to_string()])
             .expect("window state should succeed");
         assert_eq!(state["title"], "Wizard101 336");
+        assert_eq!(state["client_origin"]["x"], 22);
+        assert_eq!(state["client_origin"]["y"], 32);
+        assert_eq!(state["client_size"]["width"], 796);
+        assert_eq!(state["client_size"]["height"], 576);
         assert!(state.get("window_handle").is_none());
 
         let coordinate_call = RpcCall {

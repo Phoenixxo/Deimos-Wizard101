@@ -42,6 +42,10 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::host_hotkey::{
+    HostHotkeyError as NativeHostHotkeyError, HostHotkeyErrorKind, HostHotkeyService,
+};
+use crate::host_window::{HostWindowError as NativeHostWindowError, HostWindowService};
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use crate::lifecycle::{AgentEndpoint, AgentLaunch, AgentLaunchError, AgentProcess, AgentRuntime};
 use crate::lifecycle::{AgentManager, BottleId, LifecycleError, LifecycleErrorCode};
@@ -57,7 +61,179 @@ create_exception!(deimos_native, ProcessError, AgentProtocolError);
 create_exception!(deimos_native, MemoryError, AgentProtocolError);
 create_exception!(deimos_native, WindowError, AgentProtocolError);
 create_exception!(deimos_native, InputError, AgentProtocolError);
+create_exception!(deimos_native, HostHotkeyError, DeimosNativeError);
+create_exception!(deimos_native, HostWindowError, DeimosNativeError);
 create_exception!(deimos_native, NativePanicError, DeimosNativeError);
+
+#[pyclass(name = "HostWindowManager")]
+struct PyHostWindowManager;
+
+#[pymethods]
+impl PyHostWindowManager {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn client_geometry(&self, py: Python<'_>, window: u64) -> PyResult<(i32, i32, i32, i32)> {
+        let geometry = py
+            .allow_threads(|| HostWindowService::client_geometry(window))
+            .map_err(|error| host_window_error(py, "host_window.client_geometry", error))?;
+        Ok((geometry.left, geometry.top, geometry.width, geometry.height))
+    }
+
+    fn make_click_through(&self, py: Python<'_>, window: u64) -> PyResult<()> {
+        py.allow_threads(|| HostWindowService::make_click_through(window))
+            .map_err(|error| host_window_error(py, "host_window.make_click_through", error))
+    }
+
+    fn stack_above(&self, py: Python<'_>, overlay_window: u64, game_window: u64) -> PyResult<()> {
+        py.allow_threads(|| HostWindowService::stack_above(overlay_window, game_window))
+            .map_err(|error| host_window_error(py, "host_window.stack_above", error))
+    }
+}
+
+fn host_window_error(py: Python<'_>, operation: &str, error: NativeHostWindowError) -> PyErr {
+    decorate_error(
+        py,
+        PyErr::new::<HostWindowError, _>(
+            "Deimos could not update the overlay window. Close and reopen the overlay, then try again.",
+        ),
+        "host_window_native_failure",
+        operation,
+        None,
+        json!({ "native_code": error.native_code }),
+        None,
+        &error.message,
+    )
+}
+
+#[pyclass(name = "HostHotkeyManager")]
+struct PyHostHotkeyManager {
+    service: Mutex<HostHotkeyService>,
+}
+
+#[pymethods]
+impl PyHostHotkeyManager {
+    #[new]
+    fn new() -> Self {
+        Self {
+            service: Mutex::new(HostHotkeyService::default()),
+        }
+    }
+
+    fn register_hotkey(&self, py: Python<'_>, virtual_key: u16, modifiers: u16) -> PyResult<u32> {
+        self.with_service(py, "hotkey.register", |service| {
+            service.register(virtual_key, modifiers)
+        })
+    }
+
+    fn unregister_hotkey(&self, py: Python<'_>, registration_id: u32) -> PyResult<()> {
+        self.with_service(py, "hotkey.unregister", |service| {
+            service.unregister(registration_id)
+        })
+    }
+
+    fn poll_events(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
+        let mut service = self.service.lock().map_err(|_| {
+            host_hotkey_state_error(py, "hotkey.poll", "the hotkey service lock was poisoned")
+        })?;
+        Ok(service.poll_events())
+    }
+
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.with_service(py, "hotkey.clear", HostHotkeyService::clear)
+    }
+}
+
+impl PyHostHotkeyManager {
+    fn with_service<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        call: impl FnOnce(&mut HostHotkeyService) -> Result<T, NativeHostHotkeyError> + Send,
+    ) -> PyResult<T> {
+        let result = py.allow_threads(|| {
+            let mut service = self.service.lock().map_err(|_| None)?;
+            call(&mut service).map_err(Some)
+        });
+        match result {
+            Ok(value) => Ok(value),
+            Err(Some(error)) => Err(host_hotkey_error(py, operation, error)),
+            Err(None) => Err(host_hotkey_state_error(
+                py,
+                operation,
+                "the hotkey service lock was poisoned",
+            )),
+        }
+    }
+}
+
+fn host_hotkey_error(py: Python<'_>, operation: &str, error: NativeHostHotkeyError) -> PyErr {
+    let (code, user_message) = match error.kind {
+        HostHotkeyErrorKind::Conflict => (
+            "hotkey_conflict",
+            "That shortcut is already in use. Choose a different key combination and try again.",
+        ),
+        HostHotkeyErrorKind::NotRegistered => (
+            "hotkey_not_registered",
+            "That shortcut is no longer registered. Refresh the hotkey settings and try again.",
+        ),
+        HostHotkeyErrorKind::UnsupportedKey => (
+            "hotkey_unsupported_key",
+            "That key cannot be used as a global shortcut on this platform. Choose another key.",
+        ),
+        HostHotkeyErrorKind::InvalidModifiers => (
+            "hotkey_invalid_modifiers",
+            "That shortcut uses an unsupported modifier combination. Choose another shortcut.",
+        ),
+        #[cfg(target_os = "macos")]
+        HostHotkeyErrorKind::PermissionRequired => (
+            "hotkey_permission_required",
+            "macOS is blocking global hotkeys. Allow Deimos under System Settings > Privacy & Security > Input Monitoring, then restart Deimos.",
+        ),
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        HostHotkeyErrorKind::UnsupportedPlatform => (
+            "hotkey_unsupported_platform",
+            "Global hotkeys are available only on Windows and macOS.",
+        ),
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        HostHotkeyErrorKind::Native => (
+            "hotkey_native_failure",
+            "Deimos could not update that global shortcut. Try another binding or restart Deimos.",
+        ),
+    };
+    let details = json!({
+        "virtual_key": error.virtual_key,
+        "modifiers": error.modifiers,
+        "native_code": error.native_code,
+    });
+    decorate_error(
+        py,
+        PyErr::new::<HostHotkeyError, _>(user_message),
+        code,
+        operation,
+        None,
+        details,
+        None,
+        &error.message,
+    )
+}
+
+fn host_hotkey_state_error(py: Python<'_>, operation: &str, message: &str) -> PyErr {
+    decorate_error(
+        py,
+        PyErr::new::<HostHotkeyError, _>(
+            "The global hotkey service is unavailable. Restart Deimos and try again.",
+        ),
+        "hotkey_invalid_state",
+        operation,
+        None,
+        json!({}),
+        None,
+        message,
+    )
+}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 type ManagedRuntime = AgentManager<WineAgentRuntime>;
@@ -1686,6 +1862,8 @@ fn agent_call_error(error: crate::lifecycle::AgentCallError) -> BindingError {
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAgentManager>()?;
+    module.add_class::<PyHostHotkeyManager>()?;
+    module.add_class::<PyHostWindowManager>()?;
     module.add(
         "DeimosNativeError",
         module.py().get_type_bound::<DeimosNativeError>(),
@@ -1710,6 +1888,14 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("MemoryError", module.py().get_type_bound::<MemoryError>())?;
     module.add("WindowError", module.py().get_type_bound::<WindowError>())?;
     module.add("InputError", module.py().get_type_bound::<InputError>())?;
+    module.add(
+        "HostHotkeyError",
+        module.py().get_type_bound::<HostHotkeyError>(),
+    )?;
+    module.add(
+        "HostWindowError",
+        module.py().get_type_bound::<HostWindowError>(),
+    )?;
     module.add(
         "NativePanicError",
         module.py().get_type_bound::<NativePanicError>(),

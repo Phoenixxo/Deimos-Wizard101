@@ -1,5 +1,7 @@
 #![allow(clippy::useless_conversion, unexpected_cfgs)]
 
+mod host_hotkey;
+mod host_window;
 pub mod lifecycle;
 #[cfg(feature = "python")]
 mod python_api;
@@ -46,6 +48,8 @@ mod tests {
 
             for name in [
                 "AgentManager",
+                "HostHotkeyManager",
+                "HostWindowManager",
                 "DeimosNativeError",
                 "ConfigurationError",
                 "UnsupportedPlatformError",
@@ -55,6 +59,8 @@ mod tests {
                 "MemoryError",
                 "WindowError",
                 "InputError",
+                "HostHotkeyError",
+                "HostWindowError",
                 "NativePanicError",
             ] {
                 assert!(
@@ -69,6 +75,35 @@ mod tests {
             let manager = module
                 .getattr("AgentManager")
                 .expect("AgentManager should be exported");
+            let hotkeys = module
+                .getattr("HostHotkeyManager")
+                .expect("HostHotkeyManager should be exported");
+            for method in [
+                "register_hotkey",
+                "unregister_hotkey",
+                "poll_events",
+                "clear",
+            ] {
+                assert!(
+                    hotkeys
+                        .getattr(method)
+                        .unwrap_or_else(|_| panic!("HostHotkeyManager.{method} should be exported"))
+                        .is_callable(),
+                    "HostHotkeyManager.{method} should be callable"
+                );
+            }
+            let host_windows = module
+                .getattr("HostWindowManager")
+                .expect("HostWindowManager should be exported");
+            for method in ["client_geometry", "make_click_through", "stack_above"] {
+                assert!(
+                    host_windows
+                        .getattr(method)
+                        .unwrap_or_else(|_| panic!("HostWindowManager.{method} should be exported"))
+                        .is_callable(),
+                    "HostWindowManager.{method} should be callable"
+                );
+            }
             for forbidden in ["new_auth_token", "rpc_call_json"] {
                 assert!(
                     !module
