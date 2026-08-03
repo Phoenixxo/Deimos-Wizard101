@@ -39,6 +39,9 @@ class MemoryBackend:
     """Synchronous process-memory contract used by :class:`MemoryReader`."""
 
     supports_mutation = False
+    supports_write = False
+    supports_allocation = False
+    supports_remote_thread = False
     process: Any
 
     def is_running(self) -> bool:
@@ -70,6 +73,9 @@ class PymemMemoryBackend(MemoryBackend):
     """Compatibility backend around the legacy ``pymem.Pymem`` object."""
 
     supports_mutation = True
+    supports_write = True
+    supports_allocation = True
+    supports_remote_thread = True
 
     def __init__(self, process: Any):
         self.process = process
@@ -125,7 +131,7 @@ class PymemMemoryBackend(MemoryBackend):
 
 class DeimosNativeMemoryBackend(MemoryBackend):
     """
-    Read-only adapter around a ``deimos_native.AgentManager`` session.
+    Adapter around a mutation-capable ``deimos_native.AgentManager`` session.
 
     The caller owns the manager and process-session lifecycle. Constructing this
     backend never starts an agent or opens a process implicitly.
@@ -145,6 +151,7 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         self.session_id = session_id
         self.process = self
         self._native_module = native_module
+        self.supports_write = hasattr(manager, "write_memory")
         self.supports_feature_hooks = all(
             hasattr(manager, name)
             for name in (
@@ -186,7 +193,13 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         )
 
     def write_bytes(self, address: int, value: bytes, size: int | None = None) -> None:
-        raise UnsupportedMemoryOperation("write")
+        if size is not None and size != len(value):
+            raise ValueError("size must match the number of bytes being written")
+        self.manager.write_memory(
+            self.session_id,
+            hex(address),
+            bytes(value),
+        )
 
     def allocate(self, size: int) -> int:
         raise UnsupportedMemoryOperation("allocate")
@@ -342,6 +355,9 @@ class DeimosNativeMemoryBackend(MemoryBackend):
 
     def is_read_error(self, error: BaseException) -> bool:
         return isinstance(error, (self._native().MemoryError, IncompleteMemoryScanError))
+
+    def is_write_error(self, error: BaseException) -> bool:
+        return isinstance(error, self._native().MemoryError)
 
     def is_operation_error(self, error: BaseException) -> bool:
         native_error = getattr(self._native(), "DeimosNativeError", None)

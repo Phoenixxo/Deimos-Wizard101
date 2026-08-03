@@ -444,7 +444,18 @@ class MemoryReader:
             raise MemoryWriteError(address) from error
 
     def _require_mutation(self, operation: str):
-        if not self._backend.supports_mutation:
+        capability = {
+            "write": "supports_write",
+            "allocate": "supports_allocation",
+            "free": "supports_allocation",
+            "remote thread creation": "supports_remote_thread",
+        }.get(operation)
+        supported = (
+            getattr(self._backend, capability)
+            if capability is not None and hasattr(self._backend, capability)
+            else self._backend.supports_mutation
+        )
+        if not supported:
             raise UnsupportedMemoryOperation(operation)
 
     async def _is_running_after_error(self) -> bool | None:

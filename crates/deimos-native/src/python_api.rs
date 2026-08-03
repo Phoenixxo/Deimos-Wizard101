@@ -23,13 +23,13 @@ use deimos_core::memory::{
     FeatureHookSessionRequest, FeatureMousePositionRequest, FeatureTeleportRequest,
     MemoryBatchReadRequest, MemoryPointerChainRequest, MemoryReadItem, MemoryReadRequest,
     MemoryReadResponse, MemoryScanRequest, MemoryScanScope, MemorySessionRequest, MemoryValueType,
-    TypedMemoryReadRequest, DEFAULT_SCAN_MAX_MATCHES, OP_CORE_HOOK_ACTIVATE,
+    MemoryWriteRequest, TypedMemoryReadRequest, DEFAULT_SCAN_MAX_MATCHES, OP_CORE_HOOK_ACTIVATE,
     OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
     OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_FEATURE_BUDDY_ADD, OP_FEATURE_CHAT_SEND,
     OP_FEATURE_HOOK_ACTIVATE, OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL,
     OP_FEATURE_HOOK_READ_EXPORT, OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT,
     OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
-    OP_MEMORY_REGIONS, OP_MEMORY_SCAN,
+    OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessSessionId, SessionRequest,
@@ -1513,6 +1513,25 @@ impl PyAgentManager {
         let response: MemoryReadResponse = serde_json::from_value(response)
             .map_err(|error| BindingError::serialization(OP_MEMORY_READ, error).into_pyerr(py))?;
         Ok(PyBytes::new_bound(py, &response.bytes).unbind())
+    }
+
+    fn write_memory(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        address: String,
+        bytes: Vec<u8>,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_MEMORY_WRITE,
+            MemoryWriteRequest {
+                session_id: ProcessSessionId(session_id),
+                address,
+                bytes,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_MEMORY_WRITE, request)
     }
 
     fn read_memory_batch(
