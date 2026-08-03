@@ -5,15 +5,15 @@ from functools import cached_property, partial
 from importlib import import_module
 from typing import Callable, List, Optional
 
-from . import (
-    CacheHandler,
-    Keycode,
+from . import utils
+from .constants import Keycode, Primitive, WIZARD_SPEED
+from .errors import (
+    ExceptionalTimeout,
     MemoryReadError,
+    PatternMultipleResults,
     ReadingEnumFailed,
-    utils, ExceptionalTimeout,
 )
-from .constants import WIZARD_SPEED, Primitive
-from .errors import PatternMultipleResults
+from .file_readers import CacheHandler
 from .memory import (
     CurrentActorBody,
     CurrentChatOwner,
