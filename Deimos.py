@@ -46,6 +46,12 @@ from src.settings_manager import DeimosSettings
 from src.tokenizer import tokenize
 from src.deimoslang import vm
 from src.platform_adapter import host_platform
+from src.runtime_recovery import (
+	AgentRuntimeRecovery,
+	AutoHookRetryPolicy,
+	format_error_diagnostics,
+	is_recoverable_agent_error,
+)
 
 
 def get_all_wizard_handles():
@@ -412,6 +418,15 @@ async def tool_finish():
 async def main(agent_manager: Any = None):
 	if agent_manager is not None:
 		wizlaunch.configure_runtime(agent_manager)
+	runtime_recovery = AgentRuntimeRecovery(agent_manager)
+	if agent_manager is not None:
+		try:
+			runtime_recovery.remember(await asyncio.to_thread(agent_manager.status))
+		except Exception as error:
+			logger.warning(
+				"Could not capture the initial helper-agent identity: "
+				f"{format_error_diagnostics(error)}"
+			)
 	global tool_status
 	global original_client_locations
 	global listener
@@ -1149,8 +1164,8 @@ async def main(agent_manager: Any = None):
 	released_handles: set[int | str] = set()
 	# Handles currently mid-hook (activate_hooks in progress)
 	_hooking_in_progress: set[int | str] = set()
-	# Failed automatic hooks require an explicit retry or a new process identity.
-	_failed_auto_hooks: set[int | str] = set()
+	# Newly launched clients need a short settling period before memory hooks are installed.
+	_auto_hook_retries = AutoHookRetryPolicy()
 
 	def _client_identity(client):
 		return walker.client_identity(client)
@@ -1158,6 +1173,74 @@ async def main(agent_manager: Any = None):
 	def _mask_uid(uid) -> str:
 		s = str(uid)
 		return '****' if len(s) <= 4 else '*' * (len(s) - 4) + s[-4:]
+
+	def _log_native_failure(message: str, error: BaseException, *, warning: bool = False):
+		formatted = f"{message}: {format_error_diagnostics(error)}"
+		if warning:
+			logger.warning(formatted)
+		else:
+			logger.error(formatted)
+
+	async def _recover_agent_runtime(operation: str, error: BaseException) -> bool:
+		global walker
+		nonlocal foreground_client
+		nonlocal background_clients
+
+		_log_native_failure(f"Native helper failed during {operation}", error)
+		outcome = await runtime_recovery.recover(error)
+		if not outcome.recovered:
+			if outcome.error is not None:
+				_log_native_failure("Helper-agent recovery failed", outcome.error)
+			elif outcome.reason not in ("recovery cooldown active", "error is not recoverable"):
+				logger.error(f"Helper-agent recovery stopped: {outcome.reason}.")
+			return False
+
+		identity = (outcome.response or {}).get("identity", {})
+		logger.info(
+			"Helper-agent connection recovered"
+			+ (f" (instance {identity.get('instance_id')})." if identity else ".")
+		)
+		if outcome.instance_changed:
+			for client in walker.clients:
+				mark_closed = getattr(client, "_mark_closed", None)
+				if callable(mark_closed):
+					mark_closed()
+			walker = ClientHandler(agent_manager=agent_manager)
+			foreground_client = None
+			background_clients = []
+			launched_account_map.clear()
+			released_handles.clear()
+			_hooking_in_progress.clear()
+			_auto_hook_retries.clear_all()
+			if "client_speeds" in globals():
+				client_speeds.clear()
+			gui_send_queue.put(deimosgui.GUICommand(
+				deimosgui.GUICommandType.UpdateHookedClients,
+				{'hooked': [], 'unmanaged': [], 'managed_accounts': [], 'hooking': []},
+			))
+			logger.warning(
+				"The helper-agent instance changed. Existing client sessions were discarded; "
+				"running clients will be rediscovered."
+			)
+		return True
+
+	async def _get_all_wizard_handles(operation: str):
+		for attempt in range(2):
+			try:
+				handles = set(await asyncio.to_thread(get_all_wizard_handles))
+				runtime_recovery.confirm_healthy()
+				return handles
+			except Exception as error:
+				if attempt == 0 and await _recover_agent_runtime(operation, error):
+					continue
+				if attempt > 0:
+					_log_native_failure(
+						f"Native helper remained unavailable after recovery during {operation}",
+						error,
+					)
+				await asyncio.sleep(0.5)
+				return None
+		return None
 
 	def _kill_process_by_handle(handle):
 		"""Terminate the OS process behind a window handle."""
@@ -1168,8 +1251,21 @@ async def main(agent_manager: Any = None):
 
 	def _build_hooked_clients_info():
 		# Prune stale entries for handles whose windows no longer exist
-		all_handles = set(get_all_wizard_handles())
-		stale = [h for h in launched_account_map if h not in all_handles]
+		listing_available = True
+		try:
+			all_handles = set(get_all_wizard_handles())
+		except Exception as error:
+			listing_available = False
+			_log_native_failure(
+				"Could not refresh the client list while updating the launcher",
+				error,
+				warning=True,
+			)
+			all_handles = set(walker.managed_identities)
+		stale = [
+			h for h in launched_account_map
+			if listing_available and h not in all_handles
+		]
 		for h in stale:
 			launched_account_map.pop(h)
 			_hooking_in_progress.discard(h)
@@ -1560,14 +1656,20 @@ async def main(agent_manager: Any = None):
 
 			# Continuous detection — only auto-hook vault-launched clients
 			if initial_setup_complete and not paused_task_names:
-				all_handles = set(get_all_wizard_handles())
-				_failed_auto_hooks.intersection_update(all_handles)
+				all_handles = await _get_all_wizard_handles("client discovery")
+				if all_handles is None:
+					await asyncio.sleep(0.5)
+					continue
+				_auto_hook_retries.retain(all_handles)
 				managed = set(walker.managed_identities)
-				unmanaged = all_handles - managed - released_handles - _failed_auto_hooks
+				unmanaged = all_handles - managed - released_handles
 
 				# Auto-hook any unmanaged handle that was launched via the vault (in launch order)
 				hooked_any = False
-				launch_order = [h for h in launched_account_map if h in unmanaged]
+				launch_order = [
+					h for h in launched_account_map
+					if h in unmanaged and _auto_hook_retries.ready(h)
+				]
 				for handle in launch_order:
 					nc = None
 					try:
@@ -1584,15 +1686,28 @@ async def main(agent_manager: Any = None):
 						_send_hooked_clients_update()
 						await nc.activate_hooks()
 						await _init_client_attrs(nc)
+						_auto_hook_retries.clear(handle)
 						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}).")
 						hooked_any = True
 					except wizwalker.errors.HookAlreadyActivated:
 						await _init_client_attrs(nc)
+						_auto_hook_retries.clear(handle)
 						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked).")
 						hooked_any = True
 					except Exception as e:
-						logger.error(f"Failed to auto-hook vault-launched client (handle {handle}): {e}")
-						_failed_auto_hooks.add(handle)
+						decision = _auto_hook_retries.record_failure(handle)
+						if decision.retry:
+							_log_native_failure(
+								f"Auto-hook attempt {decision.attempt} failed for vault-launched client "
+								f"{handle}; retrying in {decision.delay_seconds:g} seconds",
+								e,
+								warning=True,
+							)
+						else:
+							_log_native_failure(
+								f"Auto-hook retries exhausted for vault-launched client {handle}",
+								e,
+							)
 						if nc is not None:
 							walker.release_client(nc)
 					finally:
@@ -1600,7 +1715,7 @@ async def main(agent_manager: Any = None):
 
 				if hooked_any:
 					_send_hooked_clients_update()
-					last_known_handle_count = len(get_all_wizard_handles())
+					last_known_handle_count = len(all_handles)
 					_restart_always_on_tasks()
 					_restart_active_toggle_tasks()
 				else:
@@ -2248,12 +2363,13 @@ async def main(agent_manager: Any = None):
 								logger.info(f"Launching {len(nicknames)} instance(s)...")
 							# Clear any released handles so newly launched clients get auto-hooked
 							released_handles.clear()
-							_failed_auto_hooks.clear()
+							_auto_hook_retries.clear_all()
 							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ClearLaunchCheckboxes))
 							try:
 								results = await asyncio.to_thread(wizlaunch.launch_instances, nicknames, game_path)
 								for nickname, handle in results.items():
 									launched_account_map[handle] = nickname
+									_auto_hook_retries.register(handle)
 									logger.info(f"Launched and logged in '{nickname}'.")
 							except Exception as e:
 								logger.error(f"Error launching instances: {e}")
@@ -2294,13 +2410,15 @@ async def main(agent_manager: Any = None):
 							handle = com.data
 							# Remove from released set so it can be managed
 							released_handles.discard(handle)
-							_failed_auto_hooks.discard(handle)
+							_auto_hook_retries.clear(handle)
 							# Check handle is still valid and not already managed
 							if handle in walker.managed_identities:
 								logger.debug(f"Handle {handle} already managed, skipping.")
 								_send_hooked_clients_update()
 								continue
-							all_handles = get_all_wizard_handles()
+							all_handles = await _get_all_wizard_handles("manual client hook")
+							if all_handles is None:
+								continue
 							if handle not in all_handles:
 								logger.error(f"Handle {handle} no longer exists.")
 								_send_hooked_clients_update()
@@ -2710,9 +2828,12 @@ async def main(agent_manager: Any = None):
 
 
 	await asyncio.sleep(0.1)
-	if get_all_wizard_handles():
+	startup_handles = await _get_all_wizard_handles("initial client discovery")
+	if startup_handles:
 		override_wiz_install_using_handle()
 		logger.debug('Wizard101 client(s) detected. Hook clients from the Launcher tab.')
+	elif startup_handles is None:
+		logger.warning('The helper agent is unavailable. Deimos will keep trying in the background.')
 	else:
 		logger.debug('No Wizard101 clients detected. Use the Launcher tab to start one.')
 	logger.debug('Ready. Hook clients from the Launcher tab.')
@@ -2830,9 +2951,17 @@ async def main(agent_manager: Any = None):
 					logger.info("Tool close triggered by user.")
 					should_exit = True
 				elif t == all_tasks.get('gui'):
-					# GUI task errors are always fatal
-					logger.opt(exception=exc).error("GUI task crashed")
-					should_exit = True
+					if is_recoverable_agent_error(exc):
+						await _recover_agent_runtime("GUI task", exc)
+						await asyncio.sleep(1.0)
+						gui_task = asyncio.create_task(handle_gui())
+						all_tasks['gui'] = gui_task
+						logger.warning(
+							"The GUI backend survived a helper-agent interruption and resumed polling."
+						)
+					else:
+						logger.opt(exception=exc).error("GUI task crashed")
+						should_exit = True
 				else:
 					# Client-dependent task died (memory error, dead process, etc.)
 					# Non-fatal — the client is likely closed
