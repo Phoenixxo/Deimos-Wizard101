@@ -318,10 +318,10 @@ fn template(hook: CoreHook) -> Template {
             &[0x48, 0x89, 0xc8][..], // mov rax, rcx
         ),
         CoreHook::RootWindow => (
-            "49 8B 8F D8 00 00 00 48 8B 01 ?? ?? ?? ?? ?? ?? ?? FF 50 70 84 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??",
+            "49 8B 8D D8 00 00 00 48 8B 01 ?? ?? ?? ?? ?? ?? ?? FF 50 70 84 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??",
             0,
             0,
-            &[0x49, 0x8b, 0x87, 0xd8, 0x00, 0x00, 0x00][..], // mov rax,[r15+0xd8]
+            &[0x49, 0x8b, 0x85, 0xd8, 0x00, 0x00, 0x00][..], // mov rax,[r13+0xd8]
         ),
         CoreHook::RenderContext => (
             "F3 44 0F 10 8B 98 00 00 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? F3 41 0F 10 28 F3 0F 10 56 04 48 63 C1 ??",
@@ -433,6 +433,16 @@ mod tests {
                 &[0xeb, 0x08]
             );
         }
+    }
+
+    #[test]
+    fn root_window_hook_captures_the_current_r13_root_pointer() {
+        let template = template(CoreHook::RootWindow);
+        assert!(template.signature.starts_with("49 8B 8D D8 00 00 00"));
+        assert_eq!(
+            &template.payload[1..8],
+            &[0x49, 0x8b, 0x85, 0xd8, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
