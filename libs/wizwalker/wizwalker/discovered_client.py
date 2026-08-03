@@ -7,7 +7,11 @@ from functools import partial
 from typing import Any
 
 from .memory import DeimosNativeMemoryBackend, MemoryReader
-from .telemetry import ReadOnlyTelemetryReader, ReadOnlyTelemetrySnapshot
+from .telemetry import (
+    ReadOnlyTelemetryReader,
+    ReadOnlyTelemetrySnapshot,
+    _TelemetryReadContext,
+)
 
 
 class WindowRectangle:
@@ -183,6 +187,45 @@ class NativeMouseHandler:
 class DiscoveredClient:
     """Read-only client identity reported by the native helper agent."""
 
+    _HOOK_MEMORY_OBJECT_ATTRIBUTES = (
+        "stats",
+        "body",
+        "duel",
+        "quest_position",
+        "client_object",
+        "root_window",
+        "render_context",
+        "game_client",
+        "social_systems_manager",
+        "chat_owner",
+        "_teleport_helper",
+    )
+    _HOOKED_CLIENT_METHODS = frozenset(
+        {
+            "zone_name",
+            "get_base_entity_list",
+            "get_base_entities_with_predicate",
+            "get_base_entities_with_name",
+            "get_base_entities_with_display_name",
+            "get_world_view_window",
+            "get_template_ids",
+            "quest_manager",
+            "character_registry",
+            "quest_id",
+            "goal_id",
+            "in_battle",
+            "is_loading",
+            "is_in_dialog",
+            "is_in_npc_range",
+            "backpack_space",
+            "wait_for_zone_change",
+            "current_energy",
+            "teleport",
+            "_teleport_object",
+            "_get_je_instruction_forward_backwards",
+        }
+    )
+
     def __init__(self, agent_manager: Any, descriptor: dict[str, Any]):
         self._agent_manager = agent_manager
         self._running = True
@@ -196,7 +239,23 @@ class DiscoveredClient:
         self._attach_lock = asyncio.Lock()
         self._hook_attach_lock = asyncio.Lock()
         self._mouse_handler = NativeMouseHandler(self)
+        self._cache_handler = None
+        self._template_ids = None
+        self._world_view_window = None
+        self._character_registry_addr = None
+        self._quest_client_manager_addr = None
+        self._je_instruction_forward_backwards = None
         self._update(descriptor)
+
+    def __getattr__(self, name: str):
+        if name not in self._HOOKED_CLIENT_METHODS:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+
+        from .client import Client
+
+        return getattr(Client, name).__get__(self, type(self))
 
     def _update(self, descriptor: dict[str, Any]) -> None:
         client_id = descriptor.get("client_id")
@@ -357,7 +416,42 @@ class DiscoveredClient:
         if self.hook_handler is not None:
             self.hook_handler.cancel_core_hook_heartbeat()
         self.hook_handler = None
+        for attribute in self._HOOK_MEMORY_OBJECT_ATTRIBUTES:
+            self.__dict__.pop(attribute, None)
         return session_id
+
+    def _build_hook_memory_objects(self, handler) -> dict[str, Any]:
+        from .memory.memory_objects import (
+            CurrentActorBody,
+            CurrentChatOwner,
+            CurrentClientObject,
+            CurrentDuel,
+            CurrentGameClient,
+            CurrentGameStats,
+            CurrentQuestPosition,
+            CurrentRenderContext,
+            CurrentRootWindow,
+            CurrentSocialSystemsManager,
+            TeleportHelper,
+        )
+        address_context = _TelemetryReadContext(handler, {})
+
+        return {
+            "stats": CurrentGameStats(handler, address_context.game_stats),
+            "body": CurrentActorBody(handler, address_context.actor_body),
+            "duel": CurrentDuel(handler),
+            "quest_position": CurrentQuestPosition(handler),
+            "client_object": CurrentClientObject(
+                handler,
+                address_context.root_client_object,
+            ),
+            "root_window": CurrentRootWindow(handler),
+            "render_context": CurrentRenderContext(handler),
+            "game_client": CurrentGameClient(handler),
+            "social_systems_manager": CurrentSocialSystemsManager(handler),
+            "chat_owner": CurrentChatOwner(handler),
+            "_teleport_helper": TeleportHelper(handler),
+        }
 
     def _close_session_blocking(self, session_id: str) -> None:
         try:
@@ -530,8 +624,14 @@ class DiscoveredClient:
                 DeimosNativeMemoryBackend(self._agent_manager, session_id),
                 self,
             )
+            try:
+                memory_objects = self._build_hook_memory_objects(handler)
+            except BaseException:
+                await self._close_session(session_id)
+                raise
             self._hook_session_id = session_id
             self.hook_handler = handler
+            self.__dict__.update(memory_objects)
             return handler, True
 
     async def activate_hooks(self, wait_for_ready: bool = True) -> None:
@@ -565,6 +665,14 @@ class DiscoveredClient:
     @property
     def mouse_handler(self):
         return self._mouse_handler
+
+    @property
+    def cache_handler(self):
+        if self._cache_handler is None:
+            from .file_readers import CacheHandler
+
+            self._cache_handler = CacheHandler()
+        return self._cache_handler
 
     async def close(self) -> None:
         hook_handler = self.hook_handler

@@ -208,10 +208,13 @@ class CurrentClientObject(ClientObject):
     """
     Client object tied to the client hook
     """
-    def __init__(self, hook_handler: HookHandler):
+    def __init__(self, hook_handler: HookHandler, base_address_resolver=None):
         super(DynamicMemoryObject, self).__init__(hook_handler)
+        self._base_address_resolver = base_address_resolver
 
     async def read_base_address(self) -> int:
+        if self._base_address_resolver is not None:
+            return await self._base_address_resolver()
         return await self.hook_handler.read_current_client_base()
 
 

@@ -90,6 +90,7 @@ jobs:
           scripts/test-deimos-telemetry-live.py
           scripts/test-deimos-window-input-live.py
           scripts/test-deimos-app-live.py
+          scripts/probe-deimos-movement-selectors-live.py
 
       - name: Run portable WizWalker tests
         run: |

@@ -1164,6 +1164,8 @@ async def main(agent_manager: Any = None):
 	released_handles: set[int | str] = set()
 	# Handles currently mid-hook (activate_hooks in progress)
 	_hooking_in_progress: set[int | str] = set()
+	# A failed mutation attempt requires a fresh game process before another hook attempt.
+	_failed_hook_handles: set[int | str] = set()
 	# Newly launched clients need a short settling period before memory hooks are installed.
 	_auto_hook_retries = AutoHookRetryPolicy()
 
@@ -1211,6 +1213,7 @@ async def main(agent_manager: Any = None):
 			launched_account_map.clear()
 			released_handles.clear()
 			_hooking_in_progress.clear()
+			_failed_hook_handles.clear()
 			_auto_hook_retries.clear_all()
 			if "client_speeds" in globals():
 				client_speeds.clear()
@@ -2408,6 +2411,17 @@ async def main(agent_manager: Any = None):
 
 						case deimosgui.GUICommandType.HookClient:
 							handle = com.data
+							all_handles = await _get_all_wizard_handles("manual client hook")
+							if all_handles is None:
+								continue
+							_failed_hook_handles.intersection_update(all_handles)
+							if handle in _failed_hook_handles:
+								logger.error(
+									f"Hooking is disabled for client {handle} after a failed memory mutation. "
+									"Restart that Wizard101 client before trying again."
+								)
+								_send_hooked_clients_update()
+								continue
 							# Remove from released set so it can be managed
 							released_handles.discard(handle)
 							_auto_hook_retries.clear(handle)
@@ -2415,9 +2429,6 @@ async def main(agent_manager: Any = None):
 							if handle in walker.managed_identities:
 								logger.debug(f"Handle {handle} already managed, skipping.")
 								_send_hooked_clients_update()
-								continue
-							all_handles = await _get_all_wizard_handles("manual client hook")
-							if all_handles is None:
 								continue
 							if handle not in all_handles:
 								logger.error(f"Handle {handle} no longer exists.")
@@ -2444,9 +2455,18 @@ async def main(agent_manager: Any = None):
 								await _init_client_attrs(nc)
 								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}, already hooked).")
 							except Exception as e:
-								logger.error(f"Failed to hook client (handle {handle}): {e}")
+								_failed_hook_handles.add(handle)
+								_log_native_failure(f"Failed to hook client (handle {handle})", e)
 								if nc is not None:
-									walker.release_client(nc)
+									try:
+										await nc.close()
+									except Exception as cleanup_error:
+										_log_native_failure(
+											f"Failed to clean up client after hook failure (handle {handle})",
+											cleanup_error,
+										)
+									finally:
+										walker.release_client(nc)
 								_hooking_in_progress.discard(handle)
 								_send_hooked_clients_update()
 								continue
@@ -2539,6 +2559,11 @@ async def main(agent_manager: Any = None):
 
 			except queue.Empty:
 				pass
+			except deimosgui.ToolClosedException:
+				raise
+			except Exception as error:
+				command_name = getattr(getattr(com, "com_type", None), "name", "unknown")
+				_log_native_failure(f"GUI action {command_name} failed", error)
 
 			if walker.clients:
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', bool_to_string(auto_pet_status))))
@@ -2830,7 +2855,8 @@ async def main(agent_manager: Any = None):
 	await asyncio.sleep(0.1)
 	startup_handles = await _get_all_wizard_handles("initial client discovery")
 	if startup_handles:
-		override_wiz_install_using_handle()
+		if agent_manager is None:
+			override_wiz_install_using_handle()
 		logger.debug('Wizard101 client(s) detected. Hook clients from the Launcher tab.')
 	elif startup_handles is None:
 		logger.warning('The helper agent is unavailable. Deimos will keep trying in the background.')
