@@ -157,6 +157,11 @@ jobs:
           python -m pip install --disable-pip-version-check -e ./libs/wizwalker -e ./libs/wizsprinter
           python -m pip install --disable-pip-version-check "PyQt6>=6.6.0" "pyperclip>=1.9.0" "pyyaml>=6.0.1" "requests>=2.32.3"
 
+      - name: Smoke test Windows WizWalker import
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import wizwalker; from wizwalker import ClientHandler, DiscoveredClient, Orient, Rectangle, XYZ; assert ClientHandler and DiscoveredClient and Orient and Rectangle and XYZ"
+
       - name: Build workspace
         env:
           PYO3_PYTHON: python
@@ -200,6 +205,7 @@ jobs:
           if-no-files-found: error
 
       - name: Run WizWalker compatibility tests
+        shell: bash
         env:
           DEIMOS_TEST_REAL_NATIVE: "1"
         run: |
