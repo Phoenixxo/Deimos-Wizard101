@@ -18,6 +18,58 @@ _RECOVERABLE_LIFECYCLE_CODES = {
     "stale_recovery_failed",
 }
 _RECOVERABLE_PROTOCOL_CODES = {"io", "timeout", "transport_error"}
+_CHARACTER_NOT_READY_MESSAGES = (
+    "has not selected a character yet",
+    "has not published its client-object tree yet",
+)
+
+
+class AutoHookClientNotReady(RuntimeError):
+    """A launched client is visible but has not entered a playable character yet."""
+
+
+def client_supports_operations(client: Any, *operation_names: str) -> bool:
+    """Return whether a client exposes every operation required by a UI action."""
+    for operation_name in operation_names:
+        try:
+            operation = getattr(client, operation_name)
+        except AttributeError:
+            return False
+        if not callable(operation):
+            return False
+    return True
+
+
+def task_is_active(task: Any) -> bool:
+    """Treat completed tasks as inactive even when they were not cancelled."""
+    return task is not None and not task.done()
+
+
+def require_auto_hook_character_ready(snapshot: Any) -> None:
+    """Reject auto-hooking until read-only telemetry sees a selected character."""
+    fields = getattr(snapshot, "fields", None)
+    if not isinstance(fields, dict) or "character_identity" not in fields:
+        raise ValueError(
+            "The read-only telemetry snapshot did not include character identity."
+        )
+
+    field = fields["character_identity"]
+    if getattr(field, "available", False):
+        return
+
+    diagnostic = getattr(field, "error", None)
+    technical_message = str(
+        getattr(diagnostic, "technical_message", "")
+    ).casefold()
+    if any(message in technical_message for message in _CHARACTER_NOT_READY_MESSAGES):
+        raise AutoHookClientNotReady(
+            "Wizard101 is still loading the selected character."
+        )
+
+    message = getattr(diagnostic, "message", None)
+    raise RuntimeError(
+        message or "Deimos could not confirm that this Wizard101 client is ready."
+    )
 
 
 def error_diagnostics(error: BaseException) -> dict[str, Any]:
@@ -200,6 +252,14 @@ class AutoHookRetryPolicy:
         delay = self._retry_delays[retry_index]
         state.next_attempt_at = self._clock() + delay
         return AutoHookRetryDecision(state.failures, True, delay)
+
+    def defer(self, identity: Hashable, delay_seconds: float = 5.0) -> float:
+        """Delay a readiness check without consuming the hook-failure budget."""
+        if delay_seconds < 0:
+            raise ValueError("hook readiness delay must not be negative")
+        state = self._states.setdefault(identity, _AutoHookState(0, self._clock()))
+        state.next_attempt_at = self._clock() + delay_seconds
+        return delay_seconds
 
     def clear(self, identity: Hashable) -> None:
         self._states.pop(identity, None)

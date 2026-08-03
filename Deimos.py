@@ -48,9 +48,13 @@ from src.deimoslang import vm
 from src.platform_adapter import host_platform
 from src.runtime_recovery import (
 	AgentRuntimeRecovery,
+	AutoHookClientNotReady,
 	AutoHookRetryPolicy,
+	client_supports_operations,
 	format_error_diagnostics,
 	is_recoverable_agent_error,
+	require_auto_hook_character_ready,
+	task_is_active,
 )
 
 
@@ -460,7 +464,7 @@ async def main(agent_manager: Any = None):
 		global gui_send_queue
 
 		if not freecam_status:
-			if speed_task is not None and not speed_task.cancelled():
+			if task_is_active(speed_task):
 				speed_task.cancel()
 				speed_task = None
 				logger.debug('Speed hotkey pressed, disabling speed multiplier.')
@@ -500,22 +504,23 @@ async def main(agent_manager: Any = None):
 		global combat_task
 		global gui_send_queue
 
-		for client in walker.clients:
-			client.combat_status ^= True
-
-		if not freecam_status:
-			if combat_task is not None and not combat_task.cancelled():
-				combat_task.cancel()
-				combat_task = None
-				if debug:
-					logger.debug('Combat hotkey pressed, disabling auto combat.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Disabled')))
-
-			else:
-				if debug:
-					logger.debug('Combat hotkey pressed, enabling auto combat.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Enabled')))
-				combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
+		if freecam_status:
+			return
+		if task_is_active(combat_task):
+			for client in walker.clients:
+				client.combat_status = False
+			combat_task.cancel()
+			combat_task = None
+			if debug:
+				logger.debug('Combat hotkey pressed, disabling auto combat.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Disabled')))
+		else:
+			for client in walker.clients:
+				client.combat_status = True
+			if debug:
+				logger.debug('Combat hotkey pressed, enabling auto combat.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Enabled')))
+			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
 
 
 	async def toggle_dialogue_hotkey():
@@ -524,7 +529,7 @@ async def main(agent_manager: Any = None):
 		global side_quest_status
 
 		if not freecam_status:
-			if dialogue_task is not None and not dialogue_task.cancelled():
+			if task_is_active(dialogue_task):
 				side_quest_status = False
 				dialogue_task.cancel()
 				dialogue_task = None
@@ -556,54 +561,69 @@ async def main(agent_manager: Any = None):
 		global questing_task
 		global gui_send_queue
 
-		if not freecam_status:
+		if freecam_status:
+			return
+		if task_is_active(sigil_task):
 			for p in walker.clients:
-				p.sigil_status ^= True
-				if p.sigil_status:
-					p.questing_status = False
-					p.auto_pet_status = False
+				p.sigil_status = False
+			sigil_task.cancel()
+			sigil_task = None
+			logger.debug('Sigil hotkey pressed, disabling auto sigil.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
+		else:
+			for p in walker.clients:
+				p.sigil_status = True
+				p.questing_status = False
+				p.auto_pet_status = False
+			logger.debug('Sigil hotkey pressed, enabling auto sigil.')
+			if task_is_active(questing_task):
+				logger.debug('Questing hotkey pressed, disabling auto questing.')
+				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
+				questing_task.cancel()
+				questing_status = False
+				questing_task = None
 
-			if sigil_task is not None and not sigil_task.cancelled():
-				sigil_task.cancel()
-				sigil_task = None
-				logger.debug('Sigil hotkey pressed, disabling auto sigil.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
-
-			else:
-				logger.debug('Sigil hotkey pressed, enabling auto sigil.')
-				if questing_task is not None and not questing_task.cancelled():
-					logger.debug('Questing hotkey pressed, disabling auto questing.')
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
-					questing_task.cancel()
-					for p in walker.clients:
-						p.questing_status = False
-					questing_status = False
-					questing_task = None
-
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Enabled')))
-				sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Enabled')))
+			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
 
 
 
 	async def toggle_freecam_hotkey(debug: bool = True):
 		global freecam_status
-		if foreground_client:
-			if await is_free(foreground_client):
-				if await foreground_client.game_client.is_freecam():
-					if debug:
-						logger.debug('Freecam hotkey pressed, disabling freecam.')
-					await foreground_client.camera_elastic()
-					freecam_status = False
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Disabled')))
+		if not foreground_client:
+			return False
+		if not client_supports_operations(
+			foreground_client,
+			"camera_elastic",
+			"camera_freecam",
+		):
+			freecam_status = False
+			gui_send_queue.put(deimosgui.GUICommand(
+				deimosgui.GUICommandType.UpdateWindow,
+				('FreecamStatus', 'Disabled'),
+			))
+			logger.info(
+				"Freecam is not available for this client yet; no settings were changed."
+			)
+			return False
+		if not await is_free(foreground_client):
+			return freecam_status
 
-				else:
-					if debug:
-						logger.debug('Freecam hotkey pressed, enabling freecam.')
+		if await foreground_client.game_client.is_freecam():
+			if debug:
+				logger.debug('Freecam hotkey pressed, disabling freecam.')
+			await foreground_client.camera_elastic()
+			freecam_status = False
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Disabled')))
+			return False
 
-					freecam_status = True
-					await sync_camera(foreground_client)
-					await foreground_client.camera_freecam()
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Enabled')))
+		if debug:
+			logger.debug('Freecam hotkey pressed, enabling freecam.')
+		await sync_camera(foreground_client)
+		await foreground_client.camera_freecam()
+		freecam_status = True
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Enabled')))
+		return True
 
 
 	async def tp_to_freecam_hotkey():
@@ -624,21 +644,22 @@ async def main(agent_manager: Any = None):
 		global gui_send_queue
 
 		if not freecam_status:
-			questing_status ^= True
-			for p in walker.clients:
-				p.questing_status ^= True
-
-			if questing_task is not None and not questing_task.cancelled():
+			if task_is_active(questing_task):
+				questing_status = False
+				for p in walker.clients:
+					p.questing_status = False
 				logger.debug('Questing hotkey pressed, disabling auto questing.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
 				questing_task.cancel()
 				questing_task = None
 
 			else:
+				questing_status = True
 				for p in walker.clients:
+					p.questing_status = True
 					p.sigil_status = False
 
-				if sigil_task is not None and not sigil_task.cancelled():
+				if task_is_active(sigil_task):
 					logger.debug('Sigil hotkey pressed, disabling auto sigil.')
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
 					sigil_task.cancel()
@@ -657,17 +678,19 @@ async def main(agent_manager: Any = None):
 		global auto_pet_status
 
 		if not freecam_status:
-			auto_pet_status ^= True
-			for p in walker.clients:
-				p.auto_pet_status ^= True
-
-			if auto_pet_task is not None and not auto_pet_task.cancelled():
+			if task_is_active(auto_pet_task):
+				auto_pet_status = False
+				for p in walker.clients:
+					p.auto_pet_status = False
 				logger.debug(f'Disabling auto pet.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', 'Disabled')))
 				auto_pet_task.cancel()
 				auto_pet_task = None
 
 			else:
+				auto_pet_status = True
+				for p in walker.clients:
+					p.auto_pet_status = True
 				logger.debug(f'Enabling auto pet.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', 'Enabled')))
 				auto_pet_task = asyncio.create_task(try_task_coro(auto_pet_loop, walker.clients, True))
@@ -789,8 +812,15 @@ async def main(agent_manager: Any = None):
 			if not freecam_status:
 				await asyncio.sleep(0.2)
 				for c in walker.clients:
-					if await c.client_object.speed_multiplier() != modified_speed:
-						await c.client_object.write_speed_multiplier(modified_speed)
+					try:
+						if await c.client_object.speed_multiplier() != modified_speed:
+							await c.client_object.write_speed_multiplier(modified_speed)
+					except (
+						wizwalker.errors.HookNotReady,
+						wizwalker.errors.MemoryReadError,
+					):
+						# Hook-backed pointers are briefly unavailable while zones load.
+						continue
 
 
 	async def is_client_in_combat_loop():
@@ -890,7 +920,7 @@ async def main(agent_manager: Any = None):
 								client_in_solo_zone = True
 
 						# restart questing
-						if questing_task is not None and not questing_task.cancelled() and not client_in_solo_zone:
+						if task_is_active(questing_task) and not client_in_solo_zone:
 								logger.debug(f'Questing appears to have halted - restarting.')
 								questing_task.cancel()
 								questing_task = None
@@ -1356,6 +1386,22 @@ async def main(agent_manager: Any = None):
 			global questing_leader_pid
 			questing_leader_pid = client.process_id
 
+	async def _release_failed_auto_hook(client, handle) -> bool:
+		if client is None:
+			return True
+		try:
+			await client.close()
+		except Exception as cleanup_error:
+			_failed_hook_handles.add(handle)
+			_log_native_failure(
+				f"Failed to clean up auto-hook attempt for client {handle}",
+				cleanup_error,
+			)
+			return False
+		finally:
+			walker.release_client(client)
+		return True
+
 	async def handle_gui():
 
 		def _overlay_target(client):
@@ -1590,7 +1636,7 @@ async def main(agent_manager: Any = None):
 							"auto_pet": auto_pet_task,
 						}
 						for name, task in task_vars.items():
-							if task is not None and not task.cancelled():
+							if task_is_active(task):
 								active_tasks.add(name)
 								task.cancel()
 
@@ -1664,8 +1710,9 @@ async def main(agent_manager: Any = None):
 					await asyncio.sleep(0.5)
 					continue
 				_auto_hook_retries.retain(all_handles)
+				_failed_hook_handles.intersection_update(all_handles)
 				managed = set(walker.managed_identities)
-				unmanaged = all_handles - managed - released_handles
+				unmanaged = all_handles - managed - released_handles - _failed_hook_handles
 
 				# Auto-hook any unmanaged handle that was launched via the vault (in launch order)
 				hooked_any = False
@@ -1687,17 +1734,36 @@ async def main(agent_manager: Any = None):
 						nc.title = f'p{num}'
 						_hooking_in_progress.add(handle)
 						_send_hooked_clients_update()
-						await nc.activate_hooks()
+						snapshot = await nc.telemetry_snapshot()
+						require_auto_hook_character_ready(snapshot)
+						already_activated = False
+						try:
+							await nc.activate_hooks()
+						except wizwalker.errors.HookAlreadyActivated:
+							already_activated = True
 						await _init_client_attrs(nc)
 						_auto_hook_retries.clear(handle)
-						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}).")
+						activation_note = ", already hooked" if already_activated else ""
+						logger.info(
+							f"Auto-hooked vault-launched client '{nc.title}' "
+							f"({launched_account_map[handle]}{activation_note})."
+						)
 						hooked_any = True
-					except wizwalker.errors.HookAlreadyActivated:
-						await _init_client_attrs(nc)
-						_auto_hook_retries.clear(handle)
-						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked).")
-						hooked_any = True
+					except AutoHookClientNotReady as e:
+						cleaned = await _release_failed_auto_hook(nc, handle)
+						if cleaned:
+							delay = _auto_hook_retries.defer(handle)
+							logger.debug(
+								f"Waiting to auto-hook vault-launched client {handle}: {e} "
+								f"Checking again in {delay:g} seconds."
+							)
+						else:
+							_auto_hook_retries.clear(handle)
 					except Exception as e:
+						cleaned = await _release_failed_auto_hook(nc, handle)
+						if not cleaned:
+							_auto_hook_retries.clear(handle)
+							continue
 						decision = _auto_hook_retries.record_failure(handle)
 						if decision.retry:
 							_log_native_failure(
@@ -1711,10 +1777,9 @@ async def main(agent_manager: Any = None):
 								f"Auto-hook retries exhausted for vault-launched client {handle}",
 								e,
 							)
-						if nc is not None:
-							walker.release_client(nc)
 					finally:
 						_hooking_in_progress.discard(handle)
+						_send_hooked_clients_update()
 
 				if hooked_any:
 					_send_hooked_clients_update()
@@ -2086,8 +2151,8 @@ async def main(agent_manager: Any = None):
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
 							if foreground_client:
-								if not freecam_status:
-									await toggle_freecam_hotkey()
+								if not freecam_status and not await toggle_freecam_hotkey():
+									continue
 								camera: DynamicCameraController = await foreground_client.game_client.selected_camera_controller()
 								camera_pos: XYZ = await camera.position()
 								camera_pitch, camera_roll, camera_yaw = await camera.orientation()
@@ -2217,7 +2282,7 @@ async def main(agent_manager: Any = None):
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if flythrough_task is not None and not flythrough_task.cancelled():
+							if task_is_active(flythrough_task):
 								flythrough_task.cancel()
 								flythrough_task = None
 								await asyncio.sleep(0)
@@ -2293,7 +2358,7 @@ async def main(agent_manager: Any = None):
 										for command_str in new_commands:
 											await parse_command(walker.clients, command_str)
 										await asyncio.sleep(1)
-							if bot_task is not None and not bot_task.cancelled():
+							if task_is_active(bot_task):
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
@@ -2304,7 +2369,7 @@ async def main(agent_manager: Any = None):
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if bot_task is not None and not bot_task.cancelled():
+							if task_is_active(bot_task):
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
@@ -2907,7 +2972,7 @@ async def main(agent_manager: Any = None):
 		"""Cancel and recreate snapshot-based always-on tasks so they pick up new clients."""
 		for name in SNAPSHOT_TASK_NAMES:
 			old = all_tasks.get(name)
-			if old is not None and not old.cancelled():
+			if task_is_active(old):
 				old.cancel()
 			all_tasks[name] = asyncio.create_task(SNAPSHOT_TASK_FUNCS[name]())
 
@@ -2915,33 +2980,33 @@ async def main(agent_manager: Any = None):
 		"""Cancel and recreate any currently-active toggle tasks so they pick up new clients."""
 		global combat_task, dialogue_task, sigil_task, questing_task, speed_task, auto_pet_task
 
-		if combat_task is not None and not combat_task.cancelled():
+		if task_is_active(combat_task):
 			combat_task.cancel()
 			for c in walker.clients:
 				c.combat_status = True
 			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
 
-		if dialogue_task is not None and not dialogue_task.cancelled():
+		if task_is_active(dialogue_task):
 			dialogue_task.cancel()
 			dialogue_task = asyncio.create_task(try_task_coro(dialogue_loop, walker.clients, True))
 
-		if sigil_task is not None and not sigil_task.cancelled():
+		if task_is_active(sigil_task):
 			sigil_task.cancel()
 			for c in walker.clients:
 				c.sigil_status = True
 			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
 
-		if questing_task is not None and not questing_task.cancelled():
+		if task_is_active(questing_task):
 			questing_task.cancel()
 			for c in walker.clients:
 				c.questing_status = True
 			questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
 
-		if speed_task is not None and not speed_task.cancelled():
+		if task_is_active(speed_task):
 			speed_task.cancel()
 			speed_task = asyncio.create_task(try_task_coro(speed_switching, walker.clients))
 
-		if auto_pet_task is not None and not auto_pet_task.cancelled():
+		if task_is_active(auto_pet_task):
 			auto_pet_task.cancel()
 			for c in walker.clients:
 				c.feeding_pet_status = True

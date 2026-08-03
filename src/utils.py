@@ -1257,7 +1257,12 @@ async def try_task_coro(coro: Coroutine, clients: List[Client], deactive_mousele
             await asyncio.gather(*[attempt_deactivate_dance_hook(p) for p in clients])
             return
 
-        except (wizwalker.errors.MemoryInvalidated, wizwalker.errors.ExceptionalTimeout):
+        except (
+            wizwalker.errors.HookNotReady,
+            wizwalker.errors.MemoryInvalidated,
+            wizwalker.errors.MemoryReadError,
+            wizwalker.errors.ExceptionalTimeout,
+        ):
             if attempt < max_retries:
                 logger.debug(f'Task {task_coro} encountered a memory error, retrying ({attempt + 1}/{max_retries})...')
                 await asyncio.sleep(1)
