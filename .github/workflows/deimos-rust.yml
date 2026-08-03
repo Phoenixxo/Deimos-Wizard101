@@ -69,6 +69,16 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Install Linux GUI test libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libegl1
+
+      - name: Install Python compatibility test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ./libs/wizwalker -e ./libs/wizsprinter
+          python -m pip install --disable-pip-version-check "PyQt6>=6.6.0" "pyperclip>=1.9.0" "pyyaml>=6.0.1" "requests>=2.32.3"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -79,6 +89,8 @@ jobs:
           scripts/test-deimos-launch-live.py
           scripts/test-deimos-telemetry-live.py
           scripts/test-deimos-window-input-live.py
+          scripts/test-deimos-app-live.py
+          scripts/probe-deimos-movement-selectors-live.py
 
       - name: Run portable WizWalker tests
         run: |
@@ -141,8 +153,15 @@ jobs:
           python -m pip install --disable-pip-version-check ./libs/wizlaunch
           python -c "import wizlaunch; assert wizlaunch.__version__ == '0.2.0'; assert callable(wizlaunch.launch_instance)"
 
-      - name: Install WizWalker adapter test dependencies
-        run: python -m pip install --disable-pip-version-check -e ./libs/wizwalker
+      - name: Install Python compatibility test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -e ./libs/wizwalker -e ./libs/wizsprinter
+          python -m pip install --disable-pip-version-check "PyQt6>=6.6.0" "pyperclip>=1.9.0" "pyyaml>=6.0.1" "requests>=2.32.3"
+
+      - name: Smoke test Windows WizWalker import
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import wizwalker; from wizwalker import ClientHandler, DiscoveredClient, Orient, Rectangle, XYZ; assert ClientHandler and DiscoveredClient and Orient and Rectangle and XYZ"
 
       - name: Build workspace
         env:
@@ -187,6 +206,7 @@ jobs:
           if-no-files-found: error
 
       - name: Run WizWalker compatibility tests
+        shell: bash
         env:
           DEIMOS_TEST_REAL_NATIVE: "1"
         run: |

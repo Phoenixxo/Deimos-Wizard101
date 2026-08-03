@@ -1715,7 +1715,7 @@ fn movement_template<B: MutationBackend>(
         sessions,
         backend,
         session_id,
-        "40 57 48 83 EC 30 48 C7 44 24 20 FE FF FF FF 48 89 5C 24 40 48 8B 99 B8 01 00 00 48 85 DB 74 13",
+        "48 89 5C 24 08 57 48 83 EC 20 48 8B 99 B8 01 00 00 48 85 DB 74 2F",
         module_scope(),
     )?;
     let movement_state =
@@ -1724,54 +1724,38 @@ fn movement_template<B: MutationBackend>(
     let second_je = movement_state + 24;
     let first_original = array8(read_at(sessions, backend, session_id, first_je, 8)?)?;
     let second_original = array8(read_at(sessions, backend, session_id, second_je, 8)?)?;
-    let collision_one = resolve_unique_pattern(
+    let collision = resolve_unique_pattern(
         sessions,
         backend,
         session_id,
-        "74 ?? F3 0F 10 55 90",
+        "74 24 F3 0F 10 44 24 58 F3 0F 11 44 24 78 48 8B 06",
         module_scope(),
     )?;
-    let collision_two = resolve_unique_pattern(
+    let mut auxiliary_patches = vec![patch(
+        collision,
+        2,
+        vec![0x90; 2],
+        true,
         sessions,
         backend,
         session_id,
-        "74 ?? F3 0F 10 44 24 58 F3 0F",
-        module_scope(),
-    )?;
-    let auxiliary_patches = vec![
-        patch(
-            collision_one,
-            2,
-            vec![0x90; 2],
-            true,
-            sessions,
-            backend,
-            session_id,
-        )?,
-        patch(
-            collision_two,
-            2,
-            vec![0x90; 2],
-            true,
-            sessions,
-            backend,
-            session_id,
-        )?,
-        HookPatch {
-            address: first_je,
-            expected_bytes: first_original.to_vec(),
-            replacement_bytes: [vec![0x90; 6], first_original[6..].to_vec()].concat(),
-            apply_on_activation: false,
-            keep_writable: true,
-        },
-        HookPatch {
-            address: second_je,
-            expected_bytes: second_original.to_vec(),
-            replacement_bytes: [vec![0x90; 6], second_original[6..].to_vec()].concat(),
-            apply_on_activation: false,
-            keep_writable: true,
-        },
-    ];
+    )?];
+    let first_action_patch = auxiliary_patches.len();
+    auxiliary_patches.push(HookPatch {
+        address: first_je,
+        expected_bytes: first_original.to_vec(),
+        replacement_bytes: [vec![0x90; 6], first_original[6..].to_vec()].concat(),
+        apply_on_activation: false,
+        keep_writable: true,
+    });
+    let second_action_patch = auxiliary_patches.len();
+    auxiliary_patches.push(HookPatch {
+        address: second_je,
+        expected_bytes: second_original.to_vec(),
+        replacement_bytes: [vec![0x90; 6], second_original[6..].to_vec()].concat(),
+        apply_on_activation: false,
+        keep_writable: true,
+    });
     let payload_kind = PayloadKind::Movement {
         first_je,
         second_je,
@@ -1788,7 +1772,7 @@ fn movement_template<B: MutationBackend>(
         exports,
         resolved_target: Some(target),
         auxiliary_patches,
-        movement_action_patches: Some((2, 3)),
+        movement_action_patches: Some((first_action_patch, second_action_patch)),
         payload_kind,
         replay_original: true,
         quiescence_offset,

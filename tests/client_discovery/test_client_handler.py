@@ -155,6 +155,21 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid client discovery response"):
             handler.get_new_clients()
 
+    def test_specific_native_client_can_be_managed_by_opaque_identity(self):
+        manager = FakeAgentManager(
+            [[descriptor("client-a", 448), descriptor("client-b", 544)]]
+        )
+        handler = ClientHandler(agent_manager=manager)
+
+        client = handler.manage_client("client-b")
+
+        self.assertEqual(client.client_id, "client-b")
+        self.assertEqual(handler.client_identity(client), "client-b")
+        self.assertEqual(handler.managed_identities, ("client-b",))
+        handler.release_client(client)
+        self.assertEqual(handler.managed_identities, ())
+        self.assertEqual(handler.clients, [])
+
     def test_native_discovery_rejects_malformed_or_duplicate_descriptors(self):
         malformed = ClientHandler(
             agent_manager=SimpleNamespace(list_clients=lambda: {"clients": [{}]})
@@ -256,9 +271,10 @@ class NonWindowsImportTests(unittest.TestCase):
                 "-c",
                 (
                     "import sys; "
-                    "from wizwalker import ClientHandler, DiscoveredClient; "
+                    "from wizwalker import ClientHandler, DiscoveredClient, utils; "
                     "assert 'pymem' not in sys.modules; "
-                    "assert 'wizwalker.utils' not in sys.modules; "
+                    "assert 'winreg' not in sys.modules; "
+                    "assert utils.__name__ == 'wizwalker.utils'; "
                     "print(ClientHandler.__name__, DiscoveredClient.__name__)"
                 ),
             ],

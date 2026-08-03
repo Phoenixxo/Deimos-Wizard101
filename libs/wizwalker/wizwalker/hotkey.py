@@ -2,6 +2,7 @@ import asyncio
 from collections import Counter
 from contextlib import suppress
 from enum import IntFlag
+import time
 from typing import Callable, Union
 
 from .constants import Keycode
@@ -249,10 +250,12 @@ class Listener:
 class HotkeyListener:
     """Cross-platform global hotkey listener with asynchronous callbacks."""
 
-    def __init__(self, *, sleep_time: float = 0.1):
+    def __init__(self, *, sleep_time: float = 0.1, duplicate_window: float = 0.1):
         self.sleep_time = sleep_time
+        self.duplicate_window = duplicate_window
         self._hotkeys = {}
         self._callbacks = {}
+        self._last_triggered = {}
         self._callback_tasks = set()
         self._message_loop_task = None
         self._connected = False
@@ -334,6 +337,7 @@ class HotkeyListener:
         del self._hotkeys[chord]
         callback_chord = (keycode, modifier_value & ~int(ModifierKeys.NOREPEAT))
         self._callbacks.pop(callback_chord, None)
+        self._last_triggered.pop(callback_chord, None)
 
     @staticmethod
     async def set_global_message_loop_delay(delay: float):
@@ -354,6 +358,7 @@ class HotkeyListener:
             del self._hotkeys[(keycode, modifiers)]
             callback_chord = (keycode, modifiers & ~int(ModifierKeys.NOREPEAT))
             self._callbacks.pop(callback_chord, None)
+            self._last_triggered.pop(callback_chord, None)
         if first_error is not None:
             raise first_error
 
@@ -365,6 +370,15 @@ class HotkeyListener:
                         chord[0],
                         chord[1] & ~int(ModifierKeys.NOREPEAT),
                     )
+                    if chord[1] & int(ModifierKeys.NOREPEAT):
+                        triggered_at = time.monotonic()
+                        last_triggered = self._last_triggered.get(callback_chord)
+                        if (
+                            last_triggered is not None
+                            and triggered_at - last_triggered < self.duplicate_window
+                        ):
+                            continue
+                        self._last_triggered[callback_chord] = triggered_at
                     self._handle_hotkey(callback_chord)
             await asyncio.sleep(self.sleep_time)
 

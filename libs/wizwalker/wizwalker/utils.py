@@ -1,14 +1,9 @@
 import asyncio
-import ctypes
-import ctypes.wintypes
 import io
 import math
 import struct
-import subprocess
 import contextlib
 
-# noinspection PyCompatibility
-import winreg
 import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional
@@ -16,7 +11,8 @@ from typing import Any, Callable, Iterable, List, Optional
 import appdirs
 
 from wizwalker import ExceptionalTimeout
-from wizwalker.constants import Keycode, kernel32, user32, gdi32, WM_KEYDOWN, WM_KEYUP
+from wizwalker.constants import Keycode, WM_KEYDOWN, WM_KEYUP
+from wizwalker.platform_adapter import legacy_windows
 
 
 DEFAULT_INSTALL = "C:/ProgramData/KingsIsle Entertainment/Wizard101"
@@ -178,40 +174,11 @@ class Rectangle:
             rgb: Red, green, blue tuple to define the color of the rectangle
             window_handle: Handle to the window to paint the rectangle on
         """
-        paint_struct = PAINTSTRUCT()
-        # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdc
-        device_context = user32.GetDC(window_handle)
-        brush = gdi32.CreateSolidBrush(ctypes.wintypes.RGB(*rgb))
-
-        user32.BeginPaint(window_handle, ctypes.byref(paint_struct))
-
-        # left, top = top left corner; right, bottom = bottom right corner
-        draw_rect = ctypes.wintypes.RECT()
-        draw_rect.left = self.x1
-        draw_rect.top = self.y1
-        draw_rect.right = self.x2
-        draw_rect.bottom = self.y2
-
-        # https://docs.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createrectrgnindirect
-        region = gdi32.CreateRectRgnIndirect(ctypes.byref(draw_rect))
-        # https://docs.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-fillrgn
-        gdi32.FillRgn(device_context, region, brush)
-
-        user32.EndPaint(window_handle, ctypes.byref(paint_struct))
-        user32.ReleaseDC(window_handle, device_context)
-        gdi32.DeleteObject(brush)
-        gdi32.DeleteObject(region)
-
-
-class PAINTSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("hdc", ctypes.wintypes.HDC),
-        ("fErase", ctypes.wintypes.BOOL),
-        ("rcPaint", ctypes.wintypes.RECT),
-        ("fRestore", ctypes.wintypes.BOOL),
-        ("fIncUpdate", ctypes.wintypes.BOOL),
-        ("rgbReserved", ctypes.c_char * 32),
-    ]
+        legacy_windows.paint_rectangle(
+            window_handle,
+            (self.x1, self.y1, self.x2, self.y2),
+            rgb,
+        )
 
 
 def order_clients(clients):
@@ -250,18 +217,9 @@ def get_wiz_install() -> Path:
         return default_install_path
 
     try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{A9E27FF5-6294-46A8-B8FD-77B1DECA3021}",
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            install_location = Path(
-                winreg.QueryValueEx(key, "InstallLocation")[0]
-            ).absolute()
-            return install_location
-    except OSError:
-        raise Exception("Wizard101 install not found.")
+        return legacy_windows.install_location()
+    except (OSError, RuntimeError) as error:
+        raise Exception("Wizard101 install not found.") from error
 
 
 def start_instance():
@@ -269,10 +227,7 @@ def start_instance():
     Starts a wizard101 instance
     """
     location = get_wiz_install()
-    subprocess.Popen(
-        rf"{location}\Bin\WizardGraphicalClient.exe -L login.us.wizard101.com 12000",
-        cwd=rf"{location}\Bin",
-    )
+    legacy_windows.start_instance(location)
 
 
 def instance_login(window_handle: int, username: str, password: str):
@@ -285,16 +240,7 @@ def instance_login(window_handle: int, username: str, password: str):
         password: Password to login with
     """
 
-    def send_chars(chars: str):
-        for char in chars:
-            user32.SendMessageW(window_handle, 0x102, ord(char), 0)
-
-    send_chars(username)
-    # tab
-    user32.SendMessageW(window_handle, 0x102, 9, 0)
-    send_chars(password)
-    # enter
-    user32.SendMessageW(window_handle, 0x102, 13, 0)
+    legacy_windows.send_login(window_handle, username, password)
 
 
 # TODO: use login window for this
@@ -540,10 +486,7 @@ def get_system_directory(max_size: int = 100) -> Path:
         max_size: Max size of the string
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemdirectoryw
-    buffer = ctypes.create_unicode_buffer(max_size)
-    kernel32.GetSystemDirectoryW(buffer, max_size)
-
-    return Path(buffer.value)
+    return legacy_windows.system_directory(max_size)
 
 
 def get_foreground_window() -> Optional[int]:
@@ -553,7 +496,7 @@ def get_foreground_window() -> Optional[int]:
     Returns:
         Handle to the window currently in the forground
     """
-    return user32.GetForegroundWindow()
+    return legacy_windows.foreground_window()
 
 
 def set_foreground_window(window_handle: int) -> bool:
@@ -566,7 +509,7 @@ def set_foreground_window(window_handle: int) -> bool:
     Returns:
         False if the operation failed True otherwise
     """
-    return user32.SetForegroundWindow(window_handle) != 0
+    return legacy_windows.set_foreground_window(window_handle)
 
 
 def get_window_title(handle: int, max_size: int = 100) -> str:
@@ -581,9 +524,7 @@ def get_window_title(handle: int, max_size: int = 100) -> str:
         The window title
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw
-    window_title = ctypes.create_unicode_buffer(max_size)
-    user32.GetWindowTextW(handle, ctypes.byref(window_title), max_size)
-    return window_title.value
+    return legacy_windows.window_title(handle, max_size)
 
 
 def set_window_title(handle: int, window_title: str):
@@ -595,7 +536,7 @@ def set_window_title(handle: int, window_title: str):
         window_title: Title to write
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowtextw
-    user32.SetWindowTextW(handle, window_title)
+    legacy_windows.set_window_title(handle, window_title)
 
 
 def get_window_rectangle(handle: int) -> Rectangle:
@@ -609,11 +550,7 @@ def get_window_rectangle(handle: int) -> Rectangle:
         The window's Rectangle
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect
-    rect = ctypes.wintypes.RECT()
-    user32.GetWindowRect(handle, ctypes.byref(rect))
-
-    # noinspection PyTypeChecker
-    return Rectangle(rect.right, rect.top, rect.left, rect.bottom)
+    return Rectangle(*legacy_windows.window_rectangle(handle))
 
 
 def check_if_process_running(handle: int) -> bool:
@@ -623,17 +560,12 @@ def check_if_process_running(handle: int) -> bool:
     False = Not
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess
-    exit_code = ctypes.wintypes.DWORD()
-    kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
-    # 259 is the value of IS_ALIVE
-    return exit_code.value == 259
+    return legacy_windows.process_running(handle)
 
 
 def get_pid_from_handle(handle: int) -> int:
     # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowthreadprocessid
-    pid = ctypes.wintypes.DWORD()
-    user32.GetWindowThreadProcessId(handle, ctypes.byref(pid))
-    return pid.value
+    return legacy_windows.process_id(handle)
 
 
 def get_all_wizard_handles() -> list:
@@ -643,10 +575,7 @@ def get_all_wizard_handles() -> list:
     target_class = "Wizard Graphical Client"
 
     def callback(handle):
-        class_name = ctypes.create_unicode_buffer(len(target_class))
-        user32.GetClassNameW(handle, class_name, len(target_class) + 1)
-        if target_class == class_name.value:
-            return True
+        return target_class == legacy_windows.window_class(handle, len(target_class) + 1)
 
     return get_windows_from_predicate(callback)
 
@@ -669,25 +598,7 @@ def get_windows_from_predicate(predicate: Callable) -> list:
                     # handle will not be returned
                     return False
     """
-    handles = []
-
-    def callback(handle, _):
-        if predicate(handle):
-            handles.append(handle)
-
-        # iterate all windows, (True)
-        return 1
-
-    enumwindows_func_type = ctypes.WINFUNCTYPE(
-        ctypes.c_bool,
-        ctypes.c_int,
-        ctypes.POINTER(ctypes.c_int),
-    )
-
-    callback = enumwindows_func_type(callback)
-    user32.EnumWindows(callback, 0)
-
-    return handles
+    return legacy_windows.enumerate_windows(predicate)
 
 
 # TODO: 2.0 move all these pharse functions to cache_handler, and rename them to parse instead of pharse
@@ -847,11 +758,11 @@ async def send_hotkey(window_handle: int, modifers: List[Keycode], key: Keycode)
 
 
 def _send_keydown(window_handle: int, key: Keycode):
-    user32.SendMessageW(window_handle, WM_KEYDOWN, key.value, 0)
+    legacy_windows.send_window_message(window_handle, WM_KEYDOWN, key.value, 0)
 
 
 def _send_keyup(window_handle: int, key: Keycode):
-    user32.SendMessageW(window_handle, WM_KEYUP, key.value, 0)
+    legacy_windows.send_window_message(window_handle, WM_KEYUP, key.value, 0)
 
 
 async def timed_send_key(window_handle: int, key: Keycode, seconds: float):

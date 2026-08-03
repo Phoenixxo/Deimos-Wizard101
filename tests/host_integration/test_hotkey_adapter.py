@@ -119,6 +119,31 @@ class HotkeyAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.backend.registrations)
         self.assertFalse(listener.is_running)
 
+    async def test_no_repeat_coalesces_duplicate_native_key_down_events(self):
+        callback_count = 0
+        callback_ran = asyncio.Event()
+
+        async def callback():
+            nonlocal callback_count
+            callback_count += 1
+            callback_ran.set()
+
+        listener = HotkeyListener(sleep_time=0.005, duplicate_window=0.05)
+        listener.start()
+        await listener.add_hotkey(
+            Keycode.F4,
+            callback,
+            modifiers=ModifierKeys.SHIFT | ModifierKeys.NOREPEAT,
+        )
+        registration_id = next(iter(self.backend.registrations))
+        self.backend.events.extend((registration_id, registration_id))
+
+        await asyncio.wait_for(callback_ran.wait(), timeout=0.25)
+        await asyncio.sleep(0.08)
+
+        self.assertEqual(callback_count, 1)
+        await listener.stop()
+
     async def test_conflict_is_structured_and_human_readable(self):
         first = HotkeyListener()
         second = HotkeyListener()

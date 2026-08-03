@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from wizwalker.utils import XYZ, Orient
 from wizwalker.memory.memory_object import Primitive, PropertyClass, DynamicMemoryObject
@@ -161,7 +161,17 @@ class CurrentActorBody(ActorBody):
     Actor body tied to the player hook
     """
 
+    def __init__(
+        self,
+        hook_handler,
+        base_address_resolver: Callable[[], Awaitable[int]] | None = None,
+    ):
+        super().__init__(hook_handler)
+        self._base_address_resolver = base_address_resolver
+
     async def read_base_address(self) -> int:
+        if self._base_address_resolver is not None:
+            return await self._base_address_resolver()
         return await self.hook_handler.read_current_player_base()
 
 

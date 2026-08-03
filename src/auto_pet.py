@@ -3,7 +3,6 @@ import traceback
 from asyncio import CancelledError
 
 from loguru import logger
-from pymem.exception import MemoryReadError
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, Client, Keycode, XYZ
 from wizwalker.memory import HookHandler, SimpleHook
 
@@ -361,4 +360,3 @@ async def auto_pet(client: Client, ignore_pet_level_up: bool, only_play_dance_ga
             except FriendBusyOrInstanceClosed:
                 logger.debug('Client ' + client.title + 'failed to recall from pet pavilion - instance was closed.')
                 break
-

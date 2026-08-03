@@ -2,7 +2,6 @@ import struct
 from typing import Optional
 
 import regex
-import pymem.process
 
 from wizwalker.constants import Primitive
 from wizwalker.errors import PatternFailed
@@ -286,9 +285,7 @@ class CurrentSocialSystemsManager(SocialSystemsManager):
 
     async def _find_ssm_via_constructor_pattern(self) -> int:
         """Locate the SSM singleton via constructor vtable pattern + heap scan."""
-        module = pymem.process.module_from_name(
-            self.hook_handler.process.process_handle, _EXE_NAME
-        )
+        module = self.hook_handler._backend.module(_EXE_NAME)
         if module is None:
             raise RuntimeError(f"{_EXE_NAME} module not found")
         module_base = module.lpBaseOfDll

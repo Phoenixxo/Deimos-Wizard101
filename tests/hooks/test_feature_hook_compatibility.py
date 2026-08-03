@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -15,7 +16,12 @@ for import_root in (REPOSITORY_ROOT, WIZWALKER_ROOT):
 
 sys.modules.setdefault(
     "loguru",
-    SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None)),
+    SimpleNamespace(
+        logger=SimpleNamespace(
+            debug=lambda *args, **kwargs: None,
+            disable=lambda *args, **kwargs: None,
+        )
+    ),
 )
 if "pymem" not in sys.modules:
     pymem = ModuleType("pymem")
@@ -287,6 +293,44 @@ class FeatureHookCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.backend.calls,
         )
         self.assertIn(("add_buddy", 77), self.backend.calls)
+
+    async def test_legacy_movement_hook_matches_current_client_layout(self):
+        movement_jumps = (0x2000, 0x3000)
+
+        async def get_movement_jumps():
+            return movement_jumps
+
+        hook = MovementTeleportHook.__new__(MovementTeleportHook)
+        hook.hook_handler = SimpleNamespace(
+            client=SimpleNamespace(
+                _get_je_instruction_forward_backwards=get_movement_jumps
+            ),
+            read_bytes=AsyncMock(
+                side_effect=(b"\x0f\x84\x01\x02\x03\x04\xaa\xbb", b"\x0f\x84\x05\x06\x07\x08\xcc\xdd")
+            ),
+        )
+        hook.pattern_scan = AsyncMock(return_value=0x4000)
+        hook.read_bytes = AsyncMock(return_value=b"\x74\x24")
+        hook.write_bytes = AsyncMock()
+        hook._set_page_protection = lambda address, protection: 0x20
+
+        await hook.prehook()
+        hook.pattern_scan.assert_awaited_once_with(
+            rb"\x74\x24\xF3\x0F\x10\x44\x24\x58\xF3\x0F"
+            rb"\x11\x44\x24\x78\x48\x8B\x06",
+            module="WizardGraphicalClient.exe",
+        )
+        hook.write_bytes.assert_awaited_once_with(0x4000, b"\x90\x90")
+        self.assertEqual(hook._collision_je_addrs, (0x4000,))
+        self.assertEqual(hook._old_collision_jes_bytes, (b"\x74\x24",))
+
+        bytecode = await hook.bytecode_generator((("teleport_helper", struct.pack("<Q", 0x1000)),))
+        self.assertTrue(bytecode.endswith(b"\x48\x89\x5C\x24\x08\x57"))
+        self.assertTrue(
+            MovementTeleportHook.pattern.startswith(
+                rb"\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20"
+            )
+        )
 
     async def test_chat_exports_are_integer_addresses_for_direct_consumers(self):
         await self.handler.activate_chat_hook(wait_for_ready=False)

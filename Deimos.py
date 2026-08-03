@@ -5,7 +5,6 @@ import queue
 import threading
 import wizwalker
 from wizwalker import Keycode, HotkeyListener, ModifierKeys, utils, XYZ, Orient
-from wizwalker.utils import get_all_wizard_handles, get_foreground_window
 from wizwalker.client_handler import ClientHandler, Client
 from wizwalker.extensions.scripting import teleport_to_friend_from_list
 from wizwalker.memory.memory_objects.camera_controller import DynamicCameraController, ElasticCameraController
@@ -13,8 +12,6 @@ from wizwalker.memory.memory_objects.window import Window
 import os
 import time
 import sys
-import ctypes
-import winreg
 import subprocess
 from loguru import logger
 import datetime
@@ -40,7 +37,7 @@ from src import discsdk
 from wizwalker.extensions.wizsprinter.wiz_navigator import toZoneDisplayName, toZone
 from wizwalker.extensions.wizsprinter.sprinty_combat import SprintyCombat
 from src.config_combat import StrCombatConfigProvider, delegate_combat_configs, default_config
-from typing import List
+from typing import Any, List
 
 from src import gui as deimosgui
 from src.gui import GUIKeys
@@ -48,9 +45,21 @@ import wizlaunch
 from src.settings_manager import DeimosSettings
 from src.tokenizer import tokenize
 from src.deimoslang import vm
+from src.platform_adapter import host_platform
+from src.runtime_recovery import (
+	AgentRuntimeRecovery,
+	AutoHookClientNotReady,
+	AutoHookRetryPolicy,
+	client_supports_operations,
+	format_error_diagnostics,
+	is_recoverable_agent_error,
+	require_auto_hook_character_ready,
+	task_is_active,
+)
 
 
-cMessageBox = ctypes.windll.user32.MessageBoxW
+def get_all_wizard_handles():
+	return wizlaunch.get_wizard_handles()
 
 tool_version: str = '3.13.1'
 tool_name: str = 'Deimos'
@@ -410,7 +419,18 @@ async def tool_finish():
 
 
 @logger.catch()
-async def main():
+async def main(agent_manager: Any = None):
+	if agent_manager is not None:
+		wizlaunch.configure_runtime(agent_manager)
+	runtime_recovery = AgentRuntimeRecovery(agent_manager)
+	if agent_manager is not None:
+		try:
+			runtime_recovery.remember(await asyncio.to_thread(agent_manager.status))
+		except Exception as error:
+			logger.warning(
+				"Could not capture the initial helper-agent identity: "
+				f"{format_error_diagnostics(error)}"
+			)
 	global tool_status
 	global original_client_locations
 	global listener
@@ -444,7 +464,7 @@ async def main():
 		global gui_send_queue
 
 		if not freecam_status:
-			if speed_task is not None and not speed_task.cancelled():
+			if task_is_active(speed_task):
 				speed_task.cancel()
 				speed_task = None
 				logger.debug('Speed hotkey pressed, disabling speed multiplier.')
@@ -484,22 +504,23 @@ async def main():
 		global combat_task
 		global gui_send_queue
 
-		for client in walker.clients:
-			client.combat_status ^= True
-
-		if not freecam_status:
-			if combat_task is not None and not combat_task.cancelled():
-				combat_task.cancel()
-				combat_task = None
-				if debug:
-					logger.debug('Combat hotkey pressed, disabling auto combat.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Disabled')))
-
-			else:
-				if debug:
-					logger.debug('Combat hotkey pressed, enabling auto combat.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Enabled')))
-				combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
+		if freecam_status:
+			return
+		if task_is_active(combat_task):
+			for client in walker.clients:
+				client.combat_status = False
+			combat_task.cancel()
+			combat_task = None
+			if debug:
+				logger.debug('Combat hotkey pressed, disabling auto combat.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Disabled')))
+		else:
+			for client in walker.clients:
+				client.combat_status = True
+			if debug:
+				logger.debug('Combat hotkey pressed, enabling auto combat.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Enabled')))
+			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
 
 
 	async def toggle_dialogue_hotkey():
@@ -508,7 +529,7 @@ async def main():
 		global side_quest_status
 
 		if not freecam_status:
-			if dialogue_task is not None and not dialogue_task.cancelled():
+			if task_is_active(dialogue_task):
 				side_quest_status = False
 				dialogue_task.cancel()
 				dialogue_task = None
@@ -540,54 +561,69 @@ async def main():
 		global questing_task
 		global gui_send_queue
 
-		if not freecam_status:
+		if freecam_status:
+			return
+		if task_is_active(sigil_task):
 			for p in walker.clients:
-				p.sigil_status ^= True
-				if p.sigil_status:
-					p.questing_status = False
-					p.auto_pet_status = False
+				p.sigil_status = False
+			sigil_task.cancel()
+			sigil_task = None
+			logger.debug('Sigil hotkey pressed, disabling auto sigil.')
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
+		else:
+			for p in walker.clients:
+				p.sigil_status = True
+				p.questing_status = False
+				p.auto_pet_status = False
+			logger.debug('Sigil hotkey pressed, enabling auto sigil.')
+			if task_is_active(questing_task):
+				logger.debug('Questing hotkey pressed, disabling auto questing.')
+				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
+				questing_task.cancel()
+				questing_status = False
+				questing_task = None
 
-			if sigil_task is not None and not sigil_task.cancelled():
-				sigil_task.cancel()
-				sigil_task = None
-				logger.debug('Sigil hotkey pressed, disabling auto sigil.')
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
-
-			else:
-				logger.debug('Sigil hotkey pressed, enabling auto sigil.')
-				if questing_task is not None and not questing_task.cancelled():
-					logger.debug('Questing hotkey pressed, disabling auto questing.')
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
-					questing_task.cancel()
-					for p in walker.clients:
-						p.questing_status = False
-					questing_status = False
-					questing_task = None
-
-				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Enabled')))
-				sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Enabled')))
+			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
 
 
 
 	async def toggle_freecam_hotkey(debug: bool = True):
 		global freecam_status
-		if foreground_client:
-			if await is_free(foreground_client):
-				if await foreground_client.game_client.is_freecam():
-					if debug:
-						logger.debug('Freecam hotkey pressed, disabling freecam.')
-					await foreground_client.camera_elastic()
-					freecam_status = False
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Disabled')))
+		if not foreground_client:
+			return False
+		if not client_supports_operations(
+			foreground_client,
+			"camera_elastic",
+			"camera_freecam",
+		):
+			freecam_status = False
+			gui_send_queue.put(deimosgui.GUICommand(
+				deimosgui.GUICommandType.UpdateWindow,
+				('FreecamStatus', 'Disabled'),
+			))
+			logger.info(
+				"Freecam is not available for this client yet; no settings were changed."
+			)
+			return False
+		if not await is_free(foreground_client):
+			return freecam_status
 
-				else:
-					if debug:
-						logger.debug('Freecam hotkey pressed, enabling freecam.')
+		if await foreground_client.game_client.is_freecam():
+			if debug:
+				logger.debug('Freecam hotkey pressed, disabling freecam.')
+			await foreground_client.camera_elastic()
+			freecam_status = False
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Disabled')))
+			return False
 
-					freecam_status = True
-					await sync_camera(foreground_client)
-					await foreground_client.camera_freecam()
-					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Enabled')))
+		if debug:
+			logger.debug('Freecam hotkey pressed, enabling freecam.')
+		await sync_camera(foreground_client)
+		await foreground_client.camera_freecam()
+		freecam_status = True
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FreecamStatus', 'Enabled')))
+		return True
 
 
 	async def tp_to_freecam_hotkey():
@@ -608,21 +644,22 @@ async def main():
 		global gui_send_queue
 
 		if not freecam_status:
-			questing_status ^= True
-			for p in walker.clients:
-				p.questing_status ^= True
-
-			if questing_task is not None and not questing_task.cancelled():
+			if task_is_active(questing_task):
+				questing_status = False
+				for p in walker.clients:
+					p.questing_status = False
 				logger.debug('Questing hotkey pressed, disabling auto questing.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Disabled')))
 				questing_task.cancel()
 				questing_task = None
 
 			else:
+				questing_status = True
 				for p in walker.clients:
+					p.questing_status = True
 					p.sigil_status = False
 
-				if sigil_task is not None and not sigil_task.cancelled():
+				if task_is_active(sigil_task):
 					logger.debug('Sigil hotkey pressed, disabling auto sigil.')
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Disabled')))
 					sigil_task.cancel()
@@ -641,17 +678,19 @@ async def main():
 		global auto_pet_status
 
 		if not freecam_status:
-			auto_pet_status ^= True
-			for p in walker.clients:
-				p.auto_pet_status ^= True
-
-			if auto_pet_task is not None and not auto_pet_task.cancelled():
+			if task_is_active(auto_pet_task):
+				auto_pet_status = False
+				for p in walker.clients:
+					p.auto_pet_status = False
 				logger.debug(f'Disabling auto pet.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', 'Disabled')))
 				auto_pet_task.cancel()
 				auto_pet_task = None
 
 			else:
+				auto_pet_status = True
+				for p in walker.clients:
+					p.auto_pet_status = True
 				logger.debug(f'Enabling auto pet.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', 'Enabled')))
 				auto_pet_task = asyncio.create_task(try_task_coro(auto_pet_loop, walker.clients, True))
@@ -773,8 +812,15 @@ async def main():
 			if not freecam_status:
 				await asyncio.sleep(0.2)
 				for c in walker.clients:
-					if await c.client_object.speed_multiplier() != modified_speed:
-						await c.client_object.write_speed_multiplier(modified_speed)
+					try:
+						if await c.client_object.speed_multiplier() != modified_speed:
+							await c.client_object.write_speed_multiplier(modified_speed)
+					except (
+						wizwalker.errors.HookNotReady,
+						wizwalker.errors.MemoryReadError,
+					):
+						# Hook-backed pointers are briefly unavailable while zones load.
+						continue
 
 
 	async def is_client_in_combat_loop():
@@ -874,7 +920,7 @@ async def main():
 								client_in_solo_zone = True
 
 						# restart questing
-						if questing_task is not None and not questing_task.cancelled() and not client_in_solo_zone:
+						if task_is_active(questing_task) and not client_in_solo_zone:
 								logger.debug(f'Questing appears to have halted - restarting.')
 								questing_task.cancel()
 								questing_task = None
@@ -1142,34 +1188,117 @@ async def main():
 
 
 	# Track which window handles were launched by us, mapped to account nickname
-	launched_account_map: dict[int, str] = {}
+	launched_account_map: dict[int | str, str] = {}
 	initial_setup_complete = False
 	# Handles explicitly released via UnhookClient — skip in continuous detection
-	released_handles: set[int] = set()
+	released_handles: set[int | str] = set()
 	# Handles currently mid-hook (activate_hooks in progress)
-	_hooking_in_progress: set[int] = set()
+	_hooking_in_progress: set[int | str] = set()
+	# A failed mutation attempt requires a fresh game process before another hook attempt.
+	_failed_hook_handles: set[int | str] = set()
+	# Newly launched clients need a short settling period before memory hooks are installed.
+	_auto_hook_retries = AutoHookRetryPolicy()
+
+	def _client_identity(client):
+		return walker.client_identity(client)
 
 	def _mask_uid(uid) -> str:
 		s = str(uid)
 		return '****' if len(s) <= 4 else '*' * (len(s) - 4) + s[-4:]
 
+	def _log_native_failure(message: str, error: BaseException, *, warning: bool = False):
+		formatted = f"{message}: {format_error_diagnostics(error)}"
+		if warning:
+			logger.warning(formatted)
+		else:
+			logger.error(formatted)
+
+	async def _recover_agent_runtime(operation: str, error: BaseException) -> bool:
+		global walker
+		nonlocal foreground_client
+		nonlocal background_clients
+
+		_log_native_failure(f"Native helper failed during {operation}", error)
+		outcome = await runtime_recovery.recover(error)
+		if not outcome.recovered:
+			if outcome.error is not None:
+				_log_native_failure("Helper-agent recovery failed", outcome.error)
+			elif outcome.reason not in ("recovery cooldown active", "error is not recoverable"):
+				logger.error(f"Helper-agent recovery stopped: {outcome.reason}.")
+			return False
+
+		identity = (outcome.response or {}).get("identity", {})
+		logger.info(
+			"Helper-agent connection recovered"
+			+ (f" (instance {identity.get('instance_id')})." if identity else ".")
+		)
+		if outcome.instance_changed:
+			for client in walker.clients:
+				mark_closed = getattr(client, "_mark_closed", None)
+				if callable(mark_closed):
+					mark_closed()
+			walker = ClientHandler(agent_manager=agent_manager)
+			foreground_client = None
+			background_clients = []
+			launched_account_map.clear()
+			released_handles.clear()
+			_hooking_in_progress.clear()
+			_failed_hook_handles.clear()
+			_auto_hook_retries.clear_all()
+			if "client_speeds" in globals():
+				client_speeds.clear()
+			gui_send_queue.put(deimosgui.GUICommand(
+				deimosgui.GUICommandType.UpdateHookedClients,
+				{'hooked': [], 'unmanaged': [], 'managed_accounts': [], 'hooking': []},
+			))
+			logger.warning(
+				"The helper-agent instance changed. Existing client sessions were discarded; "
+				"running clients will be rediscovered."
+			)
+		return True
+
+	async def _get_all_wizard_handles(operation: str):
+		for attempt in range(2):
+			try:
+				handles = set(await asyncio.to_thread(get_all_wizard_handles))
+				runtime_recovery.confirm_healthy()
+				return handles
+			except Exception as error:
+				if attempt == 0 and await _recover_agent_runtime(operation, error):
+					continue
+				if attempt > 0:
+					_log_native_failure(
+						f"Native helper remained unavailable after recovery during {operation}",
+						error,
+					)
+				await asyncio.sleep(0.5)
+				return None
+		return None
+
 	def _kill_process_by_handle(handle):
 		"""Terminate the OS process behind a window handle."""
 		try:
-			pid = utils.get_pid_from_handle(handle)
-			if pid:
-				PROCESS_TERMINATE = 0x0001
-				h_proc = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-				if h_proc:
-					ctypes.windll.kernel32.TerminateProcess(h_proc, 1)
-					ctypes.windll.kernel32.CloseHandle(h_proc)
+			wizlaunch.kill_instance(handle)
 		except Exception as e:
 			logger.error(f"Failed to kill process for handle {handle}: {e}")
 
 	def _build_hooked_clients_info():
 		# Prune stale entries for handles whose windows no longer exist
-		all_handles = set(get_all_wizard_handles())
-		stale = [h for h in launched_account_map if h not in all_handles]
+		listing_available = True
+		try:
+			all_handles = set(get_all_wizard_handles())
+		except Exception as error:
+			listing_available = False
+			_log_native_failure(
+				"Could not refresh the client list while updating the launcher",
+				error,
+				warning=True,
+			)
+			all_handles = set(walker.managed_identities)
+		stale = [
+			h for h in launched_account_map
+			if listing_available and h not in all_handles
+		]
 		for h in stale:
 			launched_account_map.pop(h)
 			_hooking_in_progress.discard(h)
@@ -1177,8 +1306,9 @@ async def main():
 		hooked = []
 		managed_accounts = set(launched_account_map.values())
 		for c in walker.clients:
-			nick = launched_account_map.get(c.window_handle)
-			hooked.append({'title': c.title, 'handle': c.window_handle, 'account_nick': nick})
+			identity = _client_identity(c)
+			nick = launched_account_map.get(identity)
+			hooked.append({'title': c.title, 'handle': identity, 'account_nick': nick})
 			# Also detect accounts via player_gid for manually-hooked clients
 			if not nick:
 				gid = getattr(c, 'player_gid', None)
@@ -1187,7 +1317,7 @@ async def main():
 					if vault_nick:
 						managed_accounts.add(vault_nick)
 		# Unmanaged = running wizard handles not currently managed
-		managed = set(walker._managed_handles)
+		managed = set(walker.managed_identities)
 		unmanaged = sorted(all_handles - managed)
 		return {'hooked': hooked, 'unmanaged': unmanaged, 'managed_accounts': sorted(managed_accounts), 'hooking': sorted(_hooking_in_progress)}
 
@@ -1234,9 +1364,10 @@ async def main():
 			if uid and uid != 0:
 				client.player_gid = uid
 				vault_nick = wizlaunch.get_nickname_by_gid(uid)
-				if vault_nick and client.window_handle not in launched_account_map:
-					launched_account_map[client.window_handle] = vault_nick
-				nick = launched_account_map.get(client.window_handle)
+				identity = _client_identity(client)
+				if vault_nick and identity not in launched_account_map:
+					launched_account_map[identity] = vault_nick
+				nick = launched_account_map.get(identity)
 				if nick:
 					wizlaunch.update_player_gid(nick, uid)
 					logger.debug(f"[GID] Saved user_id {_mask_uid(uid)} for vault account '{nick}'")
@@ -1254,6 +1385,22 @@ async def main():
 		if client_to_boost and client_to_boost in client.title:
 			global questing_leader_pid
 			questing_leader_pid = client.process_id
+
+	async def _release_failed_auto_hook(client, handle) -> bool:
+		if client is None:
+			return True
+		try:
+			await client.close()
+		except Exception as cleanup_error:
+			_failed_hook_handles.add(handle)
+			_log_native_failure(
+				f"Failed to clean up auto-hook attempt for client {handle}",
+				cleanup_error,
+			)
+			return False
+		finally:
+			walker.release_client(client)
+		return True
 
 	async def handle_gui():
 
@@ -1469,12 +1616,11 @@ async def main():
 					count_before = len(walker.clients)
 					dead = walker.remove_dead_clients()
 					if dead:
-						# Clean up managed handles so get_new_clients() can detect relaunched clients
+						# Clean up identities so get_new_clients() can detect relaunched clients
 						for c in dead:
-							if c.window_handle in walker._managed_handles:
-								walker._managed_handles.remove(c.window_handle)
-							launched_account_map.pop(c.window_handle, None)
-							_hooking_in_progress.discard(c.window_handle)
+							identity = _client_identity(c)
+							launched_account_map.pop(identity, None)
+							_hooking_in_progress.discard(identity)
 							logger.info(f"Client '{c.title}' disconnected.")
 						_send_hooked_clients_update()
 
@@ -1490,7 +1636,7 @@ async def main():
 							"auto_pet": auto_pet_task,
 						}
 						for name, task in task_vars.items():
-							if task is not None and not task.cancelled():
+							if task_is_active(task):
 								active_tasks.add(name)
 								task.cancel()
 
@@ -1543,10 +1689,11 @@ async def main():
 								logger.debug(f"[GID] Retry resolved '{c.title}': user_id={_mask_uid(uid)}")
 								c.player_gid = uid
 								vault_nick = wizlaunch.get_nickname_by_gid(uid)
-								if vault_nick and c.window_handle not in launched_account_map:
-									launched_account_map[c.window_handle] = vault_nick
+								identity = _client_identity(c)
+								if vault_nick and identity not in launched_account_map:
+									launched_account_map[identity] = vault_nick
 									_send_hooked_clients_update()
-								nick = launched_account_map.get(c.window_handle)
+								nick = launched_account_map.get(identity)
 								if nick:
 									wizlaunch.update_player_gid(nick, uid)
 									logger.debug(f"[GID] Retry saved user_id {_mask_uid(uid)} for '{nick}'")
@@ -1558,17 +1705,25 @@ async def main():
 
 			# Continuous detection — only auto-hook vault-launched clients
 			if initial_setup_complete and not paused_task_names:
-				all_handles = set(get_all_wizard_handles())
-				managed = set(walker._managed_handles)
-				unmanaged = all_handles - managed - released_handles
+				all_handles = await _get_all_wizard_handles("client discovery")
+				if all_handles is None:
+					await asyncio.sleep(0.5)
+					continue
+				_auto_hook_retries.retain(all_handles)
+				_failed_hook_handles.intersection_update(all_handles)
+				managed = set(walker.managed_identities)
+				unmanaged = all_handles - managed - released_handles - _failed_hook_handles
 
 				# Auto-hook any unmanaged handle that was launched via the vault (in launch order)
 				hooked_any = False
-				launch_order = [h for h in launched_account_map if h in unmanaged]
+				launch_order = [
+					h for h in launched_account_map
+					if h in unmanaged and _auto_hook_retries.ready(h)
+				]
 				for handle in launch_order:
-						walker._managed_handles.append(handle)
-						nc = walker.client_cls(handle)
-						walker.clients.append(nc)
+					nc = None
+					try:
+						nc = walker.manage_client(handle)
 						existing_nums = set()
 						for c in walker.clients:
 							if c.title.startswith('p') and c.title[1:].isdigit():
@@ -1579,25 +1734,56 @@ async def main():
 						nc.title = f'p{num}'
 						_hooking_in_progress.add(handle)
 						_send_hooked_clients_update()
+						snapshot = await nc.telemetry_snapshot()
+						require_auto_hook_character_ready(snapshot)
+						already_activated = False
 						try:
 							await nc.activate_hooks()
-							await _init_client_attrs(nc)
-							logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}).")
-							hooked_any = True
 						except wizwalker.errors.HookAlreadyActivated:
-							await _init_client_attrs(nc)
-							logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked).")
-							hooked_any = True
-						except Exception as e:
-							logger.error(f"Failed to auto-hook vault-launched client (handle {handle}): {e}")
-							walker._managed_handles.remove(handle)
-							walker.clients.remove(nc)
-						finally:
-							_hooking_in_progress.discard(handle)
+							already_activated = True
+						await _init_client_attrs(nc)
+						_auto_hook_retries.clear(handle)
+						activation_note = ", already hooked" if already_activated else ""
+						logger.info(
+							f"Auto-hooked vault-launched client '{nc.title}' "
+							f"({launched_account_map[handle]}{activation_note})."
+						)
+						hooked_any = True
+					except AutoHookClientNotReady as e:
+						cleaned = await _release_failed_auto_hook(nc, handle)
+						if cleaned:
+							delay = _auto_hook_retries.defer(handle)
+							logger.debug(
+								f"Waiting to auto-hook vault-launched client {handle}: {e} "
+								f"Checking again in {delay:g} seconds."
+							)
+						else:
+							_auto_hook_retries.clear(handle)
+					except Exception as e:
+						cleaned = await _release_failed_auto_hook(nc, handle)
+						if not cleaned:
+							_auto_hook_retries.clear(handle)
+							continue
+						decision = _auto_hook_retries.record_failure(handle)
+						if decision.retry:
+							_log_native_failure(
+								f"Auto-hook attempt {decision.attempt} failed for vault-launched client "
+								f"{handle}; retrying in {decision.delay_seconds:g} seconds",
+								e,
+								warning=True,
+							)
+						else:
+							_log_native_failure(
+								f"Auto-hook retries exhausted for vault-launched client {handle}",
+								e,
+							)
+					finally:
+						_hooking_in_progress.discard(handle)
+						_send_hooked_clients_update()
 
 				if hooked_any:
 					_send_hooked_clients_update()
-					last_known_handle_count = len(get_all_wizard_handles())
+					last_known_handle_count = len(all_handles)
 					_restart_always_on_tasks()
 					_restart_active_toggle_tasks()
 				else:
@@ -1626,7 +1812,8 @@ async def main():
 
 					# Hook new clients individually
 					for nc in new_clients:
-						_hooking_in_progress.add(nc.window_handle)
+						identity = _client_identity(nc)
+						_hooking_in_progress.add(identity)
 						_send_hooked_clients_update()
 						try:
 							await nc.activate_hooks()
@@ -1635,7 +1822,7 @@ async def main():
 						except Exception as e:
 							logger.error(f"Failed to hook client '{nc.title}': {e}")
 						finally:
-							_hooking_in_progress.discard(nc.window_handle)
+							_hooking_in_progress.discard(identity)
 						await _init_client_attrs(nc)
 						logger.info(f"New client '{nc.title}' hooked.")
 					_send_hooked_clients_update()
@@ -1964,8 +2151,8 @@ async def main():
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
 							if foreground_client:
-								if not freecam_status:
-									await toggle_freecam_hotkey()
+								if not freecam_status and not await toggle_freecam_hotkey():
+									continue
 								camera: DynamicCameraController = await foreground_client.game_client.selected_camera_controller()
 								camera_pos: XYZ = await camera.position()
 								camera_pitch, camera_roll, camera_yaw = await camera.orientation()
@@ -2095,7 +2282,7 @@ async def main():
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if flythrough_task is not None and not flythrough_task.cancelled():
+							if task_is_active(flythrough_task):
 								flythrough_task.cancel()
 								flythrough_task = None
 								await asyncio.sleep(0)
@@ -2171,7 +2358,7 @@ async def main():
 										for command_str in new_commands:
 											await parse_command(walker.clients, command_str)
 										await asyncio.sleep(1)
-							if bot_task is not None and not bot_task.cancelled():
+							if task_is_active(bot_task):
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
@@ -2182,7 +2369,7 @@ async def main():
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if bot_task is not None and not bot_task.cancelled():
+							if task_is_active(bot_task):
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
@@ -2223,7 +2410,10 @@ async def main():
 						case deimosgui.GUICommandType.LaunchInstance:
 							nicknames, game_path = com.data
 							if not game_path:
-								game_path = str(utils.get_wiz_install())
+								if agent_manager is not None:
+									game_path = r"C:\ProgramData\KingsIsle Entertainment\Wizard101"
+								else:
+									game_path = str(utils.get_wiz_install())
 							else:
 								utils.override_wiz_install_location(game_path)
 							# Filter out accounts already managed (hooked) by launch map or player_gid
@@ -2241,11 +2431,13 @@ async def main():
 								logger.info(f"Launching {len(nicknames)} instance(s)...")
 							# Clear any released handles so newly launched clients get auto-hooked
 							released_handles.clear()
+							_auto_hook_retries.clear_all()
 							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ClearLaunchCheckboxes))
 							try:
 								results = await asyncio.to_thread(wizlaunch.launch_instances, nicknames, game_path)
 								for nickname, handle in results.items():
 									launched_account_map[handle] = nickname
+									_auto_hook_retries.register(handle)
 									logger.info(f"Launched and logged in '{nickname}'.")
 							except Exception as e:
 								logger.error(f"Error launching instances: {e}")
@@ -2256,9 +2448,9 @@ async def main():
 
 						case deimosgui.GUICommandType.ReorderClients:
 							handles = com.data
-							client_map = {c.window_handle: c for c in walker.clients}
+							client_map = {_client_identity(c): c for c in walker.clients}
 							new_order = [client_map[h] for h in handles if h in client_map]
-							remaining = [c for c in walker.clients if c.window_handle not in set(handles)]
+							remaining = [c for c in walker.clients if _client_identity(c) not in set(handles)]
 							walker.clients[:] = new_order + remaining
 							for i, c in enumerate(walker.clients):
 								c.title = f'p{i + 1}'
@@ -2267,15 +2459,13 @@ async def main():
 						case deimosgui.GUICommandType.UnhookClient:
 							handle = com.data
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									released_handles.add(handle)
 									logger.info(f"Unhooked client (handle {handle}).")
 									break
@@ -2286,33 +2476,43 @@ async def main():
 
 						case deimosgui.GUICommandType.HookClient:
 							handle = com.data
+							all_handles = await _get_all_wizard_handles("manual client hook")
+							if all_handles is None:
+								continue
+							_failed_hook_handles.intersection_update(all_handles)
+							if handle in _failed_hook_handles:
+								logger.error(
+									f"Hooking is disabled for client {handle} after a failed memory mutation. "
+									"Restart that Wizard101 client before trying again."
+								)
+								_send_hooked_clients_update()
+								continue
 							# Remove from released set so it can be managed
 							released_handles.discard(handle)
+							_auto_hook_retries.clear(handle)
 							# Check handle is still valid and not already managed
-							if handle in walker._managed_handles:
+							if handle in walker.managed_identities:
 								logger.debug(f"Handle {handle} already managed, skipping.")
 								_send_hooked_clients_update()
 								continue
-							all_handles = get_all_wizard_handles()
 							if handle not in all_handles:
 								logger.error(f"Handle {handle} no longer exists.")
 								_send_hooked_clients_update()
 								continue
 							# Create client, assign title, hook, init
-							walker._managed_handles.append(handle)
-							nc = walker.client_cls(handle)
-							walker.clients.append(nc)
-							existing_nums = set()
-							for c in walker.clients:
-								if c.title.startswith('p') and c.title[1:].isdigit():
-									existing_nums.add(int(c.title[1:]))
-							num = 1
-							while num in existing_nums:
-								num += 1
-							nc.title = f'p{num}'
-							_hooking_in_progress.add(handle)
-							_send_hooked_clients_update()
+							nc = None
 							try:
+								nc = walker.manage_client(handle)
+								existing_nums = set()
+								for c in walker.clients:
+									if c.title.startswith('p') and c.title[1:].isdigit():
+										existing_nums.add(int(c.title[1:]))
+								num = 1
+								while num in existing_nums:
+									num += 1
+								nc.title = f'p{num}'
+								_hooking_in_progress.add(handle)
+								_send_hooked_clients_update()
 								await nc.activate_hooks()
 								await _init_client_attrs(nc)
 								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}).")
@@ -2320,9 +2520,18 @@ async def main():
 								await _init_client_attrs(nc)
 								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}, already hooked).")
 							except Exception as e:
-								logger.error(f"Failed to hook client (handle {handle}): {e}")
-								walker._managed_handles.remove(handle)
-								walker.clients.remove(nc)
+								_failed_hook_handles.add(handle)
+								_log_native_failure(f"Failed to hook client (handle {handle})", e)
+								if nc is not None:
+									try:
+										await nc.close()
+									except Exception as cleanup_error:
+										_log_native_failure(
+											f"Failed to clean up client after hook failure (handle {handle})",
+											cleanup_error,
+										)
+									finally:
+										walker.release_client(nc)
 								_hooking_in_progress.discard(handle)
 								_send_hooked_clients_update()
 								continue
@@ -2335,15 +2544,13 @@ async def main():
 							handle = com.data
 							# If handle belongs to a hooked client, unhook first
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									launched_account_map.pop(handle, None)
 									break
 							# Terminate the OS process
@@ -2359,15 +2566,13 @@ async def main():
 							handle, nickname = com.data
 							# Unhook the hooked client
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									launched_account_map.pop(handle, None)
 									break
 							# Kill the process
@@ -2419,6 +2624,11 @@ async def main():
 
 			except queue.Empty:
 				pass
+			except deimosgui.ToolClosedException:
+				raise
+			except Exception as error:
+				command_name = getattr(getattr(com, "com_type", None), "name", "unknown")
+				_log_native_failure(f"GUI action {command_name} failed", error)
 
 			if walker.clients:
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', bool_to_string(auto_pet_status))))
@@ -2676,7 +2886,7 @@ async def main():
 
 	await asyncio.sleep(0)
 	global walker
-	walker = ClientHandler()
+	walker = ClientHandler(agent_manager=agent_manager)
 	# walker.clients = []
 	global gui_task
 	gui_task = asyncio.create_task(handle_gui())
@@ -2684,13 +2894,11 @@ async def main():
 	# logger.debug("1")
 
 	async def ban_watcher():
-		known_ban = False
-		try:
-			rkey = winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Slackaduts\Deimos", access=winreg.KEY_READ)
-			a = winreg.QueryValueEx(rkey, "badboy")[0]
-			known_ban = a != 0
-		except:
-			pass
+		registry_path = r"SOFTWARE\Slackaduts\Deimos"
+		known_ban = host_platform.read_registry_dword(
+			registry_path,
+			"badboy",
+		) != 0
 
 		if not known_ban:
 			ban_task = threading.Thread(target=ban_thread)
@@ -2699,23 +2907,26 @@ async def main():
 			while ban_task.is_alive():
 				await asyncio.sleep(1)
 		try:
-			rkey = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Slackaduts\Deimos", access=winreg.KEY_ALL_ACCESS)
-			winreg.SetValueEx(rkey, "badboy", 0, winreg.REG_DWORD, 1)
-		except:
+			host_platform.write_registry_dword(registry_path, "badboy", 1)
+		except Exception:
 			pass
-		cMessageBox(None, "Deimos has encountered a fatal error (Code 0C24). Please contact slackaduts on discord for more info.", "Deimos error", 0x10 | 0x1000)
+		host_platform.show_error_message(
+			"Deimos has encountered a fatal error (Code 0C24). Please contact slackaduts on discord for more info.",
+			"Deimos error",
+		)
 		sys.exit(0)
 
 
-	async def hooking_logic():
-		await asyncio.sleep(0.1)
-		if not get_all_wizard_handles():
-			logger.debug('Waiting for a Wizard101 client to be opened...')
-			while not get_all_wizard_handles():
-				await asyncio.sleep(1)
-		override_wiz_install_using_handle()
+	await asyncio.sleep(0.1)
+	startup_handles = await _get_all_wizard_handles("initial client discovery")
+	if startup_handles:
+		if agent_manager is None:
+			override_wiz_install_using_handle()
 		logger.debug('Wizard101 client(s) detected. Hook clients from the Launcher tab.')
-	await hooking_logic()
+	elif startup_handles is None:
+		logger.warning('The helper agent is unavailable. Deimos will keep trying in the background.')
+	else:
+		logger.debug('No Wizard101 clients detected. Use the Launcher tab to start one.')
 	logger.debug('Ready. Hook clients from the Launcher tab.')
 	global client_speeds
 	client_speeds = {}
@@ -2761,7 +2972,7 @@ async def main():
 		"""Cancel and recreate snapshot-based always-on tasks so they pick up new clients."""
 		for name in SNAPSHOT_TASK_NAMES:
 			old = all_tasks.get(name)
-			if old is not None and not old.cancelled():
+			if task_is_active(old):
 				old.cancel()
 			all_tasks[name] = asyncio.create_task(SNAPSHOT_TASK_FUNCS[name]())
 
@@ -2769,33 +2980,33 @@ async def main():
 		"""Cancel and recreate any currently-active toggle tasks so they pick up new clients."""
 		global combat_task, dialogue_task, sigil_task, questing_task, speed_task, auto_pet_task
 
-		if combat_task is not None and not combat_task.cancelled():
+		if task_is_active(combat_task):
 			combat_task.cancel()
 			for c in walker.clients:
 				c.combat_status = True
 			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
 
-		if dialogue_task is not None and not dialogue_task.cancelled():
+		if task_is_active(dialogue_task):
 			dialogue_task.cancel()
 			dialogue_task = asyncio.create_task(try_task_coro(dialogue_loop, walker.clients, True))
 
-		if sigil_task is not None and not sigil_task.cancelled():
+		if task_is_active(sigil_task):
 			sigil_task.cancel()
 			for c in walker.clients:
 				c.sigil_status = True
 			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
 
-		if questing_task is not None and not questing_task.cancelled():
+		if task_is_active(questing_task):
 			questing_task.cancel()
 			for c in walker.clients:
 				c.questing_status = True
 			questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
 
-		if speed_task is not None and not speed_task.cancelled():
+		if task_is_active(speed_task):
 			speed_task.cancel()
 			speed_task = asyncio.create_task(try_task_coro(speed_switching, walker.clients))
 
-		if auto_pet_task is not None and not auto_pet_task.cancelled():
+		if task_is_active(auto_pet_task):
 			auto_pet_task.cancel()
 			for c in walker.clients:
 				c.feeding_pet_status = True
@@ -2831,9 +3042,17 @@ async def main():
 					logger.info("Tool close triggered by user.")
 					should_exit = True
 				elif t == all_tasks.get('gui'):
-					# GUI task errors are always fatal
-					logger.opt(exception=exc).error("GUI task crashed")
-					should_exit = True
+					if is_recoverable_agent_error(exc):
+						await _recover_agent_runtime("GUI task", exc)
+						await asyncio.sleep(1.0)
+						gui_task = asyncio.create_task(handle_gui())
+						all_tasks['gui'] = gui_task
+						logger.warning(
+							"The GUI backend survived a helper-agent interruption and resumed polling."
+						)
+					else:
+						logger.opt(exception=exc).error("GUI task crashed")
+						should_exit = True
 				else:
 					# Client-dependent task died (memory error, dead process, etc.)
 					# Non-fatal — the client is likely closed

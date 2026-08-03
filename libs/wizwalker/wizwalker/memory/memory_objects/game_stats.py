@@ -802,7 +802,13 @@ class GameStats(PropertyClass):
         await self.write_value_to_offset(1108, photo_filters, Primitive.uint32)
 
 class CurrentGameStats(GameStats):
+    def __init__(self, hook_handler, base_address_resolver=None):
+        super().__init__(hook_handler)
+        self._base_address_resolver = base_address_resolver
+
     async def read_base_address(self) -> int:
+        if self._base_address_resolver is not None:
+            return await self._base_address_resolver()
         return await self.hook_handler.read_current_player_stat_base()
 
 

@@ -15,7 +15,12 @@ for import_root in (REPOSITORY_ROOT, WIZWALKER_ROOT):
 
 sys.modules.setdefault(
     "loguru",
-    SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None)),
+    SimpleNamespace(
+        logger=SimpleNamespace(
+            debug=lambda *args, **kwargs: None,
+            disable=lambda *args, **kwargs: None,
+        )
+    ),
 )
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
@@ -230,6 +235,10 @@ class BlockingHookManager:
         self.activation_started = threading.Event()
         self.release_activation = threading.Event()
         self.closed_sessions = []
+        self.core_bases = {
+            "client": 0x1000,
+            "player_stat": 0x2000,
+        }
 
     def open_hook_process(self, pid, expected_identity_json=None):
         return {"session_id": f"hook-{pid}"}
@@ -242,6 +251,19 @@ class BlockingHookManager:
 
     def heartbeat_core_hooks(self, session_id):
         return {"hooks": sorted(CORE_HOOKS)}
+
+    def deactivate_core_hooks(self, session_id):
+        return {"hooks": []}
+
+    def read_core_hook_base(self, session_id, hook):
+        return self.core_bases.get(hook, 0)
+
+    def read_memory(self, session_id, address, size):
+        values = {
+            (0x1000 + 192, 2): (4).to_bytes(2, "little", signed=True),
+            (0x2000 + 324, 4): (170).to_bytes(4, "little", signed=True),
+        }
+        return values[(int(address, 16), size)]
 
     def close_process(self, session_id):
         self.closed_sessions.append(session_id)
@@ -280,3 +302,64 @@ class DiscoveredClientHookRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(client.hook_handler)
         self.assertIsNone(client._hook_session_id)
         self.assertEqual(manager.closed_sessions, ["hook-448"])
+
+    async def test_hook_session_binds_and_invalidates_legacy_memory_objects(self):
+        manager = BlockingHookManager()
+        client = DiscoveredClient(manager, descriptor("client-a", 448))
+
+        handler, created = await client._ensure_hook_handler()
+
+        self.assertTrue(created)
+        for attribute in client._HOOK_MEMORY_OBJECT_ATTRIBUTES:
+            memory_object = getattr(client, attribute)
+            self.assertIs(memory_object.hook_handler, handler)
+
+        changed = descriptor("client-a", 448)
+        changed["process"]["identity"]["creation_time_100ns"] = "9999"
+        client._update(changed)
+        await asyncio.sleep(0)
+
+        self.assertIsNone(client.hook_handler)
+        self.assertIsNone(client._hook_session_id)
+        for attribute in client._HOOK_MEMORY_OBJECT_ATTRIBUTES:
+            self.assertFalse(hasattr(client, attribute))
+        self.assertEqual(manager.closed_sessions, ["hook-448"])
+
+    async def test_bound_memory_objects_support_deimos_post_hook_initialization(self):
+        manager = BlockingHookManager()
+        manager.release_activation.set()
+        client = DiscoveredClient(manager, descriptor("client-a", 448))
+
+        await client.activate_hooks(wait_for_ready=False)
+
+        async def client_address():
+            return 0x1000
+
+        async def stats_address():
+            return 0x2000
+
+        client.client_object._base_address_resolver = client_address
+        client.stats._base_address_resolver = stats_address
+
+        self.assertEqual(await client.client_object.speed_multiplier(), 4)
+        self.assertEqual(await client.stats.reference_level(), 170)
+        await client.close()
+        self.assertEqual(manager.closed_sessions, ["hook-448"])
+
+    def test_native_client_exposes_hook_backed_legacy_operations(self):
+        client = DiscoveredClient(
+            BlockingHookManager(),
+            descriptor("client-a", 448),
+        )
+
+        for method_name in (
+            "zone_name",
+            "in_battle",
+            "is_loading",
+            "get_base_entity_list",
+            "teleport",
+        ):
+            self.assertTrue(callable(getattr(client, method_name)))
+
+        with self.assertRaises(AttributeError):
+            getattr(client, "login")

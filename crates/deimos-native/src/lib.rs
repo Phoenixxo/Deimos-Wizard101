@@ -173,6 +173,7 @@ mod tests {
                 "list_modules",
                 "memory_regions",
                 "read_memory",
+                "write_memory",
                 "read_memory_batch",
                 "read_typed",
                 "scan_memory",

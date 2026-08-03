@@ -126,6 +126,9 @@ class FakeAgentManager:
         self.short_reads = set()
         self.read_sizes = []
         self.read_thread = None
+        self.write_error = None
+        self.writes = []
+        self.write_thread = None
         self.memory_segments = [
             (0x140001000, self.read_result),
         ]
@@ -181,6 +184,12 @@ class FakeAgentManager:
             f"unmapped fake read at {address}",
             code="memory_read_failed",
         )
+
+    def write_memory(self, session_id, address, value):
+        self.write_thread = threading.get_ident()
+        if self.write_error is not None:
+            raise self.write_error
+        self.writes.append((session_id, address, bytes(value)))
 
     def list_modules(self, session_id):
         return {"session_id": session_id, "modules": self.modules}
@@ -760,10 +769,35 @@ class DeimosNativeBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception.__cause__, read_error)
         self.assertNotEqual(self.manager.status_thread, event_loop_thread)
 
-    async def test_rust_mutations_fail_without_calling_the_manager(self):
+    async def test_native_value_writes_use_the_mutation_session_off_loop(self):
+        event_loop_thread = threading.get_ident()
+
+        await self.reader.write_bytes(0x140001000, b"\x00\x00\x80\x3f")
+        await self.reader.write_typed(0x140001004, 2.5, Primitive.float32)
+
+        self.assertEqual(
+            self.manager.writes,
+            [
+                ("session-1", "0x140001000", b"\x00\x00\x80\x3f"),
+                ("session-1", "0x140001004", Primitive.float32.value.pack(2.5)),
+            ],
+        )
+        self.assertNotEqual(self.manager.write_thread, event_loop_thread)
+
+    async def test_native_write_errors_keep_wizwalker_mapping_and_cause(self):
+        write_error = FakeNativeMemoryError(
+            "write failed",
+            code="memory_write_failed",
+        )
+        self.manager.write_error = write_error
+
+        with self.assertRaises(MemoryWriteError) as raised:
+            await self.reader.write_bytes(0x140001000, b"x")
+
+        self.assertIs(raised.exception.__cause__, write_error)
+
+    async def test_native_process_management_mutations_remain_unsupported(self):
         operations = (
-            self.reader.write_bytes(0x1000, b"x"),
-            self.reader.write_typed(0x1000, 1, Primitive.uint32),
             self.reader.allocate(16),
             self.reader.free(0x1000),
             self.reader.start_thread(0x1000),
@@ -833,6 +867,7 @@ class ImportIsolationTests(unittest.TestCase):
             "memory_regions",
             "process_status",
             "read_memory",
+            "write_memory",
         ):
             self.assertTrue(
                 hasattr(native.AgentManager, method_name),

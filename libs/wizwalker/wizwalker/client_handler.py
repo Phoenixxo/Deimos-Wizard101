@@ -45,6 +45,70 @@ class ClientHandler:
     def _uses_native_discovery(self) -> bool:
         return self.agent_manager is not None
 
+    def client_identity(self, client: Any) -> int | str:
+        """Return the public identity used to manage one client."""
+        if self._uses_native_discovery:
+            client_id = getattr(client, "client_id", None)
+            if not isinstance(client_id, str) or not client_id:
+                raise ValueError("The native client does not have a valid client ID.")
+            return client_id
+        window_handle = getattr(client, "window_handle", None)
+        if not isinstance(window_handle, int) or isinstance(window_handle, bool):
+            raise ValueError("The Windows client does not have a valid window handle.")
+        return window_handle
+
+    @property
+    def managed_identities(self) -> tuple[int | str, ...]:
+        identities = (
+            self._managed_client_ids
+            if self._uses_native_discovery
+            else self._managed_handles
+        )
+        return tuple(identities)
+
+    def manage_client(self, identity: int | str):
+        """Create and retain one client selected by its public identity."""
+        if identity in self.managed_identities:
+            for client in self.clients:
+                if self.client_identity(client) == identity:
+                    return client
+            raise ValueError("The selected client is already being managed.")
+
+        if self._uses_native_discovery:
+            descriptor = next(
+                (
+                    candidate
+                    for candidate in self._list_native_descriptors()
+                    if candidate.get("client_id") == identity
+                ),
+                None,
+            )
+            if descriptor is None:
+                raise ValueError("The selected Wizard101 client is no longer available.")
+            client = self.client_cls(self.agent_manager, descriptor)
+            self._managed_client_ids.append(identity)
+        else:
+            if not isinstance(identity, int) or isinstance(identity, bool):
+                raise ValueError("The selected Windows client handle is invalid.")
+            client = self.client_cls(identity)
+            self._managed_handles.append(identity)
+
+        self.clients.append(client)
+        return client
+
+    def release_client(self, client: Any) -> None:
+        """Stop managing a client without closing it implicitly."""
+        identity = self.client_identity(client)
+        managed = (
+            self._managed_client_ids
+            if self._uses_native_discovery
+            else self._managed_handles
+        )
+        if identity in managed:
+            managed.remove(identity)
+        if client in self.clients:
+            self.clients.remove(client)
+
     @staticmethod
     def _legacy_utils():
         if utils is None:
@@ -157,10 +221,7 @@ class ClientHandler:
         new_clients = []
         for handle in all_handles:
             if handle not in self._managed_handles:
-                self._managed_handles.append(handle)
-                new_client = self.client_cls(handle)
-                self.clients.append(new_client)
-                new_clients.append(new_client)
+                new_clients.append(self.manage_client(handle))
         return new_clients
 
     def remove_dead_clients(self) -> List[Any]:
@@ -175,6 +236,14 @@ class ClientHandler:
                 dead_clients.append(client)
                 self.clients.remove(client)
                 self._retired_clients.append(client)
+                identity = self.client_identity(client)
+                managed = (
+                    self._managed_client_ids
+                    if self._uses_native_discovery
+                    else self._managed_handles
+                )
+                if identity in managed:
+                    managed.remove(identity)
         return dead_clients
 
     def get_ordered_clients(self) -> List[Any]:
