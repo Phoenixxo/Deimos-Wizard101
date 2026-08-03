@@ -338,11 +338,11 @@ class RenderContextHook(SimpleHook):
 
 
 class MovementTeleportHook(SimpleHook):
-    pattern = rb"\x40\x57\x48\x83\xEC\x30\x48\xC7\x44\x24\x20\xFE" \
-              rb"\xFF\xFF\xFF\x48\x89\x5C\x24\x40\x48\x8B\x99\xB8" \
-              rb"\x01\x00\x00\x48\x85\xDB\x74\x13\x4C\x8B\x43\x70" \
-              rb"\x48\x8B\x5B\x78\x48\x85\xDB\x74\x0C\xF0\xFF\x43" \
-              rb"\x08\xEB\x06\x45\x33\xC0\x41\x8B\xD8\x4D\x85\xC0\x74\x19"
+    pattern = (
+        rb"\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20\x48\x8B\x99\xB8"
+        rb"\x01\x00\x00\x48\x85\xDB\x74\x2F\x4C\x8B\x43\x70\x48\x8B"
+        rb"\x5B\x78\x48\x85"
+    )
 
     instruction_length = 6
     noops = 1
@@ -389,21 +389,16 @@ class MovementTeleportHook(SimpleHook):
 
         target_address = jes[0]
 
-        inside_event_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x55\x90",
-            module="WizardGraphicalClient.exe",
-        )
-        
         event_dispatch_je_addr = await self.pattern_scan(
-            rb"\x74.\xF3\x0F\x10\x44\x24\x58\xF3\x0F",
+            rb"\x74\x24\xF3\x0F\x10\x44\x24\x58\xF3\x0F"
+            rb"\x11\x44\x24\x78\x48\x8B\x06",
             module="WizardGraphicalClient.exe",
         )
 
-        old_inside_event_je_bytes = await self.read_bytes(inside_event_je_addr, 2)
         old_event_dispatch_je_addr = await self.read_bytes(event_dispatch_je_addr, 2)
 
-        self._collision_je_addrs = (inside_event_je_addr, event_dispatch_je_addr)
-        self._old_collision_jes_bytes = (old_inside_event_je_bytes, old_event_dispatch_je_addr)
+        self._collision_je_addrs = (event_dispatch_je_addr,)
+        self._old_collision_jes_bytes = (old_event_dispatch_je_addr,)
 
         for addr in self._collision_je_addrs:
             await self.write_bytes(addr, b"\x90\x90")
@@ -459,8 +454,8 @@ class MovementTeleportHook(SimpleHook):
             b"\x48\xB8" + jes_cmp_bytes +
             b"\x48\xA3" + packed_jes_cmp +
             b"\x58" # pop rax
-            b"\x40\x57" # push rdi (original bytes)
-            b"\x48\x83\xEC\x30" # sub rsp,20 (original bytes)
+            b"\x48\x89\x5C\x24\x08"  # mov [rsp+08], rbx (original bytes)
+            b"\x57"  # push rdi (original bytes)
         )
         # fmt: on
 
