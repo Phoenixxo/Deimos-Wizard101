@@ -15,7 +15,12 @@ for import_root in (REPOSITORY_ROOT, WIZWALKER_ROOT):
 
 sys.modules.setdefault(
     "loguru",
-    SimpleNamespace(logger=SimpleNamespace(debug=lambda *args, **kwargs: None)),
+    SimpleNamespace(
+        logger=SimpleNamespace(
+            debug=lambda *args, **kwargs: None,
+            disable=lambda *args, **kwargs: None,
+        )
+    ),
 )
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
