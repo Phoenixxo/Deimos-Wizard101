@@ -1,8 +1,6 @@
-import ctypes
-import ctypes.wintypes
 import math
 
-from wizwalker.constants import user32
+from wizwalker.platform_adapter import client_size
 
 
 async def get_camera_state(client):
@@ -29,9 +27,7 @@ async def get_camera_state(client):
 	sin_p = math.sin(pitch)
 	cos_p = math.cos(pitch)
 
-	# Client area size in pixels
-	client_rect = ctypes.wintypes.RECT()
-	user32.GetClientRect(client.window_handle, ctypes.byref(client_rect))
+	client_width, client_height = client_size(client)
 
 	return {
 		'cam_x': cam_pos.x, 'cam_y': cam_pos.y, 'cam_z': cam_pos.z,
@@ -50,8 +46,8 @@ async def get_camera_state(client):
 		'sp_top': await view.screenport_top(),
 		'sp_bottom': await view.screenport_bottom(),
 		# Client size
-		'client_w': client_rect.right,
-		'client_h': client_rect.bottom,
+		'client_w': client_width,
+		'client_h': client_height,
 	}
 
 

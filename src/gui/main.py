@@ -5,7 +5,6 @@ import sys
 import time
 
 from loguru import logger
-import ctypes
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -33,6 +32,7 @@ from src.gui.tab_camera import build_camera_tab
 from src.gui.tab_dev_utils import build_dev_utils_tab
 from src.gui.tab_stats import build_stats_tab
 from src.gui.tab_actions import build_flythrough_tab, build_bot_tab, build_combat_tab
+from src.platform_adapter import host_platform
 
 
 class GUIContext:
@@ -43,9 +43,8 @@ class GUIContext:
 def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None):
     tl = load_lang(langcode)
 
-    # Set AppUserModelID so Windows uses our icon in taskbar/process list
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"deimos.{tool_name}")
+        host_platform.set_app_user_model_id(f"deimos.{tool_name}")
     except Exception:
         pass
 
@@ -76,16 +75,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     window.setWindowFlags(_window_flags)
     window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
-    # Enable Windows 11 rounded corners on frameless window
     try:
-        import ctypes, ctypes.wintypes
-        _hwnd = ctypes.wintypes.HWND(int(window.winId()))
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = ctypes.c_int(2)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            _hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-            ctypes.byref(DWMWCP_ROUND), ctypes.sizeof(DWMWCP_ROUND)
-        )
+        host_platform.enable_rounded_corners(int(window.winId()))
     except Exception:
         pass
     window.setStyleSheet(styles['groupbox_style'])
@@ -175,18 +166,12 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
         else:
             pin_btn.setIcon(_pin_icon if _is_pinned[0] else _unpin_icon)
         pin_btn.setToolTip(tl('always_on_top') if _is_pinned[0] else tl('not_on_top'))
-        import ctypes.wintypes
-        _SetWindowPos = ctypes.windll.user32.SetWindowPos
-        _SetWindowPos.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-        _SetWindowPos.restype = ctypes.wintypes.BOOL
-        hwnd = ctypes.wintypes.HWND(int(window.winId()))
-        HWND_TOPMOST = ctypes.wintypes.HWND(-1)
-        HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
-        insert_after = HWND_TOPMOST if _is_pinned[0] else HWND_NOTOPMOST
-        _SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        if not host_platform.set_topmost(int(window.winId()), _is_pinned[0]):
+            window.setWindowFlag(
+                Qt.WindowType.WindowStaysOnTopHint,
+                _is_pinned[0],
+            )
+            window.show()
 
     pin_btn.clicked.connect(_toggle_pin)
     titlebar_layout.addWidget(pin_btn)

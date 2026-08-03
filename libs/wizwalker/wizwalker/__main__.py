@@ -8,14 +8,6 @@ from click_default_group import DefaultGroup
 from loguru import logger
 
 from wizwalker import Wad, WizWalker, utils
-from wizwalker.cli import start_console
-
-
-logger.enable("wizwalker")
-logger.remove(0)
-
-logfile = utils.get_logs_folder() / "debug.log"
-logger.add(logfile, level="DEBUG", rotation="1 week", enqueue=True)
 
 
 @click.group(cls=DefaultGroup, default="cli", default_if_no_args=True)
@@ -23,6 +15,10 @@ def main():
     """
     Wizwalker cli
     """
+    logger.enable("wizwalker")
+    logger.remove(0)
+    logfile = utils.get_logs_folder() / "debug.log"
+    logger.add(logfile, level="DEBUG", rotation="1 week", enqueue=True)
     pass
     # app = WizWalker()
     #
@@ -39,6 +35,8 @@ def cli():
     """
     if sys.platform != "win32":
         raise RuntimeError(f"This program is windows only, not {sys.platform}")
+
+    from wizwalker.cli import start_console
 
     walker = WizWalker()
     start_console(locals={"walker": walker})
