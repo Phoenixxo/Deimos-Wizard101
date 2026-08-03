@@ -5,7 +5,6 @@ import queue
 import threading
 import wizwalker
 from wizwalker import Keycode, HotkeyListener, ModifierKeys, utils, XYZ, Orient
-from wizwalker.utils import get_all_wizard_handles, get_foreground_window
 from wizwalker.client_handler import ClientHandler, Client
 from wizwalker.extensions.scripting import teleport_to_friend_from_list
 from wizwalker.memory.memory_objects.camera_controller import DynamicCameraController, ElasticCameraController
@@ -13,8 +12,6 @@ from wizwalker.memory.memory_objects.window import Window
 import os
 import time
 import sys
-import ctypes
-import winreg
 import subprocess
 from loguru import logger
 import datetime
@@ -40,7 +37,7 @@ from src import discsdk
 from wizwalker.extensions.wizsprinter.wiz_navigator import toZoneDisplayName, toZone
 from wizwalker.extensions.wizsprinter.sprinty_combat import SprintyCombat
 from src.config_combat import StrCombatConfigProvider, delegate_combat_configs, default_config
-from typing import List
+from typing import Any, List
 
 from src import gui as deimosgui
 from src.gui import GUIKeys
@@ -48,9 +45,11 @@ import wizlaunch
 from src.settings_manager import DeimosSettings
 from src.tokenizer import tokenize
 from src.deimoslang import vm
+from src.platform_adapter import host_platform
 
 
-cMessageBox = ctypes.windll.user32.MessageBoxW
+def get_all_wizard_handles():
+	return wizlaunch.get_wizard_handles()
 
 tool_version: str = '3.13.1'
 tool_name: str = 'Deimos'
@@ -410,7 +409,9 @@ async def tool_finish():
 
 
 @logger.catch()
-async def main():
+async def main(agent_manager: Any = None):
+	if agent_manager is not None:
+		wizlaunch.configure_runtime(agent_manager)
 	global tool_status
 	global original_client_locations
 	global listener
@@ -1142,12 +1143,17 @@ async def main():
 
 
 	# Track which window handles were launched by us, mapped to account nickname
-	launched_account_map: dict[int, str] = {}
+	launched_account_map: dict[int | str, str] = {}
 	initial_setup_complete = False
 	# Handles explicitly released via UnhookClient — skip in continuous detection
-	released_handles: set[int] = set()
+	released_handles: set[int | str] = set()
 	# Handles currently mid-hook (activate_hooks in progress)
-	_hooking_in_progress: set[int] = set()
+	_hooking_in_progress: set[int | str] = set()
+	# Failed automatic hooks require an explicit retry or a new process identity.
+	_failed_auto_hooks: set[int | str] = set()
+
+	def _client_identity(client):
+		return walker.client_identity(client)
 
 	def _mask_uid(uid) -> str:
 		s = str(uid)
@@ -1156,13 +1162,7 @@ async def main():
 	def _kill_process_by_handle(handle):
 		"""Terminate the OS process behind a window handle."""
 		try:
-			pid = utils.get_pid_from_handle(handle)
-			if pid:
-				PROCESS_TERMINATE = 0x0001
-				h_proc = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-				if h_proc:
-					ctypes.windll.kernel32.TerminateProcess(h_proc, 1)
-					ctypes.windll.kernel32.CloseHandle(h_proc)
+			wizlaunch.kill_instance(handle)
 		except Exception as e:
 			logger.error(f"Failed to kill process for handle {handle}: {e}")
 
@@ -1177,8 +1177,9 @@ async def main():
 		hooked = []
 		managed_accounts = set(launched_account_map.values())
 		for c in walker.clients:
-			nick = launched_account_map.get(c.window_handle)
-			hooked.append({'title': c.title, 'handle': c.window_handle, 'account_nick': nick})
+			identity = _client_identity(c)
+			nick = launched_account_map.get(identity)
+			hooked.append({'title': c.title, 'handle': identity, 'account_nick': nick})
 			# Also detect accounts via player_gid for manually-hooked clients
 			if not nick:
 				gid = getattr(c, 'player_gid', None)
@@ -1187,7 +1188,7 @@ async def main():
 					if vault_nick:
 						managed_accounts.add(vault_nick)
 		# Unmanaged = running wizard handles not currently managed
-		managed = set(walker._managed_handles)
+		managed = set(walker.managed_identities)
 		unmanaged = sorted(all_handles - managed)
 		return {'hooked': hooked, 'unmanaged': unmanaged, 'managed_accounts': sorted(managed_accounts), 'hooking': sorted(_hooking_in_progress)}
 
@@ -1234,9 +1235,10 @@ async def main():
 			if uid and uid != 0:
 				client.player_gid = uid
 				vault_nick = wizlaunch.get_nickname_by_gid(uid)
-				if vault_nick and client.window_handle not in launched_account_map:
-					launched_account_map[client.window_handle] = vault_nick
-				nick = launched_account_map.get(client.window_handle)
+				identity = _client_identity(client)
+				if vault_nick and identity not in launched_account_map:
+					launched_account_map[identity] = vault_nick
+				nick = launched_account_map.get(identity)
 				if nick:
 					wizlaunch.update_player_gid(nick, uid)
 					logger.debug(f"[GID] Saved user_id {_mask_uid(uid)} for vault account '{nick}'")
@@ -1469,12 +1471,11 @@ async def main():
 					count_before = len(walker.clients)
 					dead = walker.remove_dead_clients()
 					if dead:
-						# Clean up managed handles so get_new_clients() can detect relaunched clients
+						# Clean up identities so get_new_clients() can detect relaunched clients
 						for c in dead:
-							if c.window_handle in walker._managed_handles:
-								walker._managed_handles.remove(c.window_handle)
-							launched_account_map.pop(c.window_handle, None)
-							_hooking_in_progress.discard(c.window_handle)
+							identity = _client_identity(c)
+							launched_account_map.pop(identity, None)
+							_hooking_in_progress.discard(identity)
 							logger.info(f"Client '{c.title}' disconnected.")
 						_send_hooked_clients_update()
 
@@ -1543,10 +1544,11 @@ async def main():
 								logger.debug(f"[GID] Retry resolved '{c.title}': user_id={_mask_uid(uid)}")
 								c.player_gid = uid
 								vault_nick = wizlaunch.get_nickname_by_gid(uid)
-								if vault_nick and c.window_handle not in launched_account_map:
-									launched_account_map[c.window_handle] = vault_nick
+								identity = _client_identity(c)
+								if vault_nick and identity not in launched_account_map:
+									launched_account_map[identity] = vault_nick
 									_send_hooked_clients_update()
-								nick = launched_account_map.get(c.window_handle)
+								nick = launched_account_map.get(identity)
 								if nick:
 									wizlaunch.update_player_gid(nick, uid)
 									logger.debug(f"[GID] Retry saved user_id {_mask_uid(uid)} for '{nick}'")
@@ -1559,16 +1561,17 @@ async def main():
 			# Continuous detection — only auto-hook vault-launched clients
 			if initial_setup_complete and not paused_task_names:
 				all_handles = set(get_all_wizard_handles())
-				managed = set(walker._managed_handles)
-				unmanaged = all_handles - managed - released_handles
+				_failed_auto_hooks.intersection_update(all_handles)
+				managed = set(walker.managed_identities)
+				unmanaged = all_handles - managed - released_handles - _failed_auto_hooks
 
 				# Auto-hook any unmanaged handle that was launched via the vault (in launch order)
 				hooked_any = False
 				launch_order = [h for h in launched_account_map if h in unmanaged]
 				for handle in launch_order:
-						walker._managed_handles.append(handle)
-						nc = walker.client_cls(handle)
-						walker.clients.append(nc)
+					nc = None
+					try:
+						nc = walker.manage_client(handle)
 						existing_nums = set()
 						for c in walker.clients:
 							if c.title.startswith('p') and c.title[1:].isdigit():
@@ -1579,21 +1582,21 @@ async def main():
 						nc.title = f'p{num}'
 						_hooking_in_progress.add(handle)
 						_send_hooked_clients_update()
-						try:
-							await nc.activate_hooks()
-							await _init_client_attrs(nc)
-							logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}).")
-							hooked_any = True
-						except wizwalker.errors.HookAlreadyActivated:
-							await _init_client_attrs(nc)
-							logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked).")
-							hooked_any = True
-						except Exception as e:
-							logger.error(f"Failed to auto-hook vault-launched client (handle {handle}): {e}")
-							walker._managed_handles.remove(handle)
-							walker.clients.remove(nc)
-						finally:
-							_hooking_in_progress.discard(handle)
+						await nc.activate_hooks()
+						await _init_client_attrs(nc)
+						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}).")
+						hooked_any = True
+					except wizwalker.errors.HookAlreadyActivated:
+						await _init_client_attrs(nc)
+						logger.info(f"Auto-hooked vault-launched client '{nc.title}' ({launched_account_map[handle]}, already hooked).")
+						hooked_any = True
+					except Exception as e:
+						logger.error(f"Failed to auto-hook vault-launched client (handle {handle}): {e}")
+						_failed_auto_hooks.add(handle)
+						if nc is not None:
+							walker.release_client(nc)
+					finally:
+						_hooking_in_progress.discard(handle)
 
 				if hooked_any:
 					_send_hooked_clients_update()
@@ -1626,7 +1629,8 @@ async def main():
 
 					# Hook new clients individually
 					for nc in new_clients:
-						_hooking_in_progress.add(nc.window_handle)
+						identity = _client_identity(nc)
+						_hooking_in_progress.add(identity)
 						_send_hooked_clients_update()
 						try:
 							await nc.activate_hooks()
@@ -1635,7 +1639,7 @@ async def main():
 						except Exception as e:
 							logger.error(f"Failed to hook client '{nc.title}': {e}")
 						finally:
-							_hooking_in_progress.discard(nc.window_handle)
+							_hooking_in_progress.discard(identity)
 						await _init_client_attrs(nc)
 						logger.info(f"New client '{nc.title}' hooked.")
 					_send_hooked_clients_update()
@@ -2223,7 +2227,10 @@ async def main():
 						case deimosgui.GUICommandType.LaunchInstance:
 							nicknames, game_path = com.data
 							if not game_path:
-								game_path = str(utils.get_wiz_install())
+								if agent_manager is not None:
+									game_path = r"C:\ProgramData\KingsIsle Entertainment\Wizard101"
+								else:
+									game_path = str(utils.get_wiz_install())
 							else:
 								utils.override_wiz_install_location(game_path)
 							# Filter out accounts already managed (hooked) by launch map or player_gid
@@ -2241,6 +2248,7 @@ async def main():
 								logger.info(f"Launching {len(nicknames)} instance(s)...")
 							# Clear any released handles so newly launched clients get auto-hooked
 							released_handles.clear()
+							_failed_auto_hooks.clear()
 							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ClearLaunchCheckboxes))
 							try:
 								results = await asyncio.to_thread(wizlaunch.launch_instances, nicknames, game_path)
@@ -2256,9 +2264,9 @@ async def main():
 
 						case deimosgui.GUICommandType.ReorderClients:
 							handles = com.data
-							client_map = {c.window_handle: c for c in walker.clients}
+							client_map = {_client_identity(c): c for c in walker.clients}
 							new_order = [client_map[h] for h in handles if h in client_map]
-							remaining = [c for c in walker.clients if c.window_handle not in set(handles)]
+							remaining = [c for c in walker.clients if _client_identity(c) not in set(handles)]
 							walker.clients[:] = new_order + remaining
 							for i, c in enumerate(walker.clients):
 								c.title = f'p{i + 1}'
@@ -2267,15 +2275,13 @@ async def main():
 						case deimosgui.GUICommandType.UnhookClient:
 							handle = com.data
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									released_handles.add(handle)
 									logger.info(f"Unhooked client (handle {handle}).")
 									break
@@ -2288,8 +2294,9 @@ async def main():
 							handle = com.data
 							# Remove from released set so it can be managed
 							released_handles.discard(handle)
+							_failed_auto_hooks.discard(handle)
 							# Check handle is still valid and not already managed
-							if handle in walker._managed_handles:
+							if handle in walker.managed_identities:
 								logger.debug(f"Handle {handle} already managed, skipping.")
 								_send_hooked_clients_update()
 								continue
@@ -2299,20 +2306,19 @@ async def main():
 								_send_hooked_clients_update()
 								continue
 							# Create client, assign title, hook, init
-							walker._managed_handles.append(handle)
-							nc = walker.client_cls(handle)
-							walker.clients.append(nc)
-							existing_nums = set()
-							for c in walker.clients:
-								if c.title.startswith('p') and c.title[1:].isdigit():
-									existing_nums.add(int(c.title[1:]))
-							num = 1
-							while num in existing_nums:
-								num += 1
-							nc.title = f'p{num}'
-							_hooking_in_progress.add(handle)
-							_send_hooked_clients_update()
+							nc = None
 							try:
+								nc = walker.manage_client(handle)
+								existing_nums = set()
+								for c in walker.clients:
+									if c.title.startswith('p') and c.title[1:].isdigit():
+										existing_nums.add(int(c.title[1:]))
+								num = 1
+								while num in existing_nums:
+									num += 1
+								nc.title = f'p{num}'
+								_hooking_in_progress.add(handle)
+								_send_hooked_clients_update()
 								await nc.activate_hooks()
 								await _init_client_attrs(nc)
 								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}).")
@@ -2321,8 +2327,8 @@ async def main():
 								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}, already hooked).")
 							except Exception as e:
 								logger.error(f"Failed to hook client (handle {handle}): {e}")
-								walker._managed_handles.remove(handle)
-								walker.clients.remove(nc)
+								if nc is not None:
+									walker.release_client(nc)
 								_hooking_in_progress.discard(handle)
 								_send_hooked_clients_update()
 								continue
@@ -2335,15 +2341,13 @@ async def main():
 							handle = com.data
 							# If handle belongs to a hooked client, unhook first
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									launched_account_map.pop(handle, None)
 									break
 							# Terminate the OS process
@@ -2359,15 +2363,13 @@ async def main():
 							handle, nickname = com.data
 							# Unhook the hooked client
 							for c in walker.clients[:]:
-								if c.window_handle == handle:
+								if _client_identity(c) == handle:
 									try:
 										c.title = 'Wizard101'
 										await c.close()
 									except Exception:
 										pass
-									if c.window_handle in walker._managed_handles:
-										walker._managed_handles.remove(c.window_handle)
-									walker.clients.remove(c)
+									walker.release_client(c)
 									launched_account_map.pop(handle, None)
 									break
 							# Kill the process
@@ -2676,7 +2678,7 @@ async def main():
 
 	await asyncio.sleep(0)
 	global walker
-	walker = ClientHandler()
+	walker = ClientHandler(agent_manager=agent_manager)
 	# walker.clients = []
 	global gui_task
 	gui_task = asyncio.create_task(handle_gui())
@@ -2684,13 +2686,11 @@ async def main():
 	# logger.debug("1")
 
 	async def ban_watcher():
-		known_ban = False
-		try:
-			rkey = winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Slackaduts\Deimos", access=winreg.KEY_READ)
-			a = winreg.QueryValueEx(rkey, "badboy")[0]
-			known_ban = a != 0
-		except:
-			pass
+		registry_path = r"SOFTWARE\Slackaduts\Deimos"
+		known_ban = host_platform.read_registry_dword(
+			registry_path,
+			"badboy",
+		) != 0
 
 		if not known_ban:
 			ban_task = threading.Thread(target=ban_thread)
@@ -2699,23 +2699,22 @@ async def main():
 			while ban_task.is_alive():
 				await asyncio.sleep(1)
 		try:
-			rkey = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"SOFTWARE\Slackaduts\Deimos", access=winreg.KEY_ALL_ACCESS)
-			winreg.SetValueEx(rkey, "badboy", 0, winreg.REG_DWORD, 1)
-		except:
+			host_platform.write_registry_dword(registry_path, "badboy", 1)
+		except Exception:
 			pass
-		cMessageBox(None, "Deimos has encountered a fatal error (Code 0C24). Please contact slackaduts on discord for more info.", "Deimos error", 0x10 | 0x1000)
+		host_platform.show_error_message(
+			"Deimos has encountered a fatal error (Code 0C24). Please contact slackaduts on discord for more info.",
+			"Deimos error",
+		)
 		sys.exit(0)
 
 
-	async def hooking_logic():
-		await asyncio.sleep(0.1)
-		if not get_all_wizard_handles():
-			logger.debug('Waiting for a Wizard101 client to be opened...')
-			while not get_all_wizard_handles():
-				await asyncio.sleep(1)
+	await asyncio.sleep(0.1)
+	if get_all_wizard_handles():
 		override_wiz_install_using_handle()
 		logger.debug('Wizard101 client(s) detected. Hook clients from the Launcher tab.')
-	await hooking_logic()
+	else:
+		logger.debug('No Wizard101 clients detected. Use the Launcher tab to start one.')
 	logger.debug('Ready. Hook clients from the Launcher tab.')
 	global client_speeds
 	client_speeds = {}
