@@ -1,17 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 repository_root = Path(SPECPATH).resolve()
-workspace_package_roots = [
-    repository_root / 'libs' / 'wizwalker',
-    repository_root / 'libs' / 'wizsprinter',
-]
-for package_root in reversed(workspace_package_roots):
+analysis_source_root = repository_root / 'build' / 'pyinstaller-source'
+merged_wizwalker = analysis_source_root / 'wizwalker'
+shutil.rmtree(analysis_source_root, ignore_errors=True)
+shutil.copytree(
+    repository_root / 'libs' / 'wizwalker' / 'wizwalker',
+    merged_wizwalker,
+    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+)
+shutil.copytree(
+    repository_root / 'libs' / 'wizsprinter' / 'wizwalker' / 'extensions' / 'wizsprinter',
+    merged_wizwalker / 'extensions' / 'wizsprinter',
+    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'),
+)
+workspace_package_roots = [analysis_source_root]
+for package_root in workspace_package_roots:
     sys.path.insert(0, str(package_root))
 sys.path.insert(0, str(repository_root))
 from scripts.package_artifacts import validate_package_inputs
