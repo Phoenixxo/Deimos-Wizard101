@@ -15,6 +15,7 @@ dist/
 .secrets
 *.lock
 !Cargo.lock
+!uv.lock
 !.gitignore
 
 # Rust build output

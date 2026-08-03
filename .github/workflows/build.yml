@@ -1,5 +1,8 @@
 name: Release Deimos
 
+env:
+  DEIMOS_BUILD_ID: git-${{ github.sha }}
+
 on:
   push:
     tags:
@@ -32,8 +35,17 @@ jobs:
     - name: Set up Python
       run: uv python install
 
+    - name: Install Wine-compatible Rust
+      uses: dtolnay/rust-toolchain@1.77.2
+      with:
+        targets: x86_64-pc-windows-msvc
+
     - name: Install dependencies
-      run: uv sync --group dev
+      run: uv sync --frozen --group dev
+
+    - name: Prepare matching native package inputs
+      shell: pwsh
+      run: ./scripts/prepare-windows-package.ps1
 
     - name: Get version from source code
       id: version
@@ -78,6 +90,11 @@ jobs:
         uv run --group dev pyinstaller --noconfirm --clean Deimos.spec
         echo "Build completed successfully"
         dir dist
+
+    - name: Verify packaged native artifacts
+      run: >-
+        uv run --group dev python scripts/package_artifacts.py verify-archive
+        --archive dist/Deimos.exe
     
     - name: Verify required files exist
       shell: bash

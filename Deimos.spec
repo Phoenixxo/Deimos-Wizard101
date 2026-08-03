@@ -1,6 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+
+repository_root = Path(SPECPATH).resolve()
+sys.path.insert(0, str(repository_root))
+from scripts.package_artifacts import validate_package_inputs
+
+
+def required_artifact(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f'{name} must name an artifact produced for this package build')
+    return Path(value).resolve()
+
+
+agent_artifact = required_artifact('DEIMOS_AGENT_ARTIFACT_PATH')
+agent_manifest = required_artifact('DEIMOS_AGENT_MANIFEST_PATH')
+native_module = required_artifact('DEIMOS_NATIVE_MODULE_PATH')
+build_id = os.environ.get('DEIMOS_BUILD_ID')
+if not build_id:
+    raise RuntimeError('DEIMOS_BUILD_ID must identify this package build')
+validate_package_inputs(agent_artifact, agent_manifest, native_module, build_id)
 
 # wizsprinter installs into the wizwalker.extensions namespace at runtime via a
 # sys.path scan in wizwalker/extensions/__init__.py. PyInstaller's static
@@ -11,13 +35,15 @@ hiddenimports = (
     + collect_submodules('wizwalker.extensions.wizsprinter.combat_backends')
     + collect_submodules('wizsprinter')
     + collect_submodules('lark')
-    + ['wizlaunch']
+    + ['wizlaunch', 'deimos_native']
 )
 
 datas = [
     ('Deimos-logo.ico', '.'),
     ('Deimos-logo.png', '.'),
     ('locale', 'locale'),
+    (str(agent_artifact), '.'),
+    (str(agent_manifest), '.'),
 ]
 datas += collect_data_files('wizwalker.extensions.wizsprinter')
 datas += collect_data_files('wizwalker.extensions.wizsprinter.combat_backends')
@@ -39,7 +65,7 @@ datas += collect_data_files(
 a = Analysis(
     ['Deimos.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(str(native_module), '.')],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -71,6 +97,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='Deimos-logo.ico',
-    version='version_info.txt',
-    manifest='app.manifest',
+    version='version_info.txt' if sys.platform == 'win32' else None,
+    manifest='app.manifest' if sys.platform == 'win32' else None,
 )
+
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        exe,
+        name='Deimos.app',
+        icon='Deimos-logo.ico',
+        bundle_identifier='io.github.deimos-wizard101',
+    )

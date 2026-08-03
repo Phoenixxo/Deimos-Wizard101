@@ -13,6 +13,17 @@ pub mod wine_runtime;
 use deimos_core::{ProbeRequest, PROTOCOL_SCHEMA_VERSION};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
+use pyo3::types::PyDict;
+
+#[cfg(feature = "python")]
+#[pyfunction]
+fn build_identity(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let identity = PyDict::new_bound(py);
+    identity.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    identity.set_item("build_id", deimos_core::BUILD_ID)?;
+    Ok(identity.unbind())
+}
 
 #[cfg(feature = "python")]
 #[pyfunction]
@@ -29,6 +40,7 @@ fn default_probe_request_json() -> String {
 #[cfg(feature = "python")]
 #[pymodule]
 fn deimos_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(build_identity, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
     module.add_function(wrap_pyfunction!(default_probe_request_json, module)?)?;
     python_api::register(module)?;
@@ -46,6 +58,28 @@ mod tests {
             let module =
                 PyModule::new_bound(py, "deimos_native").expect("test module should be created");
             super::deimos_native(&module).expect("Python module should register");
+
+            let identity = module
+                .getattr("build_identity")
+                .expect("build_identity should be exported")
+                .call0()
+                .expect("build_identity should succeed");
+            assert_eq!(
+                identity
+                    .get_item("version")
+                    .expect("version lookup should succeed")
+                    .extract::<String>()
+                    .expect("version should be text"),
+                env!("CARGO_PKG_VERSION")
+            );
+            assert_eq!(
+                identity
+                    .get_item("build_id")
+                    .expect("build ID lookup should succeed")
+                    .extract::<String>()
+                    .expect("build ID should be text"),
+                deimos_core::BUILD_ID
+            );
 
             for name in [
                 "AgentManager",
