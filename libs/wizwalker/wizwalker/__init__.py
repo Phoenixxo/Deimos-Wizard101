@@ -4,6 +4,10 @@ from importlib import import_module
 from .constants import *
 from .errors import *
 from .hotkey import *
+
+if sys.platform == "win32":
+    from .utils import Orient, Rectangle, XYZ
+
 from . import memory
 from .memory import DeimosNativeMemoryBackend, MemoryBackend, MemoryReader
 from .client_handler import Client, ClientHandler
@@ -19,7 +23,6 @@ if sys.platform == "win32":
     from . import combat, utils
     from .file_readers import CacheHandler, NifMap, Wad
     from .mouse_handler import MouseHandler
-    from .utils import Orient, Rectangle, XYZ
 
     logger.disable("wizwalker")
     logging.getLogger("pymem").setLevel(logging.FATAL)
