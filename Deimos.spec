@@ -7,6 +7,12 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 repository_root = Path(SPECPATH).resolve()
+workspace_package_roots = [
+    repository_root / 'libs' / 'wizwalker',
+    repository_root / 'libs' / 'wizsprinter',
+]
+for package_root in reversed(workspace_package_roots):
+    sys.path.insert(0, str(package_root))
 sys.path.insert(0, str(repository_root))
 from scripts.package_artifacts import validate_package_inputs
 
@@ -33,7 +39,6 @@ hiddenimports = (
     collect_submodules('wizwalker')
     + collect_submodules('wizwalker.extensions.wizsprinter')
     + collect_submodules('wizwalker.extensions.wizsprinter.combat_backends')
-    + collect_submodules('wizsprinter')
     + collect_submodules('lark')
     + ['wizlaunch', 'deimos_native']
 )
@@ -64,7 +69,7 @@ datas += collect_data_files(
 
 a = Analysis(
     ['Deimos.py'],
-    pathex=[],
+    pathex=[str(path) for path in workspace_package_roots],
     binaries=[(str(native_module), '.')],
     datas=datas,
     hiddenimports=hiddenimports,
