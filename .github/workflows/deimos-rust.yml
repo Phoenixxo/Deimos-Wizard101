@@ -182,7 +182,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             toolchain: "1.77.2"
-          - os: macos-14-xlarge
+          - os: macos-14
             target: aarch64-apple-darwin
             toolchain: stable
 
