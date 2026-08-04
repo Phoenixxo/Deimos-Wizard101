@@ -11,6 +11,7 @@ from scripts.package_artifacts import (
     ArtifactValidationError,
     read_manifest,
     validate_archive_listing,
+    verify_app_bundle,
     validate_package_inputs,
 )
 
@@ -156,6 +157,20 @@ class PackageArtifactTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ArtifactValidationError, "required artifacts"):
             validate_archive_listing(listing)
+
+    def test_macos_bundle_requires_its_executable_and_native_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = Path(directory) / "Deimos.app"
+            executable = app / "Contents" / "MacOS" / "Deimos"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"app")
+            resources = app / "Contents" / "Resources"
+            resources.mkdir()
+            (resources / "deimos-agent.exe").write_bytes(b"MZagent")
+            (resources / "deimos-agent.json").write_text("{}", encoding="utf-8")
+            (resources / "deimos_native.cpython-313-darwin.so").write_bytes(b"native")
+
+            verify_app_bundle(app)
 
 
 if __name__ == "__main__":

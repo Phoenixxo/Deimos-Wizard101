@@ -230,6 +230,31 @@ def verify_archive(archive: Path, viewer: str) -> None:
     validate_archive_listing(completed.stdout)
 
 
+def verify_app_bundle(app: Path) -> None:
+    app = app.resolve()
+    executable = app / "Contents" / "MacOS" / "Deimos"
+    if not executable.is_file() or executable.is_symlink():
+        raise ArtifactValidationError(
+            f"macOS application bundle has no regular executable: {executable}"
+        )
+    members = {path.name for path in app.rglob("*") if path.is_file()}
+    missing = [
+        name
+        for name in (AGENT_FILENAME, MANIFEST_FILENAME)
+        if name not in members
+    ]
+    if not any(
+        name.startswith("deimos_native.") and name.endswith(".so")
+        for name in members
+    ):
+        missing.append("deimos_native")
+    if missing:
+        raise ArtifactValidationError(
+            "macOS application bundle is missing required artifacts: "
+            + ", ".join(missing)
+        )
+
+
 def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -250,6 +275,9 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     archive.add_argument(
         "--viewer", default=os.environ.get("PYINSTALLER_ARCHIVE_VIEWER", "pyi-archive_viewer")
     )
+
+    bundle = commands.add_parser("verify-app-bundle")
+    bundle.add_argument("--app", required=True, type=Path)
     return parser.parse_args(argv)
 
 
@@ -266,6 +294,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 options.expected_build_id,
             )
             print(json.dumps(identity, sort_keys=True))
+        elif options.command == "verify-app-bundle":
+            verify_app_bundle(options.app)
         else:
             verify_archive(options.archive, options.viewer)
     except ArtifactValidationError as error:

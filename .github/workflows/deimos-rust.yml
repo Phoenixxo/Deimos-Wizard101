@@ -308,9 +308,15 @@ jobs:
 
       - name: Verify macOS package contents
         if: runner.os == 'macOS'
+        run: |
+          uv run python scripts/package_artifacts.py verify-app-bundle --app dist/Deimos.app
+          codesign --verify --deep --strict --verbose=2 dist/Deimos.app
+
+      - name: Archive Apple Silicon application
+        if: runner.os == 'macOS'
         run: >-
-          uv run python scripts/package_artifacts.py verify-archive
-          --archive dist/Deimos.app/Contents/MacOS/Deimos
+          ditto -c -k --sequesterRsrc --keepParent
+          dist/Deimos.app dist/Deimos-macOS-arm64-${{ github.sha }}.zip
 
       - name: Upload Windows application
         if: runner.os == 'Windows'
@@ -325,5 +331,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Deimos-macOS-arm64-${{ github.sha }}
-          path: dist/Deimos.app
+          path: dist/Deimos-macOS-arm64-${{ github.sha }}.zip
           if-no-files-found: error
