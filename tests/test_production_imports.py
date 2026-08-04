@@ -93,6 +93,15 @@ class ProductionImportTests(unittest.TestCase):
         self.assertIn("request_input_monitoring_permission()", source)
         self.assertIn("await enable_hotkeys()", source)
 
+    def test_feature_tasks_use_the_guarded_failure_boundary(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("asyncio.create_task(try_task_coro", source)
+        self.assertNotIn("asyncio.create_task(_flythrough()", source)
+        self.assertNotIn("asyncio.create_task(_highlight_", source)
+        self.assertIn("run_guarded_feature", source)
+        self.assertIn("require_agent_capabilities", source)
+
     def test_all_production_modules_import_without_windows_dependencies(self):
         failures = []
         with tempfile.TemporaryDirectory(

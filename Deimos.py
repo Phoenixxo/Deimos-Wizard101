@@ -93,7 +93,9 @@ from src.runtime_recovery import (
 	client_supports_operations,
 	format_error_diagnostics,
 	is_recoverable_agent_error,
+	require_agent_capabilities,
 	require_auto_hook_character_ready,
+	run_guarded_feature,
 	task_is_active,
 )
 
@@ -479,6 +481,12 @@ async def main(agent_manager: Any = None):
 	listener = HotkeyListener()
 	foreground_client: Client = None
 	background_clients = []
+	_automation_capabilities = (
+		'memory.mutation.v1',
+		'memory.core_hook.v1',
+		'memory.feature_hook.v1',
+		'client.input.v1',
+	)
 	await asyncio.sleep(0)
 	listener.start()
 
@@ -517,7 +525,12 @@ async def main(agent_manager: Any = None):
 			else:
 				logger.debug('Speed hotkey pressed, enabling speed multiplier.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SpeedhackStatus', 'Enabled')))
-				speed_task = asyncio.create_task(try_task_coro(speed_switching, walker.clients))
+				speed_task = _start_feature_task(
+					"Speed hack",
+					try_task_coro(speed_switching, walker.clients),
+					status_update=('SpeedhackStatus', 'Disabled'),
+					required_capabilities=('memory.mutation.v1',),
+				)
 
 
 	async def friend_teleport_sync_hotkey():
@@ -562,7 +575,12 @@ async def main(agent_manager: Any = None):
 			if debug:
 				logger.debug('Combat hotkey pressed, enabling auto combat.')
 			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('CombatStatus', 'Enabled')))
-			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
+			combat_task = _start_feature_task(
+				"Combat",
+				try_task_coro(combat_loop, walker.clients, True),
+				status_update=('CombatStatus', 'Disabled'),
+				required_capabilities=_automation_capabilities,
+			)
 
 
 	async def toggle_dialogue_hotkey():
@@ -585,7 +603,12 @@ async def main(agent_manager: Any = None):
 				# 	side_quest_log_str += " and auto side quests functionality"
 				logger.debug('Dialogue hotkey pressed, enabling auto dialogue.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('DialogueStatus', 'Enabled')))
-				dialogue_task = asyncio.create_task(try_task_coro(dialogue_loop, walker.clients, True))
+				dialogue_task = _start_feature_task(
+					"Dialogue",
+					try_task_coro(dialogue_loop, walker.clients, True),
+					status_update=('DialogueStatus', 'Disabled'),
+					required_capabilities=_automation_capabilities,
+				)
 
 
 	async def toggle_dialogue_side_quests_hotkey():
@@ -626,7 +649,12 @@ async def main(agent_manager: Any = None):
 				questing_task = None
 
 			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('SigilStatus', 'Enabled')))
-			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
+			sigil_task = _start_feature_task(
+				"Sigil",
+				try_task_coro(sigil_loop, walker.clients, True),
+				status_update=('SigilStatus', 'Disabled'),
+				required_capabilities=_automation_capabilities,
+			)
 
 
 
@@ -712,7 +740,12 @@ async def main(agent_manager: Any = None):
 
 				logger.debug('Questing hotkey pressed, enabling auto questing.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Enabled')))
-				questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
+				questing_task = _start_feature_task(
+					"Questing",
+					try_task_coro(questing_loop, walker.clients, True),
+					status_update=('QuestingStatus', 'Disabled'),
+					required_capabilities=_automation_capabilities,
+				)
 
 
 	async def toggle_auto_pet_hotkey():
@@ -735,7 +768,12 @@ async def main(agent_manager: Any = None):
 					p.auto_pet_status = True
 				logger.debug(f'Enabling auto pet.')
 				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Auto PetStatus', 'Enabled')))
-				auto_pet_task = asyncio.create_task(try_task_coro(auto_pet_loop, walker.clients, True))
+				auto_pet_task = _start_feature_task(
+					"Auto pet",
+					try_task_coro(auto_pet_loop, walker.clients, True),
+					status_update=('Auto PetStatus', 'Disabled'),
+					required_capabilities=_automation_capabilities,
+				)
 
 
 	async def toggle_auto_potion_hotkey():
@@ -969,7 +1007,11 @@ async def main(agent_manager: Any = None):
 								await asyncio.sleep(1.0)
 
 								if questing_task is None:
-									questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
+									questing_task = _start_feature_task(
+										"Questing",
+										try_task_coro(questing_loop, walker.clients, True),
+										status_update=('QuestingStatus', 'Disabled'),
+									)
 
 
 		await asyncio.gather(*[async_afk_questing(p) for p in walker.clients])
@@ -1254,6 +1296,104 @@ async def main(agent_manager: Any = None):
 			logger.warning(formatted)
 		else:
 			logger.error(formatted)
+
+	def _start_feature_task(
+		name: str,
+		operation,
+		*,
+		status_update: tuple[str, str] | None = None,
+		finish_command=None,
+		required_capabilities: tuple[str, ...] = (),
+	):
+		if not required_capabilities:
+			required_capabilities = {
+				'Combat': _automation_capabilities,
+				'Dialogue': _automation_capabilities,
+				'Sigil': _automation_capabilities,
+				'Questing': _automation_capabilities,
+				'Auto pet': _automation_capabilities,
+				'Bot': _automation_capabilities,
+				'Speed hack': ('memory.mutation.v1',),
+				'Flythrough': ('memory.mutation.v1', 'memory.core_hook.v1'),
+				'Entity highlight': (
+					'memory.read_only.v1',
+					'memory.core_hook.v1',
+					'client.window.v1',
+				),
+				'UI highlight': (
+					'memory.read_only.v1',
+					'memory.core_hook.v1',
+					'client.window.v1',
+				),
+				'Entity stream': ('memory.read_only.v1', 'memory.core_hook.v1'),
+			}.get(name, ())
+
+		def report_failure(error: BaseException):
+			_log_native_failure(
+				f"{name} stopped without affecting the application",
+				error,
+				warning=True,
+			)
+
+		async def finish():
+			global auto_pet_status, questing_status, sigil_status
+			try:
+				if name == 'Combat':
+					for client in walker.clients:
+						client.combat_status = False
+				elif name == 'Sigil':
+					sigil_status = False
+					for client in walker.clients:
+						client.sigil_status = False
+				elif name == 'Questing':
+					questing_status = False
+					for client in walker.clients:
+						client.questing_status = False
+				elif name == 'Auto pet':
+					auto_pet_status = False
+					for client in walker.clients:
+						client.auto_pet_status = False
+				elif name == 'Speed hack':
+					for client in walker.clients:
+						original_speed = client_speeds.get(client.process_id)
+						if original_speed is not None:
+							await client.client_object.write_speed_multiplier(original_speed)
+				elif name == 'Flythrough' and foreground_client is not None:
+					await foreground_client.camera_elastic()
+			except Exception as cleanup_error:
+				_log_native_failure(
+					f"{name} cleanup failed",
+					cleanup_error,
+					warning=True,
+				)
+			finally:
+				if status_update is not None:
+					gui_send_queue.put(deimosgui.GUICommand(
+						deimosgui.GUICommandType.UpdateWindow,
+						status_update,
+					))
+				if finish_command is not None:
+					gui_send_queue.put(finish_command)
+
+		async def gated_operation():
+			try:
+				require_agent_capabilities(
+					agent_manager,
+					name,
+					*required_capabilities,
+				)
+			except Exception:
+				close_operation = getattr(operation, 'close', None)
+				if close_operation is not None:
+					close_operation()
+				raise
+			await operation
+
+		return asyncio.create_task(run_guarded_feature(
+			gated_operation(),
+			on_failure=report_failure,
+			on_finish=finish,
+		))
 
 	async def _recover_agent_runtime(operation: str, error: BaseException) -> bool:
 		global walker
@@ -1877,23 +2017,23 @@ async def main(agent_manager: Any = None):
 							if name == "combat":
 								for c in walker.clients:
 									c.combat_status = True
-								combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
+								combat_task = _start_feature_task("Combat", try_task_coro(combat_loop, walker.clients, True), status_update=('CombatStatus', 'Disabled'))
 							elif name == "dialogue":
-								dialogue_task = asyncio.create_task(try_task_coro(dialogue_loop, walker.clients, True))
+								dialogue_task = _start_feature_task("Dialogue", try_task_coro(dialogue_loop, walker.clients, True), status_update=('DialogueStatus', 'Disabled'))
 							elif name == "sigil":
 								for c in walker.clients:
 									c.sigil_status = True
-								sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
+								sigil_task = _start_feature_task("Sigil", try_task_coro(sigil_loop, walker.clients, True), status_update=('SigilStatus', 'Disabled'))
 							elif name == "questing":
 								for c in walker.clients:
 									c.questing_status = True
-								questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
+								questing_task = _start_feature_task("Questing", try_task_coro(questing_loop, walker.clients, True), status_update=('QuestingStatus', 'Disabled'))
 							elif name == "speed":
-								speed_task = asyncio.create_task(try_task_coro(speed_switching, walker.clients))
+								speed_task = _start_feature_task("Speed hack", try_task_coro(speed_switching, walker.clients), status_update=('SpeedhackStatus', 'Disabled'))
 							elif name == "auto_pet":
 								for c in walker.clients:
 									c.feeding_pet_status = True
-								auto_pet_task = asyncio.create_task(try_task_coro(auto_pet_loop, walker.clients, True))
+								auto_pet_task = _start_feature_task("Auto pet", try_task_coro(auto_pet_loop, walker.clients, True), status_update=('Auto PetStatus', 'Disabled'))
 
 						previous_client_count = None
 						paused_task_names = None
@@ -2316,7 +2456,11 @@ async def main(agent_manager: Any = None):
 								finally:
 									gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FlythroughStatus', 'Disabled')))
 							if foreground_client:
-								flythrough_task = asyncio.create_task(_flythrough())
+								flythrough_task = _start_feature_task(
+									"Flythrough",
+									_flythrough(),
+									status_update=('FlythroughStatus', 'Disabled'),
+								)
 								gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FlythroughStatus', 'Enabled')))
 						case deimosgui.GUICommandType.KillFlythrough:
 							if not walker.clients:
@@ -2332,15 +2476,27 @@ async def main(agent_manager: Any = None):
 							if highlight_task and not highlight_task.done():
 								highlight_task.cancel()
 							if foreground_client and com.data:
-								highlight_task = asyncio.create_task(
-									_highlight_entity_loop(foreground_client, com.data))
+								highlight_task = _start_feature_task(
+									"Entity highlight",
+									_highlight_entity_loop(foreground_client, com.data),
+									finish_command=deimosgui.GUICommand(
+										deimosgui.GUICommandType.UpdateHighlightBox,
+										None,
+									),
+								)
 
 						case deimosgui.GUICommandType.HighlightUIWindow:
 							if highlight_task and not highlight_task.done():
 								highlight_task.cancel()
 							if foreground_client and com.data:
-								highlight_task = asyncio.create_task(
-									_highlight_ui_window_loop(foreground_client, com.data))
+								highlight_task = _start_feature_task(
+									"UI highlight",
+									_highlight_ui_window_loop(foreground_client, com.data),
+									finish_command=deimosgui.GUICommand(
+										deimosgui.GUICommandType.UpdateHighlightBox,
+										None,
+									),
+								)
 
 						case deimosgui.GUICommandType.ClearHighlight:
 							if highlight_task and not highlight_task.done():
@@ -2354,7 +2510,10 @@ async def main(agent_manager: Any = None):
 							if entity_stream_task and not entity_stream_task.done():
 								entity_stream_task.cancel()
 							if foreground_client:
-								entity_stream_task = asyncio.create_task(_entity_stream_loop(foreground_client))
+								entity_stream_task = _start_feature_task(
+									"Entity stream",
+									_entity_stream_loop(foreground_client),
+								)
 
 						case deimosgui.GUICommandType.StopEntityStream:
 							if entity_stream_task and not entity_stream_task.done():
@@ -2402,8 +2561,11 @@ async def main(agent_manager: Any = None):
 								bot_task.cancel()
 								logger.debug('Bot Killed')
 								bot_task = None
-							bot_task = asyncio.create_task(try_task_coro(run_bot, walker.clients, True))
-							bot_task.add_done_callback(lambda _t: gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('BotStatus', 'Disabled'))))
+							bot_task = _start_feature_task(
+								"Bot",
+								try_task_coro(run_bot, walker.clients, True),
+								status_update=('BotStatus', 'Disabled'),
+							)
 							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('BotStatus', 'Enabled')))
 						case deimosgui.GUICommandType.KillBot:
 							if not walker.clients:
@@ -3037,33 +3199,33 @@ async def main(agent_manager: Any = None):
 			combat_task.cancel()
 			for c in walker.clients:
 				c.combat_status = True
-			combat_task = asyncio.create_task(try_task_coro(combat_loop, walker.clients, True))
+			combat_task = _start_feature_task("Combat", try_task_coro(combat_loop, walker.clients, True), status_update=('CombatStatus', 'Disabled'))
 
 		if task_is_active(dialogue_task):
 			dialogue_task.cancel()
-			dialogue_task = asyncio.create_task(try_task_coro(dialogue_loop, walker.clients, True))
+			dialogue_task = _start_feature_task("Dialogue", try_task_coro(dialogue_loop, walker.clients, True), status_update=('DialogueStatus', 'Disabled'))
 
 		if task_is_active(sigil_task):
 			sigil_task.cancel()
 			for c in walker.clients:
 				c.sigil_status = True
-			sigil_task = asyncio.create_task(try_task_coro(sigil_loop, walker.clients, True))
+			sigil_task = _start_feature_task("Sigil", try_task_coro(sigil_loop, walker.clients, True), status_update=('SigilStatus', 'Disabled'))
 
 		if task_is_active(questing_task):
 			questing_task.cancel()
 			for c in walker.clients:
 				c.questing_status = True
-			questing_task = asyncio.create_task(try_task_coro(questing_loop, walker.clients, True))
+			questing_task = _start_feature_task("Questing", try_task_coro(questing_loop, walker.clients, True), status_update=('QuestingStatus', 'Disabled'))
 
 		if task_is_active(speed_task):
 			speed_task.cancel()
-			speed_task = asyncio.create_task(try_task_coro(speed_switching, walker.clients))
+			speed_task = _start_feature_task("Speed hack", try_task_coro(speed_switching, walker.clients), status_update=('SpeedhackStatus', 'Disabled'))
 
 		if task_is_active(auto_pet_task):
 			auto_pet_task.cancel()
 			for c in walker.clients:
 				c.feeding_pet_status = True
-			auto_pet_task = asyncio.create_task(try_task_coro(auto_pet_loop, walker.clients, True))
+			auto_pet_task = _start_feature_task("Auto pet", try_task_coro(auto_pet_loop, walker.clients, True), status_update=('Auto PetStatus', 'Disabled'))
 
 	try:
 		all_tasks['foreground_client_switching'] = asyncio.create_task(foreground_client_switching())
