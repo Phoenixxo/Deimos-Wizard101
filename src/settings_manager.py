@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -112,16 +113,23 @@ _INI_KEY_MAP = {
 }
 
 
+def _settings_directory() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Deimos"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Deimos"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "Deimos"
+
+
 def _theme_path() -> Path:
-    appdata = os.environ.get("APPDATA", "")
-    return Path(appdata) / "Deimos" / "default_theme.json"
+    return _settings_directory() / "default_theme.json"
 
 
 class DeimosSettings:
     def __init__(self, settings_path: str | None = None):
         if settings_path is None:
-            appdata = os.environ.get("APPDATA", "")
-            settings_dir = Path(appdata) / "Deimos"
+            settings_dir = _settings_directory()
             settings_dir.mkdir(parents=True, exist_ok=True)
             self._path = settings_dir / "settings.json"
         else:
