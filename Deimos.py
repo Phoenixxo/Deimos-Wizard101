@@ -23,11 +23,11 @@ import sys
 import subprocess
 from pathlib import Path
 
+from src.logging_paths import application_log_directory
+
 
 def _startup_log_directory() -> Path:
-	if sys.platform == 'darwin':
-		return Path.home() / 'Library' / 'Logs' / 'Deimos'
-	return Path.home() / '.deimos' / 'logs'
+	return application_log_directory()
 
 
 def _write_startup_exception(exception_type, exception, traceback_object) -> None:
@@ -220,6 +220,8 @@ sigil_status = False
 freecam_status = False
 hotkey_status = False
 questing_status = False
+questing_generation = 0
+questing_restarting = False
 auto_pet_status = False
 auto_potion_status = False
 side_quest_status = False
@@ -244,6 +246,11 @@ bot_task: asyncio.Task = None
 flythrough_task: asyncio.Task = None
 highlight_task: asyncio.Task = None
 entity_stream_task: asyncio.Task = None
+
+gui_send_queue = queue.Queue()
+recv_queue = queue.Queue()
+control_queue = queue.Queue()
+shutdown_event = threading.Event()
 
 def file_len(filepath) -> List[str]:
 	# return the number of lines in a file
@@ -710,11 +717,13 @@ async def main(agent_manager: Any = None):
 		global sigil_task
 		global questing_task
 		global questing_status
+		global questing_generation
 		global sigil_status
 		global gui_send_queue
 
 		if not freecam_status:
-			if task_is_active(questing_task):
+			questing_generation += 1
+			if questing_status:
 				questing_status = False
 				for p in walker.clients:
 					p.questing_status = False
@@ -863,11 +872,10 @@ async def main(agent_manager: Any = None):
 
 	async def foreground_client_switching():
 		await asyncio.sleep(2)
-		# enable hotkeys if a client is selected, disable if none are
+		# Global hotkeys must remain registered while Deimos or another app has focus.
 		while True:
 			await asyncio.sleep(0.1)
-			foreground_client_list = [c for c in walker.clients if c.is_foreground]
-			if foreground_client_list:
+			if walker.clients:
 				await enable_hotkeys(debug = True)
 			else:
 				await disable_hotkeys(debug = True)
@@ -984,14 +992,19 @@ async def main(agent_manager: Any = None):
 		async def async_afk_questing(client: Client):
 			while True:
 				global questing_task
+				global questing_status
+				global questing_generation
+				global questing_restarting
 
 				await asyncio.sleep(0.1)
-				if not freecam_status:
+				if not freecam_status and questing_status:
 					client_xyz = await client.body.position()
 					await asyncio.sleep(120)
+					if not questing_status:
+						continue
 					client_xyz_2 = await client.body.position()
 					distance_moved = calc_Distance(client_xyz, client_xyz_2)
-					if distance_moved < 5.0 and not await client.in_battle() and not client.feeding_pet_status and not client.entity_detect_combat_status:
+					if distance_moved < 5.0 and await is_free(client) and not client.feeding_pet_status and not client.entity_detect_combat_status:
 
 						# During questing, one or more clients may be waiting outside while the others are completing a solo zone quest - we do not want to restart in these cases
 						client_in_solo_zone = False
@@ -1002,16 +1015,26 @@ async def main(agent_manager: Any = None):
 						# restart questing
 						if task_is_active(questing_task) and not client_in_solo_zone:
 								logger.debug(f'Questing appears to have halted - restarting.')
-								questing_task.cancel()
+								restart_generation = questing_generation
+								stalled_task = questing_task
+								questing_restarting = True
+								stalled_task.cancel()
 								questing_task = None
-								await asyncio.sleep(1.0)
+								try:
+									await asyncio.gather(stalled_task, return_exceptions=True)
+									await asyncio.sleep(1.0)
 
-								if questing_task is None:
-									questing_task = _start_feature_task(
-										"Questing",
-										try_task_coro(questing_loop, walker.clients, True),
-										status_update=('QuestingStatus', 'Disabled'),
-									)
+									if questing_generation == restart_generation and questing_task is None:
+										for p in walker.clients:
+											p.questing_status = True
+										questing_task = _start_feature_task(
+											"Questing",
+											try_task_coro(questing_loop, walker.clients, True),
+											status_update=('QuestingStatus', 'Disabled'),
+										)
+										gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('QuestingStatus', 'Enabled')))
+								finally:
+									questing_restarting = False
 
 
 		await asyncio.gather(*[async_afk_questing(p) for p in walker.clients])
@@ -1286,6 +1309,19 @@ async def main(agent_manager: Any = None):
 	def _client_identity(client):
 		return walker.client_identity(client)
 
+	_last_client_titles = {}
+
+	def _safe_client_title(client, *, live=True):
+		identity = _client_identity(client)
+		if not live:
+			return _last_client_titles.get(identity, str(identity))
+		try:
+			title = client.title
+		except Exception:
+			return _last_client_titles.get(identity, str(identity))
+		_last_client_titles[identity] = title
+		return title
+
 	def _mask_uid(uid) -> str:
 		s = str(uid)
 		return '****' if len(s) <= 4 else '*' * (len(s) - 4) + s[-4:]
@@ -1336,7 +1372,7 @@ async def main(agent_manager: Any = None):
 			)
 
 		async def finish():
-			global auto_pet_status, questing_status, sigil_status
+			global auto_pet_status, questing_status, questing_restarting, sigil_status
 			try:
 				if name == 'Combat':
 					for client in walker.clients:
@@ -1346,9 +1382,10 @@ async def main(agent_manager: Any = None):
 					for client in walker.clients:
 						client.sigil_status = False
 				elif name == 'Questing':
-					questing_status = False
-					for client in walker.clients:
-						client.questing_status = False
+					if not questing_restarting:
+						questing_status = False
+						for client in walker.clients:
+							client.questing_status = False
 				elif name == 'Auto pet':
 					auto_pet_status = False
 					for client in walker.clients:
@@ -1367,7 +1404,7 @@ async def main(agent_manager: Any = None):
 					warning=True,
 				)
 			finally:
-				if status_update is not None:
+				if status_update is not None and not (name == 'Questing' and questing_restarting):
 					gui_send_queue.put(deimosgui.GUICommand(
 						deimosgui.GUICommandType.UpdateWindow,
 						status_update,
@@ -1490,7 +1527,7 @@ async def main(agent_manager: Any = None):
 		for c in walker.clients:
 			identity = _client_identity(c)
 			nick = launched_account_map.get(identity)
-			hooked.append({'title': c.title, 'handle': identity, 'account_nick': nick})
+			hooked.append({'title': _safe_client_title(c), 'handle': identity, 'account_nick': nick})
 			# Also detect accounts via player_gid for manually-hooked clients
 			if not nick:
 				gid = getattr(c, 'player_gid', None)
@@ -1511,6 +1548,7 @@ async def main(agent_manager: Any = None):
 
 	async def _init_client_attrs(client):
 		"""Initialize all per-client attributes. Called once per client after hooking."""
+		_safe_client_title(client)
 		client_speeds[client.process_id] = await client.client_object.speed_multiplier()
 		client.combat_status = False
 		client.questing_status = False
@@ -1583,6 +1621,77 @@ async def main(agent_manager: Any = None):
 		finally:
 			walker.release_client(client)
 		return True
+
+	async def _handle_toggle_option(option):
+		if not walker.clients:
+			logger.info("This GUI option requires hooks to be active, skipping.")
+			return
+		match option:
+			case GUIKeys.toggle_speedhack:
+				await toggle_speed_hotkey()
+			case GUIKeys.toggle_combat:
+				await toggle_combat_hotkey()
+			case GUIKeys.toggle_dialogue:
+				await toggle_dialogue_hotkey()
+			case GUIKeys.toggle_sigil:
+				await toggle_sigil_hotkey()
+			case GUIKeys.toggle_questing:
+				await toggle_questing_hotkey()
+			case GUIKeys.toggle_auto_pet:
+				await toggle_auto_pet_hotkey()
+			case GUIKeys.toggle_auto_potion:
+				await toggle_auto_potion_hotkey()
+			case GUIKeys.toggle_freecam:
+				await toggle_freecam_hotkey()
+			case GUIKeys.toggle_camera_collision:
+				if foreground_client:
+					camera: ElasticCameraController = await foreground_client.game_client.elastic_camera_controller()
+					collision_status = await camera.check_collisions()
+					collision_status ^= True
+					logger.debug(f'Camera Collisions {bool_to_string(collision_status)}')
+					await camera.write_check_collisions(collision_status)
+			case GUIKeys.toggle_show_expanded_logs:
+				gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateConsole))
+			case _:
+				logger.debug(f'Unknown window toggle: {option}')
+
+	async def _stop_flythrough():
+		global flythrough_task
+		if task_is_active(flythrough_task):
+			flythrough_task.cancel()
+			flythrough_task = None
+			await asyncio.sleep(0)
+			if foreground_client is not None:
+				await foreground_client.camera_elastic()
+		gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FlythroughStatus', 'Disabled')))
+
+	def _stop_bot():
+		global bot_task
+		if task_is_active(bot_task):
+			bot_task.cancel()
+			logger.debug('Bot Killed')
+			bot_task = None
+
+	async def handle_controls():
+		while True:
+			try:
+				command = control_queue.get_nowait()
+			except queue.Empty:
+				await asyncio.sleep(0.05)
+				continue
+
+			match command.com_type:
+				case deimosgui.GUICommandType.Close | deimosgui.GUICommandType.AttemptedClose:
+					_write_lifecycle_event('backend received priority close request')
+					raise deimosgui.ToolClosedException
+				case deimosgui.GUICommandType.ToggleOption:
+					await _handle_toggle_option(command.data)
+				case deimosgui.GUICommandType.KillFlythrough:
+					await _stop_flythrough()
+				case deimosgui.GUICommandType.KillBot:
+					_stop_bot()
+				case _:
+					recv_queue.put(command)
 
 	async def handle_gui():
 
@@ -1803,7 +1912,7 @@ async def main(agent_manager: Any = None):
 							identity = _client_identity(c)
 							launched_account_map.pop(identity, None)
 							_hooking_in_progress.discard(identity)
-							logger.info(f"Client '{c.title}' disconnected.")
+							logger.info(f"Client '{_safe_client_title(c, live=False)}' disconnected.")
 						_send_hooked_clients_update()
 
 						# Record which tasks were active, then cancel them all
@@ -1967,7 +2076,7 @@ async def main(agent_manager: Any = None):
 					_send_hooked_clients_update()
 					last_known_handle_count = len(all_handles)
 					_restart_always_on_tasks()
-					_restart_active_toggle_tasks()
+					await _restart_active_toggle_tasks()
 				else:
 					# Check if handle count changed (wizard window opened/closed externally)
 					current_handle_count = len(all_handles)
@@ -2053,39 +2162,7 @@ async def main(agent_manager: Any = None):
 							_write_lifecycle_event('backend received attempted close request')
 							raise deimosgui.ToolClosedException
 						case deimosgui.GUICommandType.ToggleOption:
-							if not walker.clients:
-								logger.info("This GUI option requires hooks to be active, skipping.")
-								continue
-							match com.data:
-								case GUIKeys.toggle_speedhack:
-									await toggle_speed_hotkey()
-								case GUIKeys.toggle_combat:
-									await toggle_combat_hotkey()
-								case GUIKeys.toggle_dialogue:
-									await toggle_dialogue_hotkey()
-								case GUIKeys.toggle_sigil:
-									await toggle_sigil_hotkey()
-								case GUIKeys.toggle_questing:
-									await toggle_questing_hotkey()
-								case GUIKeys.toggle_auto_pet:
-									await toggle_auto_pet_hotkey()
-								case GUIKeys.toggle_auto_potion:
-									await toggle_auto_potion_hotkey()
-								case GUIKeys.toggle_freecam:
-									await toggle_freecam_hotkey()
-								# case 'Side Quests':
-								# 	await toggle_side_quests()
-								case GUIKeys.toggle_camera_collision:
-									if foreground_client:
-										camera: ElasticCameraController = await foreground_client.game_client.elastic_camera_controller()
-										collision_status = await camera.check_collisions()
-										collision_status ^= True
-										logger.debug(f'Camera Collisions {bool_to_string(collision_status)}')
-										await camera.write_check_collisions(collision_status)
-								case GUIKeys.toggle_show_expanded_logs:
-									gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateConsole))
-								case _:
-									logger.debug(f'Unknown window toggle: {com.data}')
+							await _handle_toggle_option(com.data)
 						case deimosgui.GUICommandType.Copy:
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
@@ -2466,12 +2543,7 @@ async def main(agent_manager: Any = None):
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if task_is_active(flythrough_task):
-								flythrough_task.cancel()
-								flythrough_task = None
-								await asyncio.sleep(0)
-								await foreground_client.camera_elastic()
-							gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('FlythroughStatus', 'Disabled')))
+							await _stop_flythrough()
 						case deimosgui.GUICommandType.HighlightEntity:
 							if highlight_task and not highlight_task.done():
 								highlight_task.cancel()
@@ -2571,10 +2643,7 @@ async def main(agent_manager: Any = None):
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
-							if task_is_active(bot_task):
-								bot_task.cancel()
-								logger.debug('Bot Killed')
-								bot_task = None
+							_stop_bot()
 						case deimosgui.GUICommandType.SetPlaystyles:
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
@@ -2675,7 +2744,7 @@ async def main(agent_manager: Any = None):
 							_send_hooked_clients_update()
 							if walker.clients:
 								_restart_always_on_tasks()
-								_restart_active_toggle_tasks()
+								await _restart_active_toggle_tasks()
 
 						case deimosgui.GUICommandType.HookClient:
 							handle = com.data
@@ -2741,7 +2810,7 @@ async def main(agent_manager: Any = None):
 							_hooking_in_progress.discard(handle)
 							_send_hooked_clients_update()
 							_restart_always_on_tasks()
-							_restart_active_toggle_tasks()
+							await _restart_active_toggle_tasks()
 
 						case deimosgui.GUICommandType.KillClient:
 							handle = com.data
@@ -2763,7 +2832,7 @@ async def main(agent_manager: Any = None):
 							_send_hooked_clients_update()
 							if walker.clients:
 								_restart_always_on_tasks()
-								_restart_active_toggle_tasks()
+								await _restart_active_toggle_tasks()
 
 						case deimosgui.GUICommandType.RelaunchClient:
 							handle, nickname = com.data
@@ -2799,7 +2868,7 @@ async def main(agent_manager: Any = None):
 								logger.error(f"Error relaunching '{nickname}': {e}")
 							if walker.clients:
 								_restart_always_on_tasks()
-								_restart_active_toggle_tasks()
+								await _restart_active_toggle_tasks()
 
 						case deimosgui.GUICommandType.UpdateSettings:
 							global speed_multiplier, use_potions, rpc_status, drop_status, anti_afk_status
@@ -3097,6 +3166,7 @@ async def main(agent_manager: Any = None):
 	# walker.clients = []
 	global gui_task
 	gui_task = asyncio.create_task(handle_gui())
+	control_task = asyncio.create_task(handle_controls())
 	await asyncio.sleep(2)
 	# logger.debug("1")
 
@@ -3162,8 +3232,9 @@ async def main(agent_manager: Any = None):
 	exc = None
 
 	async def tool_active():
-		while tool_status:
+		while not shutdown_event.is_set():
 			await asyncio.sleep(0.1)
+		raise deimosgui.ToolClosedException
 
 	all_tasks = {}
 
@@ -3182,6 +3253,12 @@ async def main(agent_manager: Any = None):
 		'zone_check_loop': zone_check_loop,
 		'anti_afk_questing_loop': anti_afk_questing_loop,
 	}
+	RESILIENT_TASK_FUNCS = {
+		**SNAPSHOT_TASK_FUNCS,
+		'foreground_client_switching': foreground_client_switching,
+		'assign_foreground_clients': assign_foreground_clients,
+		'rpc_loop': rpc_loop,
+	}
 
 	def _restart_always_on_tasks():
 		"""Cancel and recreate snapshot-based always-on tasks so they pick up new clients."""
@@ -3191,38 +3268,53 @@ async def main(agent_manager: Any = None):
 				old.cancel()
 			all_tasks[name] = asyncio.create_task(SNAPSHOT_TASK_FUNCS[name]())
 
-	def _restart_active_toggle_tasks():
+	async def _restart_active_toggle_tasks():
 		"""Cancel and recreate any currently-active toggle tasks so they pick up new clients."""
 		global combat_task, dialogue_task, sigil_task, questing_task, speed_task, auto_pet_task
+		global questing_status, questing_restarting, auto_pet_status
 
 		if task_is_active(combat_task):
 			combat_task.cancel()
+			await asyncio.gather(combat_task, return_exceptions=True)
 			for c in walker.clients:
 				c.combat_status = True
 			combat_task = _start_feature_task("Combat", try_task_coro(combat_loop, walker.clients, True), status_update=('CombatStatus', 'Disabled'))
 
 		if task_is_active(dialogue_task):
 			dialogue_task.cancel()
+			await asyncio.gather(dialogue_task, return_exceptions=True)
 			dialogue_task = _start_feature_task("Dialogue", try_task_coro(dialogue_loop, walker.clients, True), status_update=('DialogueStatus', 'Disabled'))
 
 		if task_is_active(sigil_task):
 			sigil_task.cancel()
+			await asyncio.gather(sigil_task, return_exceptions=True)
 			for c in walker.clients:
 				c.sigil_status = True
 			sigil_task = _start_feature_task("Sigil", try_task_coro(sigil_loop, walker.clients, True), status_update=('SigilStatus', 'Disabled'))
 
 		if task_is_active(questing_task):
-			questing_task.cancel()
-			for c in walker.clients:
-				c.questing_status = True
-			questing_task = _start_feature_task("Questing", try_task_coro(questing_loop, walker.clients, True), status_update=('QuestingStatus', 'Disabled'))
+			restart_generation = questing_generation
+			stalled_task = questing_task
+			questing_restarting = True
+			stalled_task.cancel()
+			try:
+				await asyncio.gather(stalled_task, return_exceptions=True)
+				if questing_status and questing_generation == restart_generation:
+					for c in walker.clients:
+						c.questing_status = True
+					questing_task = _start_feature_task("Questing", try_task_coro(questing_loop, walker.clients, True), status_update=('QuestingStatus', 'Disabled'))
+			finally:
+				questing_restarting = False
 
 		if task_is_active(speed_task):
 			speed_task.cancel()
+			await asyncio.gather(speed_task, return_exceptions=True)
 			speed_task = _start_feature_task("Speed hack", try_task_coro(speed_switching, walker.clients), status_update=('SpeedhackStatus', 'Disabled'))
 
 		if task_is_active(auto_pet_task):
 			auto_pet_task.cancel()
+			await asyncio.gather(auto_pet_task, return_exceptions=True)
+			auto_pet_status = True
 			for c in walker.clients:
 				c.feeding_pet_status = True
 			auto_pet_task = _start_feature_task("Auto pet", try_task_coro(auto_pet_loop, walker.clients, True), status_update=('Auto PetStatus', 'Disabled'))
@@ -3241,6 +3333,7 @@ async def main(agent_manager: Any = None):
 		all_tasks['ban_watcher'] = asyncio.create_task(ban_watcher())
 		all_tasks['tool_active'] = asyncio.create_task(tool_active())
 		all_tasks['gui'] = gui_task
+		all_tasks['controls'] = control_task
 
 		while True:
 			pending = [t for t in all_tasks.values() if t is not None and not t.done()]
@@ -3250,6 +3343,8 @@ async def main(agent_manager: Any = None):
 
 			should_exit = False
 			for t in done:
+				if t.cancelled():
+					continue
 				exc = t.exception()
 				if exc is None:
 					continue
@@ -3269,10 +3364,14 @@ async def main(agent_manager: Any = None):
 						logger.opt(exception=exc).error("GUI task crashed")
 						should_exit = True
 				else:
-					# Client-dependent task died (memory error, dead process, etc.)
-					# Non-fatal — the client is likely closed
 					task_name = next((k for k, v in all_tasks.items() if v is t), '?')
 					logger.opt(exception=exc).warning(f"Task '{task_name}' ended")
+					if task_name in RESILIENT_TASK_FUNCS and not shutdown_event.is_set():
+						if is_recoverable_agent_error(exc):
+							await _recover_agent_runtime(f"{task_name} monitor", exc)
+						await asyncio.sleep(0.5)
+						all_tasks[task_name] = asyncio.create_task(RESILIENT_TASK_FUNCS[task_name]())
+						logger.warning(f"Task '{task_name}' restarted after a transient failure.")
 			if should_exit:
 				break
 
@@ -3358,6 +3457,8 @@ if __name__ == "__main__":
 	# Set up GUI queues before starting anything
 	gui_send_queue = queue.Queue()
 	recv_queue = queue.Queue()
+	control_queue = queue.Queue()
+	shutdown_event = threading.Event()
 	agent_manager = None
 	runtime_error = None
 	if sys.platform == 'darwin':
@@ -3377,7 +3478,7 @@ if __name__ == "__main__":
 
 	# Run GUI on the main thread (swap queue order: sending from window = receiving from backend)
 	_write_lifecycle_event('starting GUI event loop')
-	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings, runtime_error=runtime_error)
+	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings, runtime_error=runtime_error, control_queue=control_queue, shutdown_event=shutdown_event, log_directory=log_directory)
 	_write_lifecycle_event('GUI event loop returned')
 
 	logger.remove(current_log)

@@ -102,6 +102,24 @@ class ProductionImportTests(unittest.TestCase):
         self.assertIn("run_guarded_feature", source)
         self.assertIn("require_agent_capabilities", source)
 
+    def test_runtime_controls_remain_available_during_client_polling(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertIn("control_task = asyncio.create_task(handle_controls())", source)
+        self.assertIn("while not shutdown_event.is_set()", source)
+        self.assertIn("if walker.clients:", source)
+        self.assertNotIn("foreground_client_list", source)
+
+    def test_questing_restart_and_dead_client_cleanup_preserve_lifecycle_state(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertIn("restart_generation = questing_generation", source)
+        self.assertIn("questing_generation == restart_generation", source)
+        self.assertIn("await asyncio.gather(stalled_task, return_exceptions=True)", source)
+        self.assertIn("Client '{_safe_client_title(c, live=False)}' disconnected.", source)
+        self.assertIn("RESILIENT_TASK_FUNCS", source)
+        self.assertIn("restarted after a transient failure", source)
+
     def test_all_production_modules_import_without_windows_dependencies(self):
         failures = []
         with tempfile.TemporaryDirectory(

@@ -109,6 +109,8 @@ def main() -> int:
         deimos = deimos_module
         deimos.gui_send_queue = queue.Queue()
         deimos.recv_queue = queue.Queue()
+        deimos.control_queue = queue.Queue()
+        deimos.shutdown_event = threading.Event()
 
         print(
             json.dumps(
@@ -157,6 +159,9 @@ def main() -> int:
             deimos.gui_font_size,
             deimos.tool_author,
             settings=deimos.settings,
+            control_queue=deimos.control_queue,
+            shutdown_event=deimos.shutdown_event,
+            log_directory=deimos._startup_log_directory(),
         )
         backend_thread.join(timeout=35)
         if backend_thread.is_alive():
