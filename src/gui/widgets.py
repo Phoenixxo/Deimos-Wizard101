@@ -18,6 +18,7 @@ from PyQt6.QtSvg import QSvgRenderer
 
 from src.gui.commands import _QT_KEY_TO_KEYCODE, _MODIFIER_KEYS, _format_binding
 from src.gui.overlay import OverlayGeometryAdapter
+from src.gui.helpers import guarded_qt_callback
 
 
 class ToggleNameLabel(QLabel):
@@ -311,7 +312,9 @@ class DuelCircleWidget(QWidget):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
-        self._anim_timer.timeout.connect(self._anim_tick)
+        self._anim_timer.timeout.connect(
+            guarded_qt_callback("widgets.animation", self._anim_tick)
+        )
         self._anim_progress = 1.0
         self._anim_start_time = 0.0
         self._anim_duration = 0.6

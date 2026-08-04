@@ -20,7 +20,7 @@ from src.gui.commands import GUICommand, GUICommandType, GUIKeys, _format_bindin
 from src.gui.widgets import AnimatedTabWidget, ConsoleTextEdit, PyQtSink, HighlightOverlay
 from src.gui.helpers import (
     resource_path, centered_label, copy_icon_btn, copy_callback, build_shared_svgs,
-    init_recent_imports,
+    init_recent_imports, guarded_qt_callback,
 )
 from src.gui.actions import ActionRegistry
 from src.gui.theme import compute_styles
@@ -687,7 +687,7 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
             pass
 
     timer = QTimer()
-    timer.timeout.connect(poll_queue)
+    timer.timeout.connect(guarded_qt_callback("main.poll_queue", poll_queue))
     timer.start(16)
 
     window.show()

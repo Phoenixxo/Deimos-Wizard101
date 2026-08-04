@@ -2,7 +2,10 @@ import os
 import sys
 import webbrowser
 import ctypes
+from functools import wraps
 from threading import Thread
+
+from loguru import logger
 
 from PyQt6.QtWidgets import (
     QWidget, QPushButton, QLabel, QGroupBox, QVBoxLayout, QHBoxLayout,
@@ -13,6 +16,26 @@ from PyQt6.QtGui import QPixmap, QIcon, QPainter, QTransform
 from PyQt6.QtSvg import QSvgRenderer
 
 from src.gui.commands import GUICommand, GUICommandType
+
+
+def guarded_qt_callback(name, callback):
+    """Keep exceptions in timer callbacks from aborting the Qt event loop."""
+    failure_reported = False
+
+    @wraps(callback)
+    def guarded(*args, **kwargs):
+        nonlocal failure_reported
+        try:
+            result = callback(*args, **kwargs)
+            failure_reported = False
+            return result
+        except Exception:
+            if not failure_reported:
+                logger.exception("Qt callback failed: {}", name)
+                failure_reported = True
+            return None
+
+    return guarded
 
 
 def resource_path(filename: str) -> str:
@@ -165,7 +188,7 @@ def spinning_loader_widget(ctx, size=22):
         lbl.setPixmap(pm)
     _tick()
     timer = QTimer(lbl)
-    timer.timeout.connect(_tick)
+    timer.timeout.connect(guarded_qt_callback("helpers.spinning_loader", _tick))
     timer.start(120)
     return lbl
 
