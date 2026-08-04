@@ -13,11 +13,33 @@ import os
 import time
 import sys
 import subprocess
+from pathlib import Path
+
+
+def _startup_log_directory() -> Path:
+	if sys.platform == 'darwin':
+		return Path.home() / 'Library' / 'Logs' / 'Deimos'
+	return Path.home() / '.deimos' / 'logs'
+
+
+def _write_startup_exception(exception_type, exception, traceback_object) -> None:
+	try:
+		log_directory = _startup_log_directory()
+		log_directory.mkdir(parents=True, exist_ok=True)
+		with (log_directory / 'startup.log').open('a', encoding='utf-8') as log_file:
+			traceback.print_exception(exception_type, exception, traceback_object, file=log_file)
+	except Exception:
+		pass
+	finally:
+		sys.__excepthook__(exception_type, exception, traceback_object)
+
+
+sys.excepthook = _write_startup_exception
+
 from loguru import logger
 import datetime
 import statistics
 import re
-from pathlib import Path
 # import pypresence
 from pypresence import AioPresence
 from src.command_parser import execute_flythrough, parse_command
@@ -3131,12 +3153,8 @@ if __name__ == "__main__":
 	# Validate configs and update the tool
 	# handle_tool_updating()
 
-	log_directory = Path("logs")
-	try:
-		log_directory.mkdir(parents=True, exist_ok=True)
-	except OSError:
-		log_directory = Path.home() / ".deimos" / "logs"
-		log_directory.mkdir(parents=True, exist_ok=True)
+	log_directory = _startup_log_directory()
+	log_directory.mkdir(parents=True, exist_ok=True)
 	current_log = logger.add(log_directory / f"{tool_name} - {generate_timestamp()}.log", encoding='utf-8', enqueue=True, backtrace=True)
 
 	# Set up GUI queues before starting anything
