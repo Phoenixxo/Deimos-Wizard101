@@ -208,6 +208,8 @@ def validate_archive_listing(listing: str) -> None:
         for name in members
     ):
         missing.append("deimos_native")
+    if not any(name == "pymem" or name.startswith("pymem.") for name in members):
+        missing.append("pymem")
     if missing:
         raise ArtifactValidationError(
             "Packaged application is missing required artifacts: " + ", ".join(missing)
@@ -217,7 +219,7 @@ def validate_archive_listing(listing: str) -> None:
 def verify_archive(archive: Path, viewer: str) -> None:
     archive = _regular_file(archive, "packaged application archive")
     completed = subprocess.run(
-        [viewer, "-l", str(archive)],
+        [viewer, "-r", "-l", str(archive)],
         check=False,
         capture_output=True,
         text=True,

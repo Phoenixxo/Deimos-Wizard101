@@ -53,6 +53,8 @@ hiddenimports = (
     + collect_submodules('lark')
     + ['wizlaunch', 'deimos_native']
 )
+if sys.platform == 'win32':
+    hiddenimports += collect_submodules('pymem')
 
 datas = [
     ('Deimos-logo.ico', '.'),
