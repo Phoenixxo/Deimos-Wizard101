@@ -65,6 +65,15 @@ class FakeWindowsHost:
         self.calls.append(("message", message, title))
 
 
+class FakeMacOSHost:
+    def __init__(self):
+        self.calls = 0
+
+    def request_input_monitoring_permission(self):
+        self.calls += 1
+        return True
+
+
 class FakeView:
     async def viewport_left(self): return -1.0
     async def viewport_right(self): return 1.0
@@ -211,6 +220,13 @@ class PlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.read_registry_dword("path", "name", 3), 3)
         adapter.write_registry_dword("path", "name", 1)
         adapter.show_error_message("message", "title")
+
+    def test_macos_requests_input_monitoring_permission(self):
+        macos = FakeMacOSHost()
+        adapter = HostPlatformAdapter(platform="darwin", macos_api=macos)
+
+        self.assertTrue(adapter.request_input_monitoring_permission())
+        self.assertEqual(macos.calls, 1)
 
 
 if __name__ == "__main__":

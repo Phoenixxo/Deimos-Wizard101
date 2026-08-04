@@ -86,6 +86,13 @@ class ProductionImportTests(unittest.TestCase):
         self.assertIn("agent_manager.stop", source)
         self.assertIn("wizlaunch.clear_runtime()", source)
 
+    def test_hotkey_permission_failure_does_not_stop_the_backend(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertIn("Global hotkeys are unavailable; Deimos will continue without them", source)
+        self.assertIn("request_input_monitoring_permission()", source)
+        self.assertIn("await enable_hotkeys()", source)
+
     def test_all_production_modules_import_without_windows_dependencies(self):
         failures = []
         with tempfile.TemporaryDirectory(

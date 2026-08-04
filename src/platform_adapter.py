@@ -67,17 +67,37 @@ class WindowsHostApi:
         ctypes.windll.user32.MessageBoxW(None, message, title, 0x10 | 0x1000)
 
 
+class MacOSHostApi:
+    """Small macOS-only bridge for system privacy prompts."""
+
+    def request_input_monitoring_permission(self) -> bool:
+        try:
+            application_services = ctypes.CDLL(
+                "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+            )
+            request_access = application_services.CGRequestListenEventAccess
+            request_access.argtypes = []
+            request_access.restype = ctypes.c_bool
+            return bool(request_access())
+        except (AttributeError, OSError):
+            return False
+
+
 class HostPlatformAdapter:
     def __init__(
         self,
         *,
         platform: str = sys.platform,
         windows_api: Any = None,
+        macos_api: Any = None,
     ):
         self.platform = platform
         self.windows_api = windows_api
+        self.macos_api = macos_api
         if self.platform == "win32" and self.windows_api is None:
             self.windows_api = WindowsHostApi()
+        if self.platform == "darwin" and self.macos_api is None:
+            self.macos_api = MacOSHostApi()
 
     def set_app_user_model_id(self, value: str) -> None:
         if self.windows_api is not None:
@@ -105,6 +125,11 @@ class HostPlatformAdapter:
     def show_error_message(self, message: str, title: str) -> None:
         if self.windows_api is not None:
             self.windows_api.show_error_message(message, title)
+
+    def request_input_monitoring_permission(self) -> bool:
+        if self.macos_api is None:
+            return False
+        return bool(self.macos_api.request_input_monitoring_permission())
 
 
 host_platform = HostPlatformAdapter()

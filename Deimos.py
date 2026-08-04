@@ -2976,11 +2976,19 @@ async def main(agent_manager: Any = None):
 	# Register kill_tool hotkey (always bound, separate from enable/disable cycle)
 	_kill_binding = settings.get_hotkeys().get("kill_tool")
 	if _kill_binding:
-		_kill_mods = ModifierKeys.NOREPEAT
-		for _m in _kill_binding.get("modifiers", []):
-			_kill_mods |= ModifierKeys[_m]
-		await listener.add_hotkey(Keycode[_kill_binding["key"]], kill_tool_hotkey, modifiers=_kill_mods)
-		_active_bindings["kill_tool"] = _kill_binding
+		try:
+			_kill_mods = ModifierKeys.NOREPEAT
+			for _m in _kill_binding.get("modifiers", []):
+				_kill_mods |= ModifierKeys[_m]
+			await listener.add_hotkey(Keycode[_kill_binding["key"]], kill_tool_hotkey, modifiers=_kill_mods)
+			_active_bindings["kill_tool"] = _kill_binding
+		except Exception as error:
+			if getattr(error, 'code', None) == 'hotkey_permission_required':
+				host_platform.request_input_monitoring_permission()
+			logger.warning(
+				'Global hotkeys are unavailable; Deimos will continue without them: {}',
+				error,
+			)
 	await enable_hotkeys()
 	logger.debug('Hotkeys ready!')
 	tool_status = True
