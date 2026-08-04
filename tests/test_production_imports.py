@@ -79,6 +79,13 @@ class ProductionImportTests(unittest.TestCase):
         )
         self.assertIn("enqueue=True", source)
 
+    def test_gui_close_uses_graceful_agent_cleanup(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("os._exit(0)", source)
+        self.assertIn("agent_manager.stop", source)
+        self.assertIn("wizlaunch.clear_runtime()", source)
+
     def test_all_production_modules_import_without_windows_dependencies(self):
         failures = []
         with tempfile.TemporaryDirectory(

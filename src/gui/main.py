@@ -9,7 +9,7 @@ from loguru import logger
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QLineEdit, QTextEdit,
-    QPlainTextEdit, QComboBox, QFrame, QDialog,
+    QPlainTextEdit, QComboBox, QFrame, QDialog, QMessageBox,
 )
 from PyQt6.QtCore import QTimer, Qt, QSize
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QPainter
@@ -40,7 +40,7 @@ class GUIContext:
     pass
 
 
-def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None):
+def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None):
     tl = load_lang(langcode)
 
     try:
@@ -691,6 +691,13 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     timer.start(16)
 
     window.show()
+    if runtime_error:
+        QMessageBox.warning(
+            window,
+            "Wizard101 runtime unavailable",
+            f"Deimos could not start the configured CrossOver helper agent.\n\n{runtime_error}\n\n"
+            "Update the macOS Wizard101 settings and restart Deimos.",
+        )
     # Lock width to the tab bar width + content margins
     tab_bar_width = tabs.tabBar().sizeHint().width()
     margins = content_layout.contentsMargins()

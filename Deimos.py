@@ -1907,14 +1907,10 @@ async def main(agent_manager: Any = None):
 					com = recv_queue.get_nowait()
 					match com.com_type:
 						case deimosgui.GUICommandType.Close:
-							if len(walker.clients) != 0:
-								raise deimosgui.ToolClosedException
-							_write_lifecycle_event('backend received close with no active clients')
-							os._exit(0) # "Fuck you, you're getting terminated homeboy" - Slack
+							_write_lifecycle_event('backend received close request')
+							raise deimosgui.ToolClosedException
 						case deimosgui.GUICommandType.AttemptedClose:
-							if not walker.clients:
-								_write_lifecycle_event('backend received attempted close with no active clients')
-								os._exit(0)
+							_write_lifecycle_event('backend received attempted close request')
 							raise deimosgui.ToolClosedException
 						case deimosgui.GUICommandType.ToggleOption:
 							if not walker.clients:
@@ -3115,6 +3111,13 @@ async def main(agent_manager: Any = None):
 				task.cancel()
 
 		await tool_finish()
+		if agent_manager is not None:
+			try:
+				await asyncio.to_thread(agent_manager.stop, 'Deimos desktop closed')
+			except Exception as error:
+				logger.warning(f'Could not stop the CrossOver helper agent cleanly: {error}')
+			finally:
+				wizlaunch.clear_runtime()
 		# Signal GUI thread that unhooking is done so it can exit cleanly
 		try:
 			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.Close))
@@ -3180,14 +3183,26 @@ if __name__ == "__main__":
 	# Set up GUI queues before starting anything
 	gui_send_queue = queue.Queue()
 	recv_queue = queue.Queue()
+	agent_manager = None
+	runtime_error = None
+	if sys.platform == 'darwin':
+		try:
+			import deimos_native
+			from src.macos_runtime import start_configured_agent
+			agent_manager = start_configured_agent(settings, native_module=deimos_native)
+			if agent_manager is not None:
+				_write_lifecycle_event('started configured CrossOver helper agent')
+		except Exception as error:
+			runtime_error = str(error)
+			logger.warning(f'Could not start the configured CrossOver helper agent: {runtime_error}')
 
 	# Run async backend in a background thread so the GUI can run on the main thread (required by Qt)
-	backend_thread = threading.Thread(target=lambda: asyncio.run(main()), daemon=True)
+	backend_thread = threading.Thread(target=lambda: asyncio.run(main(agent_manager)), daemon=True)
 	backend_thread.start()
 
 	# Run GUI on the main thread (swap queue order: sending from window = receiving from backend)
 	_write_lifecycle_event('starting GUI event loop')
-	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings)
+	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings, runtime_error=runtime_error)
 	_write_lifecycle_event('GUI event loop returned')
 
 	logger.remove(current_log)

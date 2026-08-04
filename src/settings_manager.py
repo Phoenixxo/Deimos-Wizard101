@@ -44,9 +44,13 @@ DEFAULT_SETTINGS = {
     "discard_duplicate_cards": True,
     # [launcher]
     "remember_chosen_clients": False,
+    # [macOS launcher]
+    "macos_cx_root": "",
+    "macos_bottle": "",
+    "macos_bottle_name": "wizard101",
 }
 
-RESTART_REQUIRED_KEYS = {"locale"}
+RESTART_REQUIRED_KEYS = {"locale", "macos_cx_root", "macos_bottle", "macos_bottle_name"}
 
 # Maps ini section+key -> DEFAULT_SETTINGS key with type coercion
 _INI_SETTINGS_MAP = {

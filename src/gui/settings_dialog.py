@@ -1,5 +1,6 @@
 import os
 import glob
+import sys
 
 import shutil
 
@@ -346,6 +347,38 @@ def show_settings_dialog(ctx):
     launcher_form.setSpacing(4)
 
     _add_checkbox(launcher_form, 'remember_chosen_clients', 'setting_remember_chosen_clients')
+
+    if sys.platform == 'darwin':
+        from src.macos_runtime import DEFAULT_BOTTLE, DEFAULT_CX_ROOT
+
+        macos_group = QGroupBox('macOS Wizard101')
+        macos_form = QFormLayout(macos_group)
+        macos_form.setSpacing(4)
+
+        def _add_directory_setting(key, label, default):
+            field = QLineEdit(str(current.get(key) or default))
+            field.setReadOnly(True)
+            browse = QPushButton('...')
+            browse.setFixedWidth(28)
+
+            def _choose():
+                path = QFileDialog.getExistingDirectory(dialog, label, field.text())
+                if path:
+                    field.setText(os.path.normpath(path))
+
+            browse.clicked.connect(_choose)
+            row = QHBoxLayout()
+            row.addWidget(field, 1)
+            row.addWidget(browse)
+            macos_form.addRow(label, row)
+            widgets[key] = field
+
+        _add_directory_setting('macos_cx_root', 'CrossOver runtime folder', DEFAULT_CX_ROOT)
+        _add_directory_setting('macos_bottle', 'Wizard101 bottle folder', DEFAULT_BOTTLE)
+        bottle_name = QLineEdit(str(current.get('macos_bottle_name', 'wizard101')))
+        macos_form.addRow('Bottle name', bottle_name)
+        widgets['macos_bottle_name'] = bottle_name
+        layout.addWidget(macos_group)
 
     layout.addWidget(launcher_group)
 
