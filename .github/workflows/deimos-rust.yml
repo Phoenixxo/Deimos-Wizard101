@@ -11,8 +11,11 @@ on:
       - "libs/wizlaunch/**"
       - "src/gui/**"
       - "Deimos.py"
+      - "Deimos.spec"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
+      - "scripts/package_artifacts.py"
+      - "scripts/prepare-windows-package.ps1"
       - "scripts/test-deimos-native-live.py"
       - "scripts/test-deimos-launch-live.py"
       - "scripts/test-deimos-telemetry-live.py"
@@ -23,6 +26,9 @@ on:
       - "tests/telemetry/**"
       - "tests/host_integration/**"
       - "tests/launch/**"
+      - "tests/packaging/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/deimos-rust.yml"
   pull_request:
     paths:
@@ -33,8 +39,11 @@ on:
       - "libs/wizlaunch/**"
       - "src/gui/**"
       - "Deimos.py"
+      - "Deimos.spec"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
+      - "scripts/package_artifacts.py"
+      - "scripts/prepare-windows-package.ps1"
       - "scripts/test-deimos-native-live.py"
       - "scripts/test-deimos-launch-live.py"
       - "scripts/test-deimos-telemetry-live.py"
@@ -45,6 +54,9 @@ on:
       - "tests/telemetry/**"
       - "tests/host_integration/**"
       - "tests/launch/**"
+      - "tests/packaging/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/deimos-rust.yml"
 
 env:
@@ -85,12 +97,16 @@ jobs:
       - name: Check live Python acceptance script
         run: >-
           python -m py_compile
+          scripts/package_artifacts.py
           scripts/test-deimos-native-live.py
           scripts/test-deimos-launch-live.py
           scripts/test-deimos-telemetry-live.py
           scripts/test-deimos-window-input-live.py
           scripts/test-deimos-app-live.py
           scripts/probe-deimos-movement-selectors-live.py
+
+      - name: Run packaging contract tests
+        run: python -m unittest discover -s tests/packaging -p "test_*.py" -v
 
       - name: Run portable WizWalker tests
         run: |
@@ -110,7 +126,55 @@ jobs:
           PYO3_PYTHON: python
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  native-builds:
+  windows-agent:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Wine-compatible Rust
+        uses: dtolnay/rust-toolchain@1.77.2
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build and validate Wine agent
+        shell: pwsh
+        run: |
+          ./scripts/build-wine-agent.ps1 -TargetDirectory target/package-agent
+          $artifactDirectory = Join-Path $PWD "package-agent"
+          New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+          $agent = Join-Path $PWD "target/package-agent/x86_64-pc-windows-msvc/release/deimos-agent.exe"
+          $packagedAgent = Join-Path $artifactDirectory "deimos-agent.exe"
+          $manifest = Join-Path $artifactDirectory "deimos-agent.json"
+          Copy-Item -LiteralPath $agent -Destination $packagedAgent
+          python scripts/package_artifacts.py create-manifest `
+            --agent $packagedAgent `
+            --output $manifest `
+            --expected-build-id $env:DEIMOS_BUILD_ID
+
+      - name: Run deterministic memory fixture integration test
+        run: >-
+          rustup run 1.77.2-x86_64-pc-windows-msvc cargo test
+          --locked
+          --package deimos-memory-fixture
+          --test windows_lifecycle
+          --target x86_64-pc-windows-msvc
+
+      - name: Upload matching Wine agent
+        uses: actions/upload-artifact@v4
+        with:
+          name: deimos-agent-${{ github.sha }}
+          path: package-agent
+          if-no-files-found: error
+
+  native-packages:
+    needs: windows-agent
     strategy:
       fail-fast: false
       matrix:
@@ -147,83 +211,125 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build and smoke test independent wizlaunch package
-        run: |
-          python -m pip install --disable-pip-version-check "maturin>=1.0,<2.0"
-          python -m pip install --disable-pip-version-check ./libs/wizlaunch
-          python -c "import wizlaunch; assert wizlaunch.__version__ == '0.2.0'; assert callable(wizlaunch.launch_instance)"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Install Python compatibility test dependencies
-        run: |
-          python -m pip install --disable-pip-version-check -e ./libs/wizwalker -e ./libs/wizsprinter
-          python -m pip install --disable-pip-version-check "PyQt6>=6.6.0" "pyperclip>=1.9.0" "pyyaml>=6.0.1" "requests>=2.32.3"
+      - name: Install package dependencies from a clean environment
+        run: uv sync --frozen --group dev
+
+      - name: Verify Apple Silicon runner
+        if: runner.os == 'macOS'
+        run: >-
+          uv run python -c
+          "import platform; machine = platform.machine(); assert machine == 'arm64', f'expected Apple Silicon, got {machine}'"
+
+      - name: Smoke test independent wizlaunch package
+        run: >-
+          uv run python -c
+          "import wizlaunch; assert wizlaunch.__version__ == '0.2.0'; assert callable(wizlaunch.launch_instance)"
 
       - name: Smoke test Windows WizWalker import
         if: runner.os == 'Windows'
         run: >-
-          python -c "import wizwalker; from wizwalker import ClientHandler, DiscoveredClient, Orient, Rectangle, XYZ; assert ClientHandler and DiscoveredClient and Orient and Rectangle and XYZ"
+          uv run python -c "import wizwalker; from wizwalker import ClientHandler, DiscoveredClient, Orient, Rectangle, XYZ; assert ClientHandler and DiscoveredClient and Orient and Rectangle and XYZ"
 
-      - name: Build workspace
+      - name: Build native Python extension
         env:
-          PYO3_PYTHON: python
-        run: rustup run ${{ matrix.toolchain }} cargo build --locked --workspace --release --target ${{ matrix.target }} --features deimos-native/extension-module
-
-      - name: Smoke test Windows Python extension import
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $suffix = (& python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))").Trim()
-          $source = "./target/${{ matrix.target }}/release/deimos_native.dll"
-          $destination = Join-Path $env:RUNNER_TEMP "deimos_native$suffix"
-          Copy-Item -LiteralPath $source -Destination $destination
-          $env:PYTHONPATH = $env:RUNNER_TEMP
-          python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager'); manager = deimos_native.HostHotkeyManager(); registration = manager.register_hotkey(0x87, 0x4000); manager.unregister_hotkey(registration)"
-          "PYTHONPATH=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Smoke test macOS Python extension import
-        if: runner.os == 'macOS'
+          PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
         shell: bash
         run: |
-          suffix="$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")"
-          cp "./target/${{ matrix.target }}/release/libdeimos_native.dylib" "$RUNNER_TEMP/deimos_native$suffix"
-          PYTHONPATH="$RUNNER_TEMP" python -c "import deimos_native; assert hasattr(deimos_native, 'AgentManager'); assert hasattr(deimos_native, 'HostHotkeyManager')"
-          echo "PYTHONPATH=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            export PYO3_PYTHON="$PWD/.venv/Scripts/python.exe"
+          fi
+          rustup run ${{ matrix.toolchain }} cargo build \
+            --locked \
+            --package deimos-native \
+            --release \
+            --target ${{ matrix.target }} \
+            --features extension-module
 
-      - name: Upload Wine agent
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+      - name: Download matching Wine agent
+        uses: actions/download-artifact@v4
         with:
           name: deimos-agent-${{ github.sha }}
-          path: ./target/${{ matrix.target }}/release/deimos-agent.exe
-          if-no-files-found: error
+          path: package-input
 
-      - name: Upload macOS native extension
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: deimos-native-macos-${{ github.sha }}
-          path: ${{ runner.temp }}/deimos_native*.so
-          if-no-files-found: error
+      - name: Stage and verify native package inputs
+        shell: bash
+        run: |
+          suffix="$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source="target/${{ matrix.target }}/release/deimos_native.dll"
+          else
+            source="target/${{ matrix.target }}/release/libdeimos_native.dylib"
+          fi
+          native="$PWD/package-input/deimos_native$suffix"
+          cp "$source" "$native"
+          uv run python scripts/package_artifacts.py verify-inputs \
+            --agent "$PWD/package-input/deimos-agent.exe" \
+            --manifest "$PWD/package-input/deimos-agent.json" \
+            --native-module "$native" \
+            --expected-build-id "$DEIMOS_BUILD_ID"
+          package_input="$PWD/package-input"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            native="$(cygpath -w "$native")"
+            package_input="$(cygpath -w "$package_input")"
+          fi
+          echo "DEIMOS_NATIVE_MODULE_PATH=$native" >> "$GITHUB_ENV"
+          echo "DEIMOS_AGENT_ARTIFACT_PATH=$package_input/deimos-agent.exe" >> "$GITHUB_ENV"
+          echo "DEIMOS_AGENT_MANIFEST_PATH=$package_input/deimos-agent.json" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$package_input" >> "$GITHUB_ENV"
+
+      - name: Smoke test native Python extension import
+        shell: bash
+        run: |
+          uv run python -c "import deimos_native; identity = deimos_native.build_identity(); assert identity['build_id'] == '$DEIMOS_BUILD_ID'; assert hasattr(deimos_native, 'AgentManager'); assert hasattr(deimos_native, 'HostHotkeyManager')"
 
       - name: Run WizWalker compatibility tests
         shell: bash
         env:
           DEIMOS_TEST_REAL_NATIVE: "1"
         run: |
-          python -m unittest discover -s tests/client_discovery -p "test_*.py" -v
-          python -m unittest discover -s tests/memory_adapter -p "test_*.py" -v
-          python -m unittest discover -s tests/hooks -p "test_*.py" -v
-          python -m unittest discover -s tests/telemetry -p "test_*.py" -v
-          python -m unittest discover -s tests/host_integration -p "test_*.py" -v
-          python -m unittest discover -s tests/launch -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/client_discovery -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/memory_adapter -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/hooks -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/telemetry -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/host_integration -p "test_*.py" -v
+          uv run python -m unittest discover -s tests/launch -p "test_*.py" -v
 
-      - name: Reject unsupported Wine agent imports
+      - name: Build clean PyInstaller package
+        run: uv run pyinstaller --noconfirm --clean Deimos.spec
+
+      - name: Verify Windows package contents
         if: runner.os == 'Windows'
-        shell: pwsh
         run: >-
-          ./scripts/check-wine-agent-imports.ps1
-          -AgentPath ./target/${{ matrix.target }}/release/deimos-agent.exe
+          uv run python scripts/package_artifacts.py verify-archive
+          --archive dist/Deimos.exe
 
-      - name: Run deterministic memory fixture integration test
+      - name: Verify macOS package contents
+        if: runner.os == 'macOS'
+        run: |
+          uv run python scripts/package_artifacts.py verify-app-bundle --app dist/Deimos.app
+          codesign --verify --deep --strict --verbose=2 dist/Deimos.app
+
+      - name: Archive Apple Silicon application
+        if: runner.os == 'macOS'
+        run: >-
+          ditto -c -k --sequesterRsrc --keepParent
+          dist/Deimos.app dist/Deimos-macOS-arm64-${{ github.sha }}.zip
+
+      - name: Upload Windows application
         if: runner.os == 'Windows'
-        run: rustup run ${{ matrix.toolchain }} cargo test --locked --package deimos-memory-fixture --test windows_lifecycle --target ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Deimos-Windows-${{ github.sha }}
+          path: dist/Deimos.exe
+          if-no-files-found: error
+
+      - name: Upload Apple Silicon application
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Deimos-macOS-arm64-${{ github.sha }}
+          path: dist/Deimos-macOS-arm64-${{ github.sha }}.zip
+          if-no-files-found: error

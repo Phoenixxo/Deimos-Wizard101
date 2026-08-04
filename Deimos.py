@@ -17,6 +17,7 @@ from loguru import logger
 import datetime
 import statistics
 import re
+from pathlib import Path
 # import pypresence
 from pypresence import AioPresence
 from src.command_parser import execute_flythrough, parse_command
@@ -157,7 +158,9 @@ automatic_team_based_combat = _json_settings.get('automatic_team_based_combat', 
 discard_duplicate_cards = _json_settings.get('discard_duplicate_cards', discard_duplicate_cards)
 
 while True:
-	if hasattr(sys, '_MEIPASS'):
+	if hasattr(sys, '_MEIPASS') and not (
+		sys.platform == 'darwin' and getattr(sys, 'frozen', False)
+	):
 		folder_path = os.path.join(sys._MEIPASS, 'wizwalker/extensions/wizsprinter/traversalData')
 		if not os.path.exists(folder_path):
 			os.makedirs(folder_path)
@@ -3128,7 +3131,13 @@ if __name__ == "__main__":
 	# Validate configs and update the tool
 	# handle_tool_updating()
 
-	current_log = logger.add(f"logs/{tool_name} - {generate_timestamp()}.log", encoding='utf-8', enqueue=True, backtrace=True)
+	log_directory = Path("logs")
+	try:
+		log_directory.mkdir(parents=True, exist_ok=True)
+	except OSError:
+		log_directory = Path.home() / ".deimos" / "logs"
+		log_directory.mkdir(parents=True, exist_ok=True)
+	current_log = logger.add(log_directory / f"{tool_name} - {generate_timestamp()}.log", encoding='utf-8', enqueue=True, backtrace=True)
 
 	# Set up GUI queues before starting anything
 	gui_send_queue = queue.Queue()

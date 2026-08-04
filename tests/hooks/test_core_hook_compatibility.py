@@ -317,7 +317,7 @@ class DiscoveredClientHookRaceTests(unittest.IsolatedAsyncioTestCase):
         changed = descriptor("client-a", 448)
         changed["process"]["identity"]["creation_time_100ns"] = "9999"
         client._update(changed)
-        await asyncio.sleep(0)
+        await client.close()
 
         self.assertIsNone(client.hook_handler)
         self.assertIsNone(client._hook_session_id)

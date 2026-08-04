@@ -7,6 +7,18 @@ use std::net::TcpListener;
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
+    if artifact_identity_requested(&args) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "component": "deimos-agent",
+                "version": env!("CARGO_PKG_VERSION"),
+                "build_id": deimos_core::BUILD_ID,
+            })
+        );
+        return;
+    }
     if let Some(token) = managed_token(&args) {
         let _instance_guard = AgentInstanceGuard::acquire().unwrap_or_else(|error| {
             exit_with_error(&format!("failed to acquire agent instance: {error}"))
@@ -61,6 +73,10 @@ fn main() {
     }
 }
 
+fn artifact_identity_requested(args: &[String]) -> bool {
+    args.len() == 2 && args[1] == "--artifact-identity"
+}
+
 fn argument_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
@@ -110,7 +126,20 @@ fn exit_with_error(message: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{argument_value, normalize_stdin_token};
+    use super::{argument_value, artifact_identity_requested, normalize_stdin_token};
+
+    #[test]
+    fn artifact_identity_is_an_explicit_standalone_request() {
+        assert!(artifact_identity_requested(&[
+            "deimos-agent".to_string(),
+            "--artifact-identity".to_string(),
+        ]));
+        assert!(!artifact_identity_requested(&[
+            "deimos-agent".to_string(),
+            "--artifact-identity".to_string(),
+            "extra".to_string(),
+        ]));
+    }
 
     #[test]
     fn managed_token_argument_remains_backward_compatible() {
