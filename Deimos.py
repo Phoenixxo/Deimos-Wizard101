@@ -1,5 +1,6 @@
 import asyncio
 import traceback
+import datetime
 import requests
 import queue
 import threading
@@ -34,10 +35,19 @@ def _write_startup_exception(exception_type, exception, traceback_object) -> Non
 		sys.__excepthook__(exception_type, exception, traceback_object)
 
 
+def _write_lifecycle_event(event: str) -> None:
+	try:
+		log_directory = _startup_log_directory()
+		log_directory.mkdir(parents=True, exist_ok=True)
+		with (log_directory / 'lifecycle.log').open('a', encoding='utf-8') as log_file:
+			log_file.write(f'{datetime.datetime.now().isoformat()} pid={os.getpid()} {event}\n')
+	except Exception:
+		pass
+
+
 sys.excepthook = _write_startup_exception
 
 from loguru import logger
-import datetime
 import statistics
 import re
 # import pypresence
@@ -1892,9 +1902,11 @@ async def main(agent_manager: Any = None):
 						case deimosgui.GUICommandType.Close:
 							if len(walker.clients) != 0:
 								raise deimosgui.ToolClosedException
+							_write_lifecycle_event('backend received close with no active clients')
 							os._exit(0) # "Fuck you, you're getting terminated homeboy" - Slack
 						case deimosgui.GUICommandType.AttemptedClose:
 							if not walker.clients:
+								_write_lifecycle_event('backend received attempted close with no active clients')
 								os._exit(0)
 							raise deimosgui.ToolClosedException
 						case deimosgui.GUICommandType.ToggleOption:
@@ -3153,6 +3165,7 @@ if __name__ == "__main__":
 	# Validate configs and update the tool
 	# handle_tool_updating()
 
+	_write_lifecycle_event('application entrypoint reached')
 	log_directory = _startup_log_directory()
 	log_directory.mkdir(parents=True, exist_ok=True)
 	current_log = logger.add(log_directory / f"{tool_name} - {generate_timestamp()}.log", encoding='utf-8', enqueue=True, backtrace=True)
@@ -3166,6 +3179,8 @@ if __name__ == "__main__":
 	backend_thread.start()
 
 	# Run GUI on the main thread (swap queue order: sending from window = receiving from backend)
+	_write_lifecycle_event('starting GUI event loop')
 	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings)
+	_write_lifecycle_event('GUI event loop returned')
 
 	logger.remove(current_log)

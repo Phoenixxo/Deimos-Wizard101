@@ -122,6 +122,9 @@ if sys.platform == 'darwin':
         name='Deimos.app',
         icon='Deimos-logo.ico',
         bundle_identifier='io.github.deimos-wizard101',
+        info_plist={
+            'LSMultipleInstancesProhibited': True,
+        },
     )
 else:
     exe = EXE(
