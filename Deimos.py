@@ -2451,7 +2451,8 @@ async def main(agent_manager: Any = None):
 							nicknames, game_path = com.data
 							if not game_path:
 								if agent_manager is not None:
-									game_path = r"C:\ProgramData\KingsIsle Entertainment\Wizard101"
+									from src.macos_runtime import configured_game_path
+									game_path = configured_game_path(settings)
 								else:
 									game_path = str(utils.get_wiz_install())
 							else:
@@ -2622,7 +2623,11 @@ async def main(agent_manager: Any = None):
 							_send_hooked_clients_update()
 							# Relaunch via wizlaunch (credentials stay in Rust)
 							try:
-								game_path = str(utils.get_wiz_install())
+								if agent_manager is not None:
+									from src.macos_runtime import configured_game_path
+									game_path = configured_game_path(settings)
+								else:
+									game_path = str(utils.get_wiz_install())
 								await asyncio.sleep(1)
 								new_handle = await asyncio.to_thread(wizlaunch.launch_instance, nickname, game_path)
 								launched_account_map[new_handle] = nickname

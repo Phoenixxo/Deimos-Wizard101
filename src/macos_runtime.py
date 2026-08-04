@@ -23,6 +23,17 @@ DEFAULT_BOTTLE = (
     / "Bottles"
     / "wizard101"
 )
+DEFAULT_GAME_PATH = r"C:\ProgramData\KingsIsle Entertainment\Wizard101"
+_GAME_INSTALLATIONS = (
+    (
+        Path("ProgramData/KingsIsle Entertainment/Wizard101"),
+        DEFAULT_GAME_PATH,
+    ),
+    (
+        Path("Program Files (x86)/Steam/steamapps/common/Wizard101"),
+        r"C:\Program Files (x86)\Steam\steamapps\common\Wizard101",
+    ),
+)
 
 
 class MacOSRuntimeConfigurationError(RuntimeError):
@@ -36,18 +47,33 @@ def bundled_agent_path() -> Path:
     return base / "deimos-agent.exe"
 
 
+def configured_bottle(settings: Any) -> Path:
+    value = settings.get_setting("macos_bottle")
+    return Path(value).expanduser() if value else DEFAULT_BOTTLE
+
+
+def configured_game_path(settings: Any) -> str:
+    saved_path = settings.get_setting("game_path")
+    if saved_path:
+        return str(saved_path)
+
+    bottle = configured_bottle(settings)
+    for relative_path, windows_path in _GAME_INSTALLATIONS:
+        executable = bottle / "drive_c" / relative_path / "Bin" / "WizardGraphicalClient.exe"
+        if executable.is_file():
+            return windows_path
+    return DEFAULT_GAME_PATH
+
+
 def configured_agent_manager(settings: Any, *, native_module: Any) -> Any | None:
-    """Create the configured CrossOver manager, or leave macOS discovery disabled."""
+    """Create a CrossOver manager from an override or the standard installation."""
     if sys.platform != "darwin":
         return None
 
     cx_root_value = settings.get_setting("macos_cx_root")
     bottle_value = settings.get_setting("macos_bottle")
-    if not cx_root_value or not bottle_value:
-        return None
-
-    cx_root = Path(cx_root_value).expanduser()
-    bottle = Path(bottle_value).expanduser()
+    cx_root = Path(cx_root_value).expanduser() if cx_root_value else DEFAULT_CX_ROOT
+    bottle = configured_bottle(settings)
     bottle_name = settings.get_setting("macos_bottle_name") or bottle.name
     wine = cx_root / "bin" / "wine"
     wineserver = cx_root / "bin" / "wineserver"
@@ -61,6 +87,8 @@ def configured_agent_manager(settings: Any, *, native_module: Any) -> Any | None
     ]
     for path, label in missing:
         if not path.exists():
+            if not cx_root_value and not bottle_value:
+                return None
             raise MacOSRuntimeConfigurationError(f"{label} was not found at {path}")
 
     return native_module.AgentManager(

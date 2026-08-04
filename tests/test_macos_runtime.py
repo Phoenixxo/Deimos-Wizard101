@@ -24,6 +24,60 @@ class MacOSRuntimeTests(unittest.TestCase):
                 macos_runtime.configured_agent_manager(settings, native_module=SimpleNamespace())
             )
 
+    def test_standard_crossover_install_is_used_without_saved_settings(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cx_root = root / "wizard101"
+            bottle = root / "bottle"
+            (cx_root / "bin").mkdir(parents=True)
+            bottle.mkdir()
+            (cx_root / "bin" / "wine").touch()
+            (cx_root / "bin" / "wineserver").touch()
+            agent = root / "deimos-agent.exe"
+            agent.touch()
+            calls = []
+
+            class Manager:
+                def __init__(self, *args, **kwargs):
+                    calls.append((args, kwargs))
+
+            settings = _Settings({"macos_cx_root": "", "macos_bottle": ""})
+            with (
+                patch.object(macos_runtime.sys, "platform", "darwin"),
+                patch.object(macos_runtime, "DEFAULT_CX_ROOT", cx_root),
+                patch.object(macos_runtime, "DEFAULT_BOTTLE", bottle),
+                patch.object(macos_runtime, "bundled_agent_path", return_value=agent),
+            ):
+                manager = macos_runtime.configured_agent_manager(
+                    settings, native_module=SimpleNamespace(AgentManager=Manager)
+                )
+
+            self.assertIsInstance(manager, Manager)
+            self.assertEqual(calls[0][0][0], str(bottle.resolve()))
+
+    def test_game_path_is_discovered_inside_the_selected_bottle(self):
+        with TemporaryDirectory() as directory:
+            bottle = Path(directory)
+            executable = (
+                bottle
+                / "drive_c"
+                / "Program Files (x86)"
+                / "Steam"
+                / "steamapps"
+                / "common"
+                / "Wizard101"
+                / "Bin"
+                / "WizardGraphicalClient.exe"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+
+            settings = _Settings({"macos_bottle": str(bottle), "game_path": ""})
+            self.assertEqual(
+                macos_runtime.configured_game_path(settings),
+                r"C:\Program Files (x86)\Steam\steamapps\common\Wizard101",
+            )
+
     def test_configured_runtime_starts_the_packaged_agent(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
