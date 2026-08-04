@@ -70,6 +70,15 @@ importlib.import_module(sys.argv[1])
 
 
 class ProductionImportTests(unittest.TestCase):
+    def test_frozen_entrypoint_bootstraps_multiprocessing_before_queued_logging(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertLess(
+            source.index("multiprocessing.freeze_support()"),
+            source.index("from loguru import logger"),
+        )
+        self.assertIn("enqueue=True", source)
+
     def test_all_production_modules_import_without_windows_dependencies(self):
         failures = []
         with tempfile.TemporaryDirectory(
