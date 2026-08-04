@@ -3,6 +3,7 @@ import queue
 import re
 import sys
 import time
+from pathlib import Path
 
 from loguru import logger
 
@@ -11,8 +12,8 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QCheckBox, QLineEdit, QTextEdit,
     QPlainTextEdit, QComboBox, QFrame, QDialog, QMessageBox,
 )
-from PyQt6.QtCore import QTimer, Qt, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QPainter
+from PyQt6.QtCore import QTimer, Qt, QSize, QUrl
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QPainter, QDesktopServices
 from PyQt6.QtSvg import QSvgRenderer
 
 from src.lang import load_lang
@@ -33,6 +34,7 @@ from src.gui.tab_dev_utils import build_dev_utils_tab
 from src.gui.tab_stats import build_stats_tab
 from src.gui.tab_actions import build_flythrough_tab, build_bot_tab, build_combat_tab
 from src.platform_adapter import host_platform
+from src.logging_paths import application_log_directory
 
 
 class GUIContext:
@@ -40,8 +42,10 @@ class GUIContext:
     pass
 
 
-def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None):
+def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None, control_queue=None, shutdown_event=None, log_directory=None):
     tl = load_lang(langcode)
+    control_queue = control_queue or send_queue
+    log_directory = Path(log_directory or application_log_directory())
 
     try:
         host_platform.set_app_user_model_id(f"deimos.{tool_name}")
@@ -255,6 +259,7 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     # ==================== GUIContext ====================
     ctx = GUIContext()
     ctx.send_queue = send_queue
+    ctx.control_queue = control_queue
     ctx.widget_tags = widget_tags
     ctx.tl = tl
     ctx.settings = settings
@@ -357,16 +362,16 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     widget_tags['-CONSOLE-'] = console_text
     console_layout.addWidget(console_text, 1)
 
-    _logs_expanded = [False]
+    _logs_expanded = [True]
 
     toggle_expand_btn = QPushButton()
-    toggle_expand_btn.setIcon(_titlebar_svg_icon(svgs['expand'], 32))
+    toggle_expand_btn.setIcon(_titlebar_svg_icon(svgs['collapse'], 32))
     toggle_expand_btn.setFixedSize(40, 40)
     toggle_expand_btn.setStyleSheet(icon_btn_style)
     toggle_expand_btn.setToolTip(tl('collapse_expand_logs'))
     toggle_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    # Track with current SVG for restyle (expand is default state)
-    ctx.tracked_icon_buttons.append((toggle_expand_btn, svgs['expand'], 32))
+    # Track with current SVG for restyle (full messages are shown by default)
+    ctx.tracked_icon_buttons.append((toggle_expand_btn, svgs['collapse'], 32))
 
     console_psg = PyQtSink(console_text)
 
@@ -378,9 +383,20 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
 
     toggle_expand_btn.clicked.connect(_toggle_expand_logs)
 
+    def _open_logs():
+        try:
+            log_directory.mkdir(parents=True, exist_ok=True)
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_directory)))
+            if not opened:
+                raise RuntimeError("the desktop could not open the log directory")
+        except Exception as error:
+            logger.warning("Could not open the Deimos log directory: {}", error)
+            QMessageBox.warning(window, tl('open_logs'), str(error))
+
     console_btn_row = QHBoxLayout()
     console_btn_row.addStretch()
     console_btn_row.addWidget(toggle_expand_btn)
+    console_btn_row.addWidget(registry.action_icon_btn(svgs['folder'], tl('open_logs'), _open_logs))
     console_btn_row.addWidget(registry.action_icon_btn(svgs['copy_logs'], tl('copy_logs'), copy_callback(send_queue, GUIKeys.copy_logs)))
     console_btn_row.addStretch()
     console_layout.addLayout(console_btn_row)
@@ -472,7 +488,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
             event.accept()
             return
         event.ignore()
-        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+        if shutdown_event is not None:
+            shutdown_event.set()
+        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
 
     window.closeEvent = close_event
 
@@ -525,7 +543,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                         return
 
                     case GUICommandType.CloseFromBackend:
-                        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+                        if shutdown_event is not None:
+                            shutdown_event.set()
+                        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
 
                     case GUICommandType.UpdateWindow:
                         tag = com.data[0]
@@ -706,7 +726,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
 
     # After app exits, signal backend
     if not close_accepted[0]:
-        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+        if shutdown_event is not None:
+            shutdown_event.set()
+        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
         timeout = 30
         start = time.time()
         while time.time() - start < timeout:

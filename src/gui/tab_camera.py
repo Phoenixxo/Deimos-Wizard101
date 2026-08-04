@@ -147,7 +147,7 @@ def build_camera_tab(ctx):
     utils_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
     utils_col.addWidget(ctx.registry.styled_btn(ctx.tl('populate_camera'), populate_camera_callback))
     utils_col.addWidget(ctx.registry.styled_btn(ctx.tl('copy_camera_position'), copy_callback(ctx.send_queue, GUIKeys.copy_camera_position)))
-    utils_col.addWidget(ctx.registry.styled_btn(ctx.tl('toggle_camera_collision'), lambda: ctx.send_queue.put(GUICommand(GUICommandType.ToggleOption, GUIKeys.toggle_camera_collision))))
+    utils_col.addWidget(ctx.registry.styled_btn(ctx.tl('toggle_camera_collision'), lambda: ctx.control_queue.put(GUICommand(GUICommandType.ToggleOption, GUIKeys.toggle_camera_collision))))
     right_layout.addLayout(utils_col)
 
     right_layout.addStretch()

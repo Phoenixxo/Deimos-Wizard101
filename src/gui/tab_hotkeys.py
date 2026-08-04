@@ -24,6 +24,7 @@ def build_hotkeys_tab(ctx):
     registry = ctx.registry
     tl = ctx.tl
     send_queue = ctx.send_queue
+    control_queue = ctx.control_queue
     settings = ctx.settings
 
     # Callbacks used by bindable actions
@@ -66,15 +67,15 @@ def build_hotkeys_tab(ctx):
 
     _hk_categories = [
         (tl('cat_toggles'), [
-            ("toggle_speed", tl('speedhack'), toggle_callback(send_queue, GUIKeys.toggle_speedhack), True, tl('speedhack'), _toggle_icons['gauge']),
-            ("toggle_combat", tl('combat_toggle'), toggle_callback(send_queue, GUIKeys.toggle_combat), True, tl('combat_toggle'), _toggle_icons['combat']),
-            ("toggle_dialogue", tl('dialogue'), toggle_callback(send_queue, GUIKeys.toggle_dialogue), True, tl('dialogue'), _toggle_icons['speech']),
+            ("toggle_speed", tl('speedhack'), toggle_callback(control_queue, GUIKeys.toggle_speedhack), True, tl('speedhack'), _toggle_icons['gauge']),
+            ("toggle_combat", tl('combat_toggle'), toggle_callback(control_queue, GUIKeys.toggle_combat), True, tl('combat_toggle'), _toggle_icons['combat']),
+            ("toggle_dialogue", tl('dialogue'), toggle_callback(control_queue, GUIKeys.toggle_dialogue), True, tl('dialogue'), _toggle_icons['speech']),
             ("toggle_dialogue_side_quests", tl('dialogue_side_quests'), dialogue_side_quests_callback, True, 'SideQuestAccept', _toggle_icons['speech']),
-            ("toggle_sigil", tl('sigil'), toggle_callback(send_queue, GUIKeys.toggle_sigil), True, tl('sigil'), _toggle_icons['bot']),
-            ("toggle_questing", tl('questing'), toggle_callback(send_queue, GUIKeys.toggle_questing), True, tl('questing'), _toggle_icons['brain']),
-            ("toggle_auto_pet", tl('auto_pet'), toggle_callback(send_queue, GUIKeys.toggle_auto_pet), True, tl('auto_pet'), _toggle_icons['paw']),
-            ("toggle_auto_potion", tl('auto_potion'), toggle_callback(send_queue, GUIKeys.toggle_auto_potion), True, tl('auto_potion'), _toggle_icons['flask']),
-            ("toggle_freecam", tl('freecam'), toggle_callback(send_queue, GUIKeys.toggle_freecam), True, tl('freecam'), _toggle_icons['cctv']),
+            ("toggle_sigil", tl('sigil'), toggle_callback(control_queue, GUIKeys.toggle_sigil), True, tl('sigil'), _toggle_icons['bot']),
+            ("toggle_questing", tl('questing'), toggle_callback(control_queue, GUIKeys.toggle_questing), True, tl('questing'), _toggle_icons['brain']),
+            ("toggle_auto_pet", tl('auto_pet'), toggle_callback(control_queue, GUIKeys.toggle_auto_pet), True, tl('auto_pet'), _toggle_icons['paw']),
+            ("toggle_auto_potion", tl('auto_potion'), toggle_callback(control_queue, GUIKeys.toggle_auto_potion), True, tl('auto_potion'), _toggle_icons['flask']),
+            ("toggle_freecam", tl('freecam'), toggle_callback(control_queue, GUIKeys.toggle_freecam), True, tl('freecam'), _toggle_icons['cctv']),
         ]),
         (tl('cat_teleports'), [
             ("quest_tp", tl('quest_tp'), teleport_callback(send_queue, GUIKeys.hotkey_quest_tp), False, None, _toggle_icons['goal']),
