@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Hashable
+from typing import Any, Awaitable, Callable, Hashable
 
 
 _RECOVERABLE_LIFECYCLE_CODES = {
@@ -28,6 +29,20 @@ class AutoHookClientNotReady(RuntimeError):
     """A launched client is visible but has not entered a playable character yet."""
 
 
+class FeatureUnavailableError(RuntimeError):
+    """Raised before a feature starts when the selected runtime cannot support it."""
+
+    def __init__(self, feature_name: str, missing_capabilities: set[str]):
+        missing = sorted(missing_capabilities)
+        self.code = "capability_required"
+        self.operation = f"feature.{feature_name.casefold().replace(' ', '_')}"
+        self.details = {"missing_capabilities": missing}
+        super().__init__(
+            f"{feature_name} is not available for this client yet. "
+            f"Missing runtime capabilities: {', '.join(missing)}."
+        )
+
+
 def client_supports_operations(client: Any, *operation_names: str) -> bool:
     """Return whether a client exposes every operation required by a UI action."""
     for operation_name in operation_names:
@@ -40,9 +55,45 @@ def client_supports_operations(client: Any, *operation_names: str) -> bool:
     return True
 
 
+def require_agent_capabilities(
+    manager: Any,
+    feature_name: str,
+    *required_capabilities: str,
+) -> None:
+    """Preserve legacy Windows behavior while gating managed-runtime features."""
+    if manager is None or not required_capabilities:
+        return
+    available = set(manager.capabilities())
+    missing = set(required_capabilities) - available
+    if missing:
+        raise FeatureUnavailableError(feature_name, missing)
+
+
 def task_is_active(task: Any) -> bool:
     """Treat completed tasks as inactive even when they were not cancelled."""
     return task is not None and not task.done()
+
+
+async def run_guarded_feature(
+    operation: Awaitable[Any],
+    *,
+    on_failure: Callable[[BaseException], None],
+    on_finish: Callable[[], Any] | None = None,
+) -> bool:
+    """Contain a feature failure so it cannot terminate shared application tasks."""
+    try:
+        await operation
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        on_failure(error)
+        return False
+    finally:
+        if on_finish is not None:
+            finish_result = on_finish()
+            if inspect.isawaitable(finish_result):
+                await finish_result
 
 
 def require_auto_hook_character_ready(snapshot: Any) -> None:
