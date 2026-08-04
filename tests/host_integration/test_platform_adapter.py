@@ -132,6 +132,61 @@ class PlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(windows.calls, [("size", 1234)])
 
+    def test_legacy_window_title_passes_unicode_buffer_directly(self):
+        received = []
+
+        def get_window_text(window_handle, buffer, max_size):
+            received.append((window_handle, buffer, max_size))
+            buffer.value = "Wizard101"
+            return len(buffer.value)
+
+        adapter = object.__new__(platform_module.LegacyWindowsPlatformAdapter)
+        adapter.platform = "win32"
+        with (
+            patch.object(
+                platform_module,
+                "user32",
+                SimpleNamespace(GetWindowTextW=get_window_text),
+            ),
+            patch.object(platform_module, "kernel32", object()),
+        ):
+            self.assertEqual(adapter.window_title(1234, 100), "Wizard101")
+
+        self.assertEqual((received[0][0], received[0][2]), (1234, 100))
+        self.assertIsInstance(received[0][1], ctypes.Array)
+
+    def test_legacy_process_path_passes_unicode_buffer_directly(self):
+        received = []
+        closed = []
+
+        def get_module_filename(process_handle, module, buffer, max_size):
+            received.append((process_handle, module, buffer, max_size))
+            buffer.value = r"C:\Games\Wizard101\Bin\WizardGraphicalClient.exe"
+            return len(buffer.value)
+
+        kernel32 = SimpleNamespace(
+            OpenProcess=lambda access, inherit, process_id: 4321,
+            CloseHandle=closed.append,
+        )
+        adapter = object.__new__(platform_module.LegacyWindowsPlatformAdapter)
+        adapter.platform = "win32"
+        adapter._psapi = SimpleNamespace(GetModuleFileNameExW=get_module_filename)
+        adapter.process_id = lambda window_handle: 9876
+        with (
+            patch.object(platform_module, "user32", object()),
+            patch.object(platform_module, "kernel32", kernel32),
+        ):
+            path = adapter.process_path(1234)
+
+        self.assertEqual(
+            path,
+            Path(r"C:\Games\Wizard101\Bin\WizardGraphicalClient.exe"),
+        )
+        self.assertEqual((received[0][0], received[0][1]), (4321, None))
+        self.assertEqual(received[0][3], 32768)
+        self.assertIsInstance(received[0][2], ctypes.Array)
+        self.assertEqual(closed, [4321])
+
     def test_invalid_native_client_size_is_rejected(self):
         client = SimpleNamespace(
             overlay_geometry={"width": 0, "height": 600}

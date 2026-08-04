@@ -225,7 +225,7 @@ class LegacyWindowsPlatformAdapter:
     def window_title(self, window_handle: int, max_size: int) -> str:
         self._require_windows()
         title = ctypes.create_unicode_buffer(max_size)
-        user32.GetWindowTextW(window_handle, ctypes.byref(title), max_size)
+        user32.GetWindowTextW(window_handle, title, max_size)
         return title.value
 
     def set_window_title(self, window_handle: int, title: str) -> None:
@@ -259,7 +259,7 @@ class LegacyWindowsPlatformAdapter:
         try:
             path = ctypes.create_unicode_buffer(max_size)
             if self._psapi.GetModuleFileNameExW(
-                process_handle, None, ctypes.byref(path), max_size
+                process_handle, None, path, max_size
             ) == 0:
                 raise OSError(f"Could not read the executable path for process {process_id}")
             return Path(path.value)
