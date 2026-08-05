@@ -103,6 +103,12 @@ impl HookState {
         }
     }
 
+    fn forget_session(&mut self, session_id: &ProcessSessionId) -> usize {
+        self.hooks
+            .remove(session_id)
+            .map_or(0, |records| records.len())
+    }
+
     pub(crate) fn allocation_address(
         &self,
         session_id: &ProcessSessionId,
@@ -940,6 +946,15 @@ pub fn cleanup_session<B: MutationBackend>(
     hooks: &mut HookState,
     session_id: &ProcessSessionId,
 ) -> Result<(), HookApiError> {
+    match sessions.status(backend, session_id) {
+        Err(error) if error.is_process_exited() => {
+            hooks.forget_session(session_id);
+            mutations.forget_session(session_id);
+            return Ok(());
+        }
+        Err(error) => return Err(MutationApiError::Process(error).into()),
+        Ok(_) => {}
+    }
     let keys = hooks
         .hooks
         .get(session_id)
@@ -992,6 +1007,22 @@ pub fn expire_at<B: MutationBackend>(
     let mut failures = Vec::new();
     let mut cleaned = 0;
     for (session_id, key) in &expired {
+        match sessions.status(backend, session_id) {
+            Err(error) if error.is_process_exited() => {
+                cleaned += hooks.forget_session(session_id);
+                mutations.forget_session(session_id);
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "expired hook {key:?} in session {}: {}",
+                    session_id.0,
+                    error.message()
+                ));
+                continue;
+            }
+            Ok(_) => {}
+        }
         match cleanup_one(sessions, backend, mutations, hooks, session_id, key) {
             Ok(()) => cleaned += 1,
             Err(error) => failures.push(format!(
@@ -1516,6 +1547,7 @@ pub(crate) mod tests {
         TargetRestore,
         TrampolineExecuting,
         Free,
+        ProcessExited,
     }
 
     struct Data {
@@ -1576,6 +1608,12 @@ pub(crate) mod tests {
 
         pub(crate) fn feature(failure: Option<Failure>) -> Self {
             let mut primary = Vec::new();
+            for marker in 1..=6 {
+                primary.extend_from_slice(&[
+                    0xb8, marker, 0xd0, 0xc0, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+                    0x90, 0x90, 0xc3,
+                ]);
+            }
             for marker in 1..=5 {
                 primary.extend_from_slice(&[
                     0xb8, marker, 0xd1, 0xc0, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
@@ -1603,6 +1641,14 @@ pub(crate) mod tests {
 
         pub(crate) fn target_protection(&self) -> MemoryProtection {
             self.0.lock().expect("data lock").target_protection
+        }
+
+        fn exit_process(&self) {
+            self.0
+                .lock()
+                .expect("data lock")
+                .failures
+                .push(Failure::ProcessExited);
         }
     }
 
@@ -1653,6 +1699,15 @@ pub(crate) mod tests {
             _handle: &Self::Handle,
             _expected: &ProcessIdentity,
         ) -> Result<(), ProcessBackendError> {
+            if take_failure(
+                &mut self.0.lock().expect("data lock"),
+                Failure::ProcessExited,
+            ) {
+                return Err(ProcessBackendError::new(
+                    ProcessBackendErrorKind::Exited,
+                    "fixture process exited",
+                ));
+            }
             Ok(())
         }
 
@@ -2301,6 +2356,74 @@ pub(crate) mod tests {
         .expect("session cleanup");
         assert_eq!(backend.primary(), before);
         assert_eq!(backend.allocation_count(), 0);
+    }
+
+    #[test]
+    fn exited_process_expiry_discards_remote_ownership_without_retrying_restoration() {
+        let backend = Backend::new(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        let activated_at = Instant::now();
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request(session_id.clone()),
+            activated_at,
+        )
+        .expect("activation");
+        assert_eq!(hooks.tracked_count(&session_id), 1);
+        assert_eq!(mutations.tracked_count(&session_id), 1);
+
+        backend.exit_process();
+        assert_eq!(
+            expire_at(
+                &mut sessions,
+                &backend,
+                &mut mutations,
+                &mut hooks,
+                activated_at + HOOK_LEASE,
+            )
+            .expect("the OS reclaims remote state after process exit"),
+            1
+        );
+
+        assert_eq!(hooks.tracked_count(&session_id), 0);
+        assert_eq!(mutations.tracked_count(&session_id), 0);
+    }
+
+    #[test]
+    fn exited_process_session_cleanup_discards_remote_ownership_without_error() {
+        let backend = Backend::new(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request(session_id.clone()),
+            Instant::now(),
+        )
+        .expect("activation");
+        assert_eq!(hooks.tracked_count(&session_id), 1);
+        assert_eq!(mutations.tracked_count(&session_id), 1);
+
+        backend.exit_process();
+        cleanup_session(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+        )
+        .expect("definitive process exit should make remote cleanup unnecessary");
+
+        assert_eq!(hooks.tracked_count(&session_id), 0);
+        assert_eq!(mutations.tracked_count(&session_id), 0);
     }
 
     #[test]

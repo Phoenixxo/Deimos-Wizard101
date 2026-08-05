@@ -6,16 +6,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use deimos_core::memory::{
-    FeatureActionResponse, FeatureBuddyAddRequest, FeatureChatSendRequest, FeatureHook,
-    FeatureHookDeactivateResponse, FeatureHookExport, FeatureHookExportRequest,
-    FeatureHookExportResponse, FeatureHookRequest, FeatureHookResponse, FeatureHookSessionRequest,
-    FeatureHooksResponse, FeatureMousePositionRequest, FeatureTeleportRequest, HookActivateRequest,
-    HookDeactivateRequest, HookHeartbeatRequest, MemoryReadRequest, MemoryScanRequest,
-    MemoryScanScope, MemoryWriteRequest,
+    CoreHook, CoreHookRequest, FeatureActionResponse, FeatureBuddyAddRequest,
+    FeatureChatSendRequest, FeatureHook, FeatureHookDeactivateResponse, FeatureHookExport,
+    FeatureHookExportRequest, FeatureHookExportResponse, FeatureHookRequest, FeatureHookResponse,
+    FeatureHookSessionRequest, FeatureHooksResponse, FeatureMousePositionRequest,
+    FeatureTeleportRequest, HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest,
+    MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemoryWriteRequest,
 };
 use deimos_core::process::{ModuleDescriptor, ProcessKind, ProcessSessionId};
 use deimos_core::rpc::{RpcError, RpcErrorCode};
 
+use crate::core_hook;
 use crate::hook::{self, HookApiError, HookMetadata, HookPatch, HookState};
 use crate::memory::{self, MemoryApiError};
 use crate::mutation::{self, MutationApiError, MutationState};
@@ -398,6 +399,38 @@ pub fn teleport<B: MutationBackend>(
         )?;
     }
     let object_address = parse_address(&request.object_address)?;
+    if request
+        .position
+        .iter()
+        .any(|coordinate| !coordinate.is_finite())
+    {
+        return Err(FeatureHookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            "teleport coordinates must be finite numbers",
+        ));
+    }
+    let current_client = core_hook::read_base(
+        sessions,
+        backend,
+        hooks,
+        &CoreHookRequest {
+            session_id: request.session_id.clone(),
+            hook: CoreHook::Client,
+        },
+    )?;
+    let current_client_address = parse_address(&current_client.base_address)?;
+    if current_client_address == 0 {
+        return Err(FeatureHookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            "teleport is unavailable while the current client object is loading",
+        ));
+    }
+    if current_client_address != object_address {
+        return Err(FeatureHookApiError::request(
+            RpcErrorCode::InvalidRequest,
+            "the client object changed before teleporting; wait for the zone to finish loading and try again",
+        ));
+    }
     let movement_key = hook_key(FeatureHook::MovementTeleport);
     let first_patch = hooks
         .patch_index(&request.session_id, &movement_key, "movement_forward")
@@ -2222,11 +2255,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use deimos_core::memory::{
-        FeatureBuddyAddRequest, FeatureChatSendRequest, FeatureHook, FeatureHookExport,
-        FeatureHookExportRequest, FeatureHookRequest, FeatureMousePositionRequest,
-        FeatureTeleportRequest,
+        CoreHook, CoreHookRequest, FeatureBuddyAddRequest, FeatureChatSendRequest, FeatureHook,
+        FeatureHookExport, FeatureHookExportRequest, FeatureHookRequest,
+        FeatureMousePositionRequest, FeatureTeleportRequest,
     };
     use deimos_core::process::ModuleDescriptor;
+    use deimos_core::rpc::RpcErrorCode;
 
     use super::{
         activate, add_buddy, build_payload, dance_code, deactivate, movement_code,
@@ -2237,6 +2271,59 @@ mod tests {
     use crate::hook::tests::{registry, Backend, Failure};
     use crate::hook::{self, HookState, HOOK_LEASE};
     use crate::mutation::MutationState;
+
+    fn activate_client_base(
+        sessions: &mut crate::process::ProcessSessionRegistry<crate::hook::tests::Handle>,
+        backend: &Backend,
+        mutations: &mut MutationState<crate::hook::tests::Thread>,
+        hooks: &mut HookState,
+        session_id: &deimos_core::process::ProcessSessionId,
+        address: usize,
+    ) {
+        crate::core_hook::activate(
+            sessions,
+            backend,
+            mutations,
+            hooks,
+            &CoreHookRequest {
+                session_id: session_id.clone(),
+                hook: CoreHook::Client,
+            },
+            Instant::now(),
+        )
+        .expect("client core hook should activate");
+        let allocation = hooks
+            .allocation_address(session_id, "wizwalker.core.client")
+            .expect("client core hook allocation");
+        write_at(
+            sessions,
+            backend,
+            session_id,
+            allocation + 14,
+            (address as u64).to_le_bytes().to_vec(),
+        )
+        .expect("client core hook fixture export should be writable");
+    }
+
+    fn deactivate_client_base(
+        sessions: &mut crate::process::ProcessSessionRegistry<crate::hook::tests::Handle>,
+        backend: &Backend,
+        mutations: &mut MutationState<crate::hook::tests::Thread>,
+        hooks: &mut HookState,
+        session_id: &deimos_core::process::ProcessSessionId,
+    ) {
+        crate::core_hook::deactivate(
+            sessions,
+            backend,
+            mutations,
+            hooks,
+            &CoreHookRequest {
+                session_id: session_id.clone(),
+                hook: CoreHook::Client,
+            },
+        )
+        .expect("client core hook should deactivate");
+    }
 
     const IMAGE_SIZE: usize = 0x1000;
 
@@ -2389,6 +2476,14 @@ mod tests {
             Instant::now(),
         )
         .expect("movement feature should activate");
+        activate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+            0x1234,
+        );
         let before_action = backend.primary();
         teleport(
             &mut sessions,
@@ -2418,10 +2513,135 @@ mod tests {
             &request,
         )
         .expect("movement cleanup should remain retryable");
+        deactivate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+        );
         assert_eq!(backend.primary(), before_activation);
         assert_eq!(
             backend.target_protection(),
             deimos_core::memory::MemoryProtection::ReadOnly
+        );
+    }
+
+    #[test]
+    fn teleport_rejects_a_stale_client_object_before_mutating_action_patches() {
+        let backend = Backend::feature(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        let request = FeatureHookRequest {
+            session_id: session_id.clone(),
+            hook: FeatureHook::MovementTeleport,
+        };
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+            Instant::now(),
+        )
+        .expect("movement feature should activate");
+        activate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+            0x5678,
+        );
+        let before_action = backend.primary();
+
+        let error = teleport(
+            &mut sessions,
+            &backend,
+            &mut hooks,
+            &FeatureTeleportRequest {
+                session_id: session_id.clone(),
+                object_address: "0x1234".to_string(),
+                position: [1.0, 2.0, 3.0],
+                wait_on_inuse: true,
+                wait_timeout_ms: 10,
+                purge_after_timeout: true,
+                purge_timeout_ms: 10,
+            },
+        )
+        .expect_err("a stale client object must fail closed");
+
+        assert_eq!(
+            error.into_rpc_error(1, "feature.teleport").code,
+            RpcErrorCode::InvalidRequest
+        );
+        assert_eq!(backend.primary(), before_action);
+    }
+
+    #[test]
+    fn teleport_rejects_non_finite_coordinates_without_mutating_action_state() {
+        let backend = Backend::feature(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &FeatureHookRequest {
+                session_id: session_id.clone(),
+                hook: FeatureHook::MovementTeleport,
+            },
+            Instant::now(),
+        )
+        .expect("movement feature should activate");
+        activate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+            0x1234,
+        );
+        let helper = super::export_address(
+            &mut sessions,
+            &backend,
+            &hooks,
+            &session_id,
+            FeatureHookExport::TeleportHelper,
+        )
+        .expect("teleport helper export");
+        let helper_before = super::read_at(&mut sessions, &backend, &session_id, helper, 21)
+            .expect("teleport helper state");
+        let patches_before = backend.primary();
+
+        let error = teleport(
+            &mut sessions,
+            &backend,
+            &mut hooks,
+            &FeatureTeleportRequest {
+                session_id: session_id.clone(),
+                object_address: "0x1234".to_string(),
+                position: [f32::NAN, 2.0, 3.0],
+                wait_on_inuse: true,
+                wait_timeout_ms: 10,
+                purge_after_timeout: true,
+                purge_timeout_ms: 10,
+            },
+        )
+        .expect_err("non-finite coordinates must fail closed");
+
+        assert_eq!(
+            error.into_rpc_error(1, "feature.teleport").code,
+            RpcErrorCode::InvalidRequest
+        );
+        assert_eq!(backend.primary(), patches_before);
+        assert_eq!(
+            super::read_at(&mut sessions, &backend, &session_id, helper, 21)
+                .expect("teleport helper state after rejection"),
+            helper_before
         );
     }
 
@@ -2706,6 +2926,14 @@ mod tests {
             },
         )
         .expect("fixture mouse action should complete");
+        activate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+            0x1234,
+        );
         teleport(
             &mut sessions,
             &backend,
@@ -2756,6 +2984,13 @@ mod tests {
             )
             .expect("feature hook should deactivate");
         }
+        deactivate_client_base(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+        );
         assert_eq!(backend.primary(), before);
         assert_eq!(
             backend.target_protection(),

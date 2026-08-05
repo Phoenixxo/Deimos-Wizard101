@@ -55,7 +55,7 @@ impl<T> MutationState<T> {
         self.allocations.get(session_id).map_or(0, BTreeMap::len)
     }
 
-    fn forget_session(&mut self, session_id: &ProcessSessionId) {
+    pub(crate) fn forget_session(&mut self, session_id: &ProcessSessionId) {
         self.allocations.remove(session_id);
         self.threads.remove(session_id);
     }
