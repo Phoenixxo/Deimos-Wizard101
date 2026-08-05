@@ -684,6 +684,7 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         class DiscoveryManager(FakeNativeManager):
             def __init__(self):
                 super().__init__(SparseMemory())
+                self.process_open = True
                 self.snapshots = iter(
                     (
                         [descriptor("client-a", 448)],
@@ -694,10 +695,16 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             def list_clients(self):
                 return {"clients": next(self.snapshots)}
 
+            def process_status(self, session_id):
+                if not self.process_open:
+                    raise FakeProcessError("fixture process closed")
+                return super().process_status(session_id)
+
         manager = DiscoveryManager()
         handler = ClientHandler(agent_manager=manager)
         client = handler.get_new_clients()[0]
         await client.attach_telemetry()
+        manager.process_open = False
 
         self.assertEqual(handler.remove_dead_clients(), [client])
         await handler.close()

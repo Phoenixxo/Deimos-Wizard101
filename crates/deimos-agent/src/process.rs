@@ -234,7 +234,6 @@ fn unsupported_game_process_operation() -> ProcessBackendError {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ClientRegistryKey {
-    native_window_id: u64,
     pid: u32,
     creation_time_100ns: String,
     // Windows executable paths are case-insensitive. Normalizing the path
@@ -244,9 +243,8 @@ struct ClientRegistryKey {
 }
 
 impl ClientRegistryKey {
-    fn new(native_window_id: u64, process_identity: &ProcessIdentity) -> Self {
+    fn new(process_identity: &ProcessIdentity) -> Self {
         Self {
-            native_window_id,
             pid: process_identity.pid,
             creation_time_100ns: process_identity.creation_time_100ns.clone(),
             executable_path: process_identity.executable_path.to_ascii_lowercase(),
@@ -254,8 +252,15 @@ impl ClientRegistryKey {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ClientRegistryEntry {
+    client_id: ClientId,
+    native_window_id: u64,
+    window_active: bool,
+}
+
 pub struct ClientRegistry {
-    clients: HashMap<ClientRegistryKey, ClientId>,
+    clients: HashMap<ClientRegistryKey, ClientRegistryEntry>,
     id_prefix: String,
     next_client: u64,
 }
@@ -289,6 +294,16 @@ impl ClientRegistry {
             .map(|(identity, process)| (process.pid, (identity, process)))
             .collect::<HashMap<_, _>>();
 
+        self.clients.retain(|key, entry| {
+            entry.window_active = false;
+            processes.get(&key.pid).is_some_and(|(identity, _)| {
+                key.creation_time_100ns == identity.creation_time_100ns
+                    && key
+                        .executable_path
+                        .eq_ignore_ascii_case(&identity.executable_path)
+            })
+        });
+
         let mut seen_keys = HashSet::new();
         let mut discovered = Vec::new();
         for (discovery_order, window) in windows.into_iter().enumerate() {
@@ -298,7 +313,7 @@ impl ClientRegistry {
             if !same_process_identity(&window.process_identity, identity) {
                 continue;
             }
-            let key = ClientRegistryKey::new(window.native_window_id, identity);
+            let key = ClientRegistryKey::new(identity);
             // EnumWindows normally reports every top-level window once, but
             // a duplicate backend result must not produce duplicate client
             // descriptors for the same agent-owned identity.
@@ -320,15 +335,20 @@ impl ClientRegistry {
             .map(|(screen_order, (discovery_order, _, _))| (discovery_order, screen_order))
             .collect::<HashMap<_, _>>();
 
-        let mut active = HashMap::new();
         let mut clients = Vec::new();
         for (discovery_order, window, key, process) in discovered {
-            let client_id = self.clients.get(&key).cloned().unwrap_or_else(|| {
-                let id = ClientId(format!("{}-{}", self.id_prefix, self.next_client));
+            let entry = self.clients.entry(key).or_insert_with(|| {
+                let client_id = ClientId(format!("{}-{}", self.id_prefix, self.next_client));
                 self.next_client += 1;
-                id
+                ClientRegistryEntry {
+                    client_id,
+                    native_window_id: window.native_window_id,
+                    window_active: true,
+                }
             });
-            active.insert(key, client_id.clone());
+            entry.native_window_id = window.native_window_id;
+            entry.window_active = true;
+            let client_id = entry.client_id.clone();
             clients.push(ClientDescriptor {
                 client_id,
                 process,
@@ -339,8 +359,6 @@ impl ClientRegistry {
                     .expect("every window has a screen order"),
             });
         }
-        self.clients = active;
-
         Ok(ListClientsResponse { clients })
     }
 
@@ -350,10 +368,10 @@ impl ClientRegistry {
         client_id: &ClientId,
     ) -> Result<ClientWindowTarget, ProcessBackendError> {
         self.list(backend)?;
-        let (key, _) = self
+        let (key, entry) = self
             .clients
             .iter()
-            .find(|(_, active_id)| *active_id == client_id)
+            .find(|(_, entry)| entry.window_active && entry.client_id == *client_id)
             .ok_or_else(|| {
                 ProcessBackendError::new(
                     ProcessBackendErrorKind::NotFound,
@@ -364,7 +382,7 @@ impl ClientRegistry {
                 )
             })?;
         Ok(ClientWindowTarget {
-            native_window_id: key.native_window_id,
+            native_window_id: entry.native_window_id,
             process_identity: ProcessIdentity {
                 pid: key.pid,
                 creation_time_100ns: key.creation_time_100ns.clone(),
@@ -1640,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn client_ids_are_stable_until_the_window_or_process_identity_changes() {
+    fn client_ids_survive_window_replacement_until_process_identity_changes() {
         let backend = MockBackend::new();
         backend.set_windows(vec![ClientWindowCandidate {
             native_window_id: 0xabc,
@@ -1678,6 +1696,23 @@ mod tests {
             .expect("closed window should be pruned")
             .clients
             .is_empty());
+        backend.set_windows(vec![ClientWindowCandidate {
+            native_window_id: 0xdef,
+            pid: 336,
+            process_identity: backend.identity(336),
+            is_foreground: false,
+            left: 100,
+            top: 50,
+        }]);
+        let replaced = registry
+            .list(&backend)
+            .expect("replacement window should list");
+        assert_eq!(first.clients[0].client_id, replaced.clients[0].client_id);
+
+        backend.set_windows(Vec::new());
+        registry
+            .list(&backend)
+            .expect("replacement window should be pruned");
         backend.replace_identity(336);
         backend.set_windows(vec![ClientWindowCandidate {
             native_window_id: 0xabc,

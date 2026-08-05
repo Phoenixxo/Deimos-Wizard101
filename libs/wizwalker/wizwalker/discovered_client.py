@@ -287,6 +287,27 @@ class DiscoveredClient:
         self._schedule_session_close(self._detach_session())
         self._schedule_session_close(self._detach_hook_session())
 
+    def _has_live_process_session(self) -> bool:
+        session_ids = tuple(
+            session_id
+            for session_id in (self._hook_session_id, self._session_id)
+            if session_id is not None
+        )
+        for session_id in session_ids:
+            try:
+                status = self._agent_manager.process_status(session_id)
+            except Exception as error:
+                if getattr(error, "code", None) in {
+                    "process_exited",
+                    "process_not_found",
+                    "session_not_found",
+                }:
+                    continue
+                raise
+            if isinstance(status, dict) and status.get("state") == "open":
+                return True
+        return False
+
     def is_running(self) -> bool:
         return self._running
 

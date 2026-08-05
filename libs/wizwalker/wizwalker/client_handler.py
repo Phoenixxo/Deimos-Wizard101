@@ -193,18 +193,54 @@ class ClientHandler:
             or isinstance(getattr(client, "client_id", None), str)
         }
 
+        def process_identity(value: Any) -> tuple[Any, Any, Any] | None:
+            process = (
+                value.get("process")
+                if isinstance(value, dict)
+                else getattr(value, "process", None)
+            )
+            identity = process.get("identity") if isinstance(process, dict) else None
+            if not isinstance(identity, dict):
+                return None
+            path = identity.get("executable_path")
+            return (
+                identity.get("pid"),
+                identity.get("creation_time_100ns"),
+                path.casefold() if isinstance(path, str) else path,
+            )
+
+        unmatched_descriptors = {}
+        for descriptor in descriptors:
+            identity = process_identity(descriptor)
+            if (
+                identity is not None
+                and descriptor.get("client_id") not in existing_by_id
+            ):
+                unmatched_descriptors[identity] = descriptor
+        rebound_ids = set()
+
         for client_id, client in existing_by_id.items():
             descriptor = descriptors_by_id.get(client_id)
             if descriptor is None:
-                client._mark_closed()
+                descriptor = unmatched_descriptors.get(process_identity(client))
+            if descriptor is None:
+                if not client._has_live_process_session():
+                    client._mark_closed()
             else:
+                replacement_id = descriptor["client_id"]
+                if replacement_id != client_id:
+                    self._managed_client_ids = [
+                        replacement_id if managed_id == client_id else managed_id
+                        for managed_id in self._managed_client_ids
+                    ]
                 client._update(descriptor)
+                rebound_ids.add(replacement_id)
 
         new_clients = []
         if add_new:
             for descriptor in descriptors:
                 client_id = descriptor.get("client_id")
-                if client_id in self._managed_client_ids:
+                if client_id in self._managed_client_ids or client_id in rebound_ids:
                     continue
                 new_client = self.client_cls(self.agent_manager, descriptor)
                 self._managed_client_ids.append(client_id)

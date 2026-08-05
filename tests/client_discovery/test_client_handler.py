@@ -84,6 +84,10 @@ class FakeAgentManager:
         self.calls.append(("hotkey", client_id, modifiers, virtual_key))
         return {"client_id": client_id, "delivered": True}
 
+    def process_status(self, session_id):
+        self.calls.append(("process_status", session_id))
+        return {"session_id": session_id, "state": "open"}
+
 
 class FakeLegacyClient:
     def __init__(self, handle):
@@ -149,6 +153,46 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
         self.assertEqual([client.client_id for client in rediscovered], ["client-c"])
         self.assertEqual(rediscovered[0].process_id, 448)
         self.assertFalse(hasattr(rediscovered[0], "window_handle"))
+
+    def test_native_discovery_rebinds_replaced_window_without_invalidating_hooks(self):
+        manager = FakeAgentManager(
+            [
+                [descriptor("client-old-window", 448, foreground=True)],
+                [descriptor("client-new-window", 448, foreground=True)],
+            ]
+        )
+        handler = ClientHandler(agent_manager=manager)
+        client = handler.get_new_clients()[0]
+        hook_marker = object()
+        client._hook_session_id = "hook-448"
+        client.body = hook_marker
+
+        self.assertEqual(handler.get_new_clients(), [])
+        self.assertIs(handler.clients[0], client)
+        self.assertEqual(client.client_id, "client-new-window")
+        self.assertEqual(handler.managed_identities, ("client-new-window",))
+        self.assertIs(client.body, hook_marker)
+        self.assertTrue(client.is_running())
+
+    def test_native_discovery_keeps_live_hook_session_during_window_gap(self):
+        manager = FakeAgentManager(
+            [
+                [descriptor("client-stable", 448, foreground=True)],
+                [],
+                [descriptor("client-stable", 448, foreground=True)],
+            ]
+        )
+        handler = ClientHandler(agent_manager=manager)
+        client = handler.get_new_clients()[0]
+        hook_marker = object()
+        client._hook_session_id = "hook-448"
+        client.body = hook_marker
+
+        self.assertEqual(handler.remove_dead_clients(), [])
+        self.assertTrue(client.is_running())
+        self.assertIs(client.body, hook_marker)
+        self.assertEqual(handler.get_new_clients(), [])
+        self.assertIs(handler.clients[0], client)
 
     def test_native_discovery_rejects_malformed_agent_responses(self):
         handler = ClientHandler(agent_manager=SimpleNamespace(list_clients=lambda: {}))
