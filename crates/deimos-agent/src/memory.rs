@@ -238,6 +238,26 @@ pub fn scan<B: MemoryBackend>(
     finish_scan(request, collected)
 }
 
+pub(crate) fn scan_optional_unique_signatures<B: MemoryBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &deimos_core::process::ProcessSessionId,
+    scope: &MemoryScanScope,
+    signatures: &[&str],
+) -> Result<Vec<Option<usize>>, MemoryApiError> {
+    let parsed = signatures
+        .iter()
+        .map(|signature| parse_signature(signature))
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sessions.with_live_session(backend, session_id, |backend, handle, process| {
+        scan_for_optional_unique_signatures(backend, handle, process, scope, &parsed)
+    })
+}
+
 pub fn pointer_chain<B: MemoryBackend>(
     sessions: &mut ProcessSessionRegistry<B::Handle>,
     backend: &B,
@@ -403,6 +423,150 @@ fn scan_for_addresses<B: MemoryBackend>(
     }
     collected.matches.sort_unstable();
     Ok(collected)
+}
+
+fn scan_for_optional_unique_signatures<B: MemoryBackend>(
+    backend: &B,
+    handle: &B::Handle,
+    process: &ProcessDescriptor,
+    scope: &MemoryScanScope,
+    signatures: &[Vec<Option<u8>>],
+) -> Result<Vec<Option<usize>>, MemoryApiError> {
+    let identity = process_identity(process)?;
+    let mut regions = backend
+        .enumerate_memory_regions(handle, identity)
+        .map_err(MemoryApiError::from)?;
+    regions.sort_by_key(|region| parse_address(&region.base_address).unwrap_or(usize::MAX));
+    if regions.len() > deimos_core::memory::MAX_SCAN_REGIONS {
+        return Err(MemoryApiError::request(
+            RpcErrorCode::MemoryLimitExceeded,
+            "scan region count exceeds the protocol limit",
+        ));
+    }
+    let bounds = match scope {
+        MemoryScanScope::Process => None,
+        MemoryScanScope::Module { name } => Some(module_bounds(backend, handle, identity, name)?),
+    };
+    let mut matches = vec![Vec::new(); signatures.len()];
+    for region in regions {
+        let start = parse_address(&region.base_address)?;
+        let end = start.checked_add(region.size).ok_or_else(|| {
+            MemoryApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "memory region address range overflowed",
+            )
+        })?;
+        let (scan_start, scan_end) = match bounds {
+            Some((module_start, module_end)) => (start.max(module_start), end.min(module_end)),
+            None => (start, end),
+        };
+        if scan_start >= scan_end
+            || signatures
+                .iter()
+                .all(|signature| scan_end - scan_start < signature.len())
+        {
+            continue;
+        }
+        scan_region_for_unique_signatures(
+            backend,
+            handle,
+            scan_start,
+            scan_end - scan_start,
+            signatures,
+            &mut matches,
+        )?;
+    }
+
+    matches
+        .into_iter()
+        .enumerate()
+        .map(|(index, addresses)| match addresses.as_slice() {
+            [] => Ok(None),
+            [address] => Ok(Some(*address)),
+            _ => Err(MemoryApiError::request(
+                RpcErrorCode::MemoryAmbiguousMatch,
+                format!("signature at index {index} matched more than one address"),
+            )
+            .with_detail("match_count", addresses.len().to_string())),
+        })
+        .collect()
+}
+
+fn scan_region_for_unique_signatures<B: MemoryBackend>(
+    backend: &B,
+    handle: &B::Handle,
+    start: usize,
+    size: usize,
+    signatures: &[Vec<Option<u8>>],
+    matches: &mut [Vec<usize>],
+) -> Result<(), MemoryApiError> {
+    let overlap = signatures
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or_default()
+        .saturating_sub(1);
+    let mut offset = 0usize;
+    let mut previous = Vec::new();
+    while offset < size {
+        let request_size = (size - offset).min(SCAN_CHUNK_SIZE);
+        let address = start.checked_add(offset).ok_or_else(|| {
+            MemoryApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "scan address overflowed",
+            )
+        })?;
+        let bytes = match backend.read_memory(handle, address, request_size) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(()),
+        };
+        let previous_end = start.checked_add(offset).ok_or_else(|| {
+            MemoryApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                "scan previous-chunk boundary overflowed",
+            )
+        })?;
+        let mut combined = previous;
+        combined.extend_from_slice(&bytes);
+        let combined_start = address.saturating_sub(combined.len() - bytes.len());
+        for (signature_index, signature) in signatures.iter().enumerate() {
+            if matches[signature_index].len() > 1 || signature.len() > combined.len() {
+                continue;
+            }
+            for (match_offset, window) in combined.windows(signature.len()).enumerate() {
+                let candidate = combined_start.checked_add(match_offset).ok_or_else(|| {
+                    MemoryApiError::request(
+                        RpcErrorCode::MemoryInvalidAddress,
+                        "scan match address overflowed",
+                    )
+                })?;
+                let candidate_end = candidate.checked_add(signature.len()).ok_or_else(|| {
+                    MemoryApiError::request(
+                        RpcErrorCode::MemoryInvalidAddress,
+                        "scan match range overflowed",
+                    )
+                })?;
+                if candidate_end <= previous_end
+                    || !window.iter().zip(signature).all(|(actual, expected)| {
+                        expected.is_none() || expected.as_ref() == Some(actual)
+                    })
+                {
+                    continue;
+                }
+                matches[signature_index].push(candidate);
+                if matches[signature_index].len() > 1 {
+                    break;
+                }
+            }
+        }
+        offset += bytes.len();
+        if bytes.len() < request_size {
+            return Ok(());
+        }
+        previous = combined.into_iter().rev().take(overlap).collect::<Vec<_>>();
+        previous.reverse();
+    }
+    Ok(())
 }
 
 fn scan_region<B: MemoryBackend>(
@@ -762,7 +926,7 @@ fn error_message(error: MemoryApiError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use deimos_core::memory::{
@@ -822,6 +986,7 @@ mod tests {
         stale_after_read: Arc<AtomicBool>,
         stale: Arc<AtomicBool>,
         large_memory: Option<Arc<Vec<u8>>>,
+        read_count: Arc<AtomicUsize>,
     }
 
     #[derive(Clone, Copy)]
@@ -927,6 +1092,7 @@ mod tests {
             address: usize,
             size: usize,
         ) -> Result<Vec<u8>, ProcessBackendError> {
+            self.read_count.fetch_add(1, Ordering::SeqCst);
             if let Some(memory) = &self.large_memory {
                 let offset = address.checked_sub(0x1000).ok_or_else(|| {
                     ProcessBackendError::new(
@@ -991,6 +1157,7 @@ mod tests {
             stale_after_read: Arc::new(AtomicBool::new(stale_after_read)),
             stale: Arc::new(AtomicBool::new(false)),
             large_memory: None,
+            read_count: Arc::new(AtomicUsize::new(0)),
         };
         let mut registry = ProcessSessionRegistry::new();
         let session = registry
@@ -1018,6 +1185,7 @@ mod tests {
             stale_after_read: Arc::new(AtomicBool::new(false)),
             stale: Arc::new(AtomicBool::new(false)),
             large_memory: Some(Arc::new(memory)),
+            read_count: Arc::new(AtomicUsize::new(0)),
         };
         let mut registry = ProcessSessionRegistry::new();
         let session = registry
@@ -1050,6 +1218,22 @@ mod tests {
                 format!("{:#x}", 0x1000 + cross_chunk_offset),
             ]
         );
+    }
+
+    #[test]
+    fn unique_signature_batch_reads_each_region_once() {
+        let (backend, mut registry, session_id) = mock_registry(false);
+        let addresses = super::scan_optional_unique_signatures(
+            &mut registry,
+            &backend,
+            &deimos_core::process::ProcessSessionId(session_id),
+            &MemoryScanScope::Process,
+            &["A5 11 22 33", "DE AD BE EF"],
+        )
+        .expect("both signatures should resolve in one scan");
+
+        assert_eq!(addresses, vec![Some(0x1000), Some(0x1004)]);
+        assert_eq!(backend.read_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]

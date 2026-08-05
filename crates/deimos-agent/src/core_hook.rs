@@ -1,5 +1,6 @@
 //! Built-in WizWalker hooks for telemetry and UI access.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use deimos_core::memory::{
@@ -33,30 +34,51 @@ pub fn activate<B: MutationBackend>(
     request: &CoreHookRequest,
     now: Instant,
 ) -> Result<CoreHookResponse, HookApiError> {
+    activate_resolved(sessions, backend, mutations, hooks, request, None, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_resolved<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    mutations: &mut MutationState<B::ThreadHandle>,
+    hooks: &mut HookState,
+    request: &CoreHookRequest,
+    resolved_target: Option<usize>,
+    now: Instant,
+) -> Result<CoreHookResponse, HookApiError> {
     let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
     let template = template_for_target(request.hook, fixture);
-    hook::activate_template(
-        sessions,
-        backend,
-        mutations,
-        hooks,
-        &HookActivateRequest {
-            session_id: request.session_id.clone(),
-            hook_key: hook_key(request.hook),
-            signature: template.signature.to_string(),
-            scope: if fixture {
-                MemoryScanScope::Process
-            } else {
-                MemoryScanScope::Module {
-                    name: MODULE.to_string(),
-                }
-            },
-            payload: template.payload,
-        },
-        template.target_offset,
-        Some(template.overwrite_size),
-        now,
-    )?;
+    let hook_request = HookActivateRequest {
+        session_id: request.session_id.clone(),
+        hook_key: hook_key(request.hook),
+        signature: template.signature.to_string(),
+        scope: scan_scope(fixture),
+        payload: template.payload,
+    };
+    match resolved_target {
+        Some(target) => hook::activate_template_at(
+            sessions,
+            backend,
+            mutations,
+            hooks,
+            &hook_request,
+            template.target_offset,
+            Some(template.overwrite_size),
+            target,
+            now,
+        )?,
+        None => hook::activate_template(
+            sessions,
+            backend,
+            mutations,
+            hooks,
+            &hook_request,
+            template.target_offset,
+            Some(template.overwrite_size),
+            now,
+        )?,
+    };
     Ok(CoreHookResponse {
         session_id: request.session_id.clone(),
         hook: request.hook,
@@ -72,6 +94,48 @@ pub fn activate_all<B: MutationBackend>(
     request: &CoreHookSessionRequest,
     now: Instant,
 ) -> Result<CoreHooksResponse, HookApiError> {
+    let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
+    let inactive = CoreHook::ALL
+        .into_iter()
+        .filter(|selected| {
+            hooks
+                .allocation_address(&request.session_id, &hook_key(*selected))
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+    let templates = inactive
+        .iter()
+        .map(|selected| template_for_target(*selected, fixture))
+        .collect::<Vec<_>>();
+    let signatures = templates
+        .iter()
+        .map(|template| template.signature)
+        .collect::<Vec<_>>();
+    let resolved_matches = memory::scan_optional_unique_signatures(
+        sessions,
+        backend,
+        &request.session_id,
+        &scan_scope(fixture),
+        &signatures,
+    )?;
+    let mut resolved_targets = BTreeMap::new();
+    for ((selected, template), match_address) in
+        inactive.into_iter().zip(templates).zip(resolved_matches)
+    {
+        let Some(match_address) = match_address else {
+            continue;
+        };
+        let target = match_address
+            .checked_add(template.target_offset)
+            .ok_or_else(|| {
+                HookApiError::request(
+                    RpcErrorCode::MemoryInvalidAddress,
+                    "hook target offset overflowed the agent address width",
+                )
+            })?;
+        resolved_targets.insert(selected, target);
+    }
+
     let mut activated = Vec::new();
     let mut responses = Vec::new();
     for selected in CoreHook::ALL {
@@ -79,7 +143,7 @@ pub fn activate_all<B: MutationBackend>(
         let was_active = hooks
             .allocation_address(&request.session_id, &key)
             .is_some();
-        match activate(
+        match activate_resolved(
             sessions,
             backend,
             mutations,
@@ -88,6 +152,7 @@ pub fn activate_all<B: MutationBackend>(
                 session_id: request.session_id.clone(),
                 hook: selected,
             },
+            resolved_targets.get(&selected).copied(),
             now,
         ) {
             Ok(response) => {
@@ -130,6 +195,16 @@ pub fn activate_all<B: MutationBackend>(
         session_id: request.session_id.clone(),
         hooks: responses,
     })
+}
+
+fn scan_scope(fixture: bool) -> MemoryScanScope {
+    if fixture {
+        MemoryScanScope::Process
+    } else {
+        MemoryScanScope::Module {
+            name: MODULE.to_string(),
+        }
+    }
 }
 
 pub fn deactivate<B: MutationBackend>(

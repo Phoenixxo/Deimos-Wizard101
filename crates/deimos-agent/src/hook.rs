@@ -242,6 +242,35 @@ pub(crate) fn activate_template<B: MutationBackend>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn activate_template_at<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    mutations: &mut MutationState<B::ThreadHandle>,
+    hooks: &mut HookState,
+    request: &HookActivateRequest,
+    target_offset: usize,
+    overwrite_size: Option<usize>,
+    resolved_target: usize,
+    now: Instant,
+) -> Result<HookActivateResponse, HookApiError> {
+    activate_transactional_template(
+        sessions,
+        backend,
+        mutations,
+        hooks,
+        request,
+        target_offset,
+        overwrite_size,
+        Some(resolved_target),
+        Vec::new(),
+        HookMetadata::default(),
+        true,
+        None,
+        now,
+    )
+}
+
 /// Installs a built-in hook whose payload depends on its remote allocation and
 /// whose auxiliary patches share the detour's rollback and lease ownership.
 #[allow(clippy::too_many_arguments)]
