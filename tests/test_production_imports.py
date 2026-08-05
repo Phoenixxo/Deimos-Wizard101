@@ -110,6 +110,29 @@ class ProductionImportTests(unittest.TestCase):
         self.assertIn("if walker.clients:", source)
         self.assertNotIn("foreground_client_list", source)
 
+    def test_macos_account_prompt_and_unauthenticated_launch_use_supported_threads(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+        gui_source = (REPOSITORY_ROOT / "src/gui/tab_launcher.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "account_prompt=wizlaunch.prompt_save_account if sys.platform == 'darwin' else None",
+            source,
+        )
+        self.assertIn("ctx.account_prompt(nick)", gui_source)
+        self.assertIn('logger.info("Launching Wizard101 without automatic login...', source)
+        self.assertIn("agent_manager.launch_game", source)
+        self.assertIn("walker.start_wiz_client", source)
+
+    def test_unsafe_agent_custom_teleport_is_contained(self):
+        source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Custom teleport is temporarily disabled for agent-backed clients",
+            source,
+        )
+
     def test_questing_restart_and_dead_client_cleanup_preserve_lifecycle_state(self):
         source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
 
