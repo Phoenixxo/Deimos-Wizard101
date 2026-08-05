@@ -42,7 +42,7 @@ class GUIContext:
     pass
 
 
-def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None, control_queue=None, shutdown_event=None, log_directory=None):
+def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None, control_queue=None, shutdown_event=None, log_directory=None, account_prompt=None):
     tl = load_lang(langcode)
     control_queue = control_queue or send_queue
     log_directory = Path(log_directory or application_log_directory())
@@ -260,6 +260,7 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     ctx = GUIContext()
     ctx.send_queue = send_queue
     ctx.control_queue = control_queue
+    ctx.account_prompt = account_prompt
     ctx.widget_tags = widget_tags
     ctx.tl = tl
     ctx.settings = settings

@@ -1,9 +1,11 @@
 import os
 
+from loguru import logger
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QCheckBox, QLineEdit, QListWidget, QListWidgetItem, QDialog,
-    QSizePolicy, QFileDialog,
+    QSizePolicy, QFileDialog, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QSize
 
@@ -116,8 +118,16 @@ def build_launcher_tab(ctx):
         def _on_save():
             nick = nick_input.text().strip()
             if nick:
-                send_queue.put(GUICommand(GUICommandType.SaveAccount, nick))
-                dlg.accept()
+                try:
+                    if ctx.account_prompt is None:
+                        send_queue.put(GUICommand(GUICommandType.SaveAccount, nick))
+                    else:
+                        ctx.account_prompt(nick)
+                        send_queue.put(GUICommand(GUICommandType.LoadAccounts))
+                    dlg.accept()
+                except Exception as error:
+                    logger.warning("Could not save account '{}': {}", nick, error)
+                    QMessageBox.warning(dlg, tl('save_account'), str(error))
         save_btn.clicked.connect(_on_save)
         dlg_layout.addWidget(save_btn)
 
@@ -345,9 +355,8 @@ def build_launcher_tab(ctx):
                 lbl = w.findChild(QLabel)
                 if cb and lbl and cb.isChecked():
                     selected.append(lbl.text())
-        if selected:
-            game_path = game_path_input.text().strip()
-            send_queue.put(GUICommand(GUICommandType.LaunchInstance, (selected, game_path)))
+        game_path = game_path_input.text().strip()
+        send_queue.put(GUICommand(GUICommandType.LaunchInstance, (selected, game_path)))
 
     # Resolve game path: saved setting > auto-detect
     _saved_path = ctx.settings.get_setting('game_path') if ctx.settings else None

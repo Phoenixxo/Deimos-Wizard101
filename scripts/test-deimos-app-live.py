@@ -162,6 +162,11 @@ def main() -> int:
             control_queue=deimos.control_queue,
             shutdown_event=deimos.shutdown_event,
             log_directory=deimos._startup_log_directory(),
+            account_prompt=(
+                deimos.wizlaunch.prompt_save_account
+                if deimos.sys.platform == "darwin"
+                else None
+            ),
         )
         backend_thread.join(timeout=35)
         if backend_thread.is_alive():

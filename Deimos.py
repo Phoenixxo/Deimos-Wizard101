@@ -2688,6 +2688,28 @@ async def main(agent_manager: Any = None):
 									game_path = str(utils.get_wiz_install())
 							else:
 								utils.override_wiz_install_location(game_path)
+							if not nicknames:
+								logger.info("Launching Wizard101 without automatic login...")
+								released_handles.clear()
+								_auto_hook_retries.clear_all()
+								if agent_manager is not None:
+									response = await asyncio.to_thread(
+										agent_manager.launch_game,
+										game_path,
+										wizlaunch.DEFAULT_LOGIN_SERVER,
+										30,
+									)
+									client = response.get("client") if isinstance(response, dict) else None
+									client_id = client.get("client_id") if isinstance(client, dict) else None
+									if not isinstance(client_id, str) or not client_id:
+										raise RuntimeError(
+											"Wizard101 opened without returning a valid client identity."
+										)
+									_auto_hook_retries.register(client_id)
+								else:
+									await asyncio.to_thread(walker.start_wiz_client)
+								gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.ClearLaunchCheckboxes))
+								continue
 							# Filter out accounts already managed (hooked) by launch map or player_gid
 							already_managed = set(launched_account_map.values())
 							for c in walker.clients:
@@ -3478,7 +3500,7 @@ if __name__ == "__main__":
 
 	# Run GUI on the main thread (swap queue order: sending from window = receiving from backend)
 	_write_lifecycle_event('starting GUI event loop')
-	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings, runtime_error=runtime_error, control_queue=control_queue, shutdown_event=shutdown_event, log_directory=log_directory)
+	deimosgui.manage_gui(recv_queue, gui_send_queue, theme_dict, tool_name, tool_version, gui_on_top, gui_langcode, gui_font, gui_font_size, tool_author, settings=settings, runtime_error=runtime_error, control_queue=control_queue, shutdown_event=shutdown_event, log_directory=log_directory, account_prompt=wizlaunch.prompt_save_account if sys.platform == 'darwin' else None)
 	_write_lifecycle_event('GUI event loop returned')
 
 	logger.remove(current_log)
