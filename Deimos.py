@@ -2255,6 +2255,12 @@ async def main(agent_manager: Any = None):
 							if not walker.clients:
 								logger.info("This GUI option requires hooks to be active, skipping.")
 								continue
+							if agent_manager is not None:
+								logger.warning(
+									"Custom teleport is temporarily disabled for agent-backed clients "
+									"after live validation detected an unsafe game-memory transition."
+								)
+								continue
 							if foreground_client:
 								x_input = param_input(com.data['X'], current_pos.x)
 								y_input = param_input(com.data['Y'], current_pos.y)
