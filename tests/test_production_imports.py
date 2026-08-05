@@ -88,9 +88,13 @@ class ProductionImportTests(unittest.TestCase):
 
     def test_hotkey_permission_failure_does_not_stop_the_backend(self):
         source = (REPOSITORY_ROOT / "Deimos.py").read_text(encoding="utf-8")
+        gui_source = (REPOSITORY_ROOT / "src" / "gui" / "main.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("Global hotkeys are unavailable; Deimos will continue without them", source)
-        self.assertIn("request_input_monitoring_permission()", source)
+        self.assertNotIn("request_input_monitoring_permission()", source)
+        self.assertIn("request_input_monitoring_permission()", gui_source)
         self.assertIn("await enable_hotkeys()", source)
 
     def test_feature_tasks_use_the_guarded_failure_boundary(self):

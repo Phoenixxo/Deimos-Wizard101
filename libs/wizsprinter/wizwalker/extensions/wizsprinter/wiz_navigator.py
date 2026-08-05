@@ -1025,7 +1025,13 @@ async def toZoneDisplayName(clients, destinationZoneDisplay):
 
 @logger.catch()
 async def toZone(clients, destinationZone):
+    if not clients:
+        logger.warning('Zone navigation is unavailable while no Wizard101 client is selected.')
+        return 1
     currentZone = await clients[0].zone_name()
+    if not isinstance(currentZone, str) or not currentZone.strip():
+        logger.warning('Zone navigation is unavailable while the current zone is loading.')
+        return 1
     worldName = currentZone.split('/', 1)[0]
 
     interactiveTeleportersOriginal = await parseFile("traversalData/interactiveTeleporters.txt", worldName)

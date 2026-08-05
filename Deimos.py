@@ -3248,8 +3248,6 @@ async def main(agent_manager: Any = None):
 			await listener.add_hotkey(Keycode[_kill_binding["key"]], kill_tool_hotkey, modifiers=_kill_mods)
 			_active_bindings["kill_tool"] = _kill_binding
 		except Exception as error:
-			if getattr(error, 'code', None) == 'hotkey_permission_required':
-				host_platform.request_input_monitoring_permission()
 			logger.warning(
 				'Global hotkeys are unavailable; Deimos will continue without them: {}',
 				error,

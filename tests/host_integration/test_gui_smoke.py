@@ -36,7 +36,11 @@ class GuiSmokeTests(unittest.TestCase):
             self.app,
             "exec",
             return_value=0,
-        ):
+        ), patch.object(
+            gui_main.host_platform,
+            "request_input_monitoring_permission",
+            return_value=False,
+        ) as request_permission:
             gui_main.manage_gui(
                 send_queue,
                 receive_queue,
@@ -46,6 +50,8 @@ class GuiSmokeTests(unittest.TestCase):
                 False,
                 "en",
             )
+
+        request_permission.assert_called_once_with()
 
         commands = []
         while not send_queue.empty():
@@ -87,7 +93,11 @@ class GuiSmokeTests(unittest.TestCase):
             gui_main.QDesktopServices,
             "openUrl",
             return_value=True,
-        ) as open_url:
+        ) as open_url, patch.object(
+            gui_main.host_platform,
+            "request_input_monitoring_permission",
+            return_value=False,
+        ):
             gui_main.manage_gui(
                 send_queue,
                 receive_queue,
