@@ -330,7 +330,15 @@ class DiscoveredClient:
 
     @property
     def is_foreground(self) -> bool:
-        is_foreground = self._window_state().get("is_foreground")
+        try:
+            is_foreground = self._window_state().get("is_foreground")
+        except Exception as error:
+            if (
+                getattr(error, "code", None) in {"client_not_found", "window_not_found"}
+                and self._has_live_process_session()
+            ):
+                return self._is_foreground
+            raise
         if not isinstance(is_foreground, bool):
             raise ValueError("The native agent returned an invalid foreground state.")
         self._is_foreground = is_foreground
@@ -455,16 +463,23 @@ class DiscoveredClient:
             CurrentSocialSystemsManager,
             TeleportHelper,
         )
-        address_context = _TelemetryReadContext(handler, {})
+        signature_addresses: dict[bytes, int] = {}
+
+        def dynamic_address(method_name: str):
+            async def resolve() -> int:
+                context = _TelemetryReadContext(handler, signature_addresses)
+                return await getattr(context, method_name)()
+
+            return resolve
 
         return {
-            "stats": CurrentGameStats(handler, address_context.game_stats),
-            "body": CurrentActorBody(handler, address_context.actor_body),
+            "stats": CurrentGameStats(handler, dynamic_address("game_stats")),
+            "body": CurrentActorBody(handler, dynamic_address("actor_body")),
             "duel": CurrentDuel(handler),
             "quest_position": CurrentQuestPosition(handler),
             "client_object": CurrentClientObject(
                 handler,
-                address_context.root_client_object,
+                dynamic_address("root_client_object"),
             ),
             "root_window": CurrentRootWindow(handler),
             "render_context": CurrentRenderContext(handler),

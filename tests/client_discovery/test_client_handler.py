@@ -99,6 +99,12 @@ class FakeLegacyClient:
         return self.running
 
 
+class NativeWindowError(RuntimeError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class ClientHandlerCompatibilityTests(unittest.TestCase):
     def test_legacy_callers_still_construct_clients_from_native_handles(self):
         legacy_utils = SimpleNamespace(
@@ -193,6 +199,41 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
         self.assertIs(client.body, hook_marker)
         self.assertEqual(handler.get_new_clients(), [])
         self.assertIs(handler.clients[0], client)
+
+    def test_foreground_state_survives_a_live_window_gap_and_recovers(self):
+        manager = FakeAgentManager([])
+        client = DiscoveredClient(
+            manager,
+            descriptor("client-stable", 448, foreground=True),
+        )
+        client._hook_session_id = "hook-448"
+        original_window_state = manager.client_window_state
+        manager.client_window_state = lambda client_id: (_ for _ in ()).throw(
+            NativeWindowError("client_not_found")
+        )
+
+        self.assertTrue(client.is_foreground)
+
+        manager.client_window_state = original_window_state
+        manager.foreground_clients.clear()
+        self.assertFalse(client.is_foreground)
+
+    def test_foreground_window_gap_fails_when_process_has_exited(self):
+        manager = FakeAgentManager([])
+        client = DiscoveredClient(
+            manager,
+            descriptor("client-stable", 448, foreground=True),
+        )
+        client._hook_session_id = "hook-448"
+        manager.client_window_state = lambda client_id: (_ for _ in ()).throw(
+            NativeWindowError("client_not_found")
+        )
+        manager.process_status = lambda session_id: (_ for _ in ()).throw(
+            NativeWindowError("process_exited")
+        )
+
+        with self.assertRaisesRegex(NativeWindowError, "client_not_found"):
+            _ = client.is_foreground
 
     def test_native_discovery_rejects_malformed_agent_responses(self):
         handler = ClientHandler(agent_manager=SimpleNamespace(list_clients=lambda: {}))
