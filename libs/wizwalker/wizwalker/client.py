@@ -9,6 +9,7 @@ from . import utils
 from .constants import Keycode, Primitive, WIZARD_SPEED
 from .errors import (
     ExceptionalTimeout,
+    HookNotReady,
     MemoryReadError,
     PatternMultipleResults,
     ReadingEnumFailed,
@@ -151,7 +152,10 @@ class Client:
         if client_zone is not None:
             # noinspection PyBroadException
             try:
-                return await client_zone.zone_name()
+                zone_name = await client_zone.zone_name()
+                if zone_name:
+                    self._last_zone_name = zone_name
+                return zone_name
             except Exception:
                 return None
 
@@ -425,7 +429,11 @@ class Client:
         return item_count, backpack_capacity
 
     async def wait_for_zone_change(
-            self, name: Optional[str] = None, *, sleep_time: Optional[float] = 0.5
+            self,
+            name: Optional[str] = None,
+            *,
+            sleep_time: Optional[float] = 0.5,
+            timeout: Optional[float] = 30.0,
     ):
         """
         Wait for the client's zone to change
@@ -434,14 +442,54 @@ class Client:
             name: The name of the zone to wait to be changed from or None to read
             sleep_time: How long to sleep between reads or None to not
         """
+        interval = 0.5 if sleep_time is None else sleep_time
+        deadline = None
+        if timeout is not None:
+            deadline = asyncio.get_running_loop().time() + timeout
+
+        def check_timeout():
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    "Wizard101 did not finish changing zones before navigation timed out."
+                )
+
+        async def readable_zone():
+            try:
+                return await self.zone_name()
+            except (HookNotReady, MemoryReadError):
+                return None
+
         if name is None:
-            name = await self.zone_name()
+            name = getattr(self, "_last_zone_name", None)
 
-        while await self.zone_name() == name:
-            await asyncio.sleep(sleep_time)
+        if name is None:
+            while name is None:
+                check_timeout()
+                name = await readable_zone()
+                if name is None:
+                    await asyncio.sleep(interval)
 
-        while await self.is_loading():
-            await asyncio.sleep(sleep_time)
+        changed_zone = None
+        while changed_zone is None:
+            check_timeout()
+            current_zone = await readable_zone()
+            if current_zone is not None and current_zone != name:
+                changed_zone = current_zone
+                break
+            await asyncio.sleep(interval)
+
+        while True:
+            check_timeout()
+            try:
+                loading = await self.is_loading()
+            except (HookNotReady, MemoryReadError):
+                loading = True
+            current_zone = await readable_zone()
+            if not loading and current_zone == changed_zone:
+                return current_zone
+            if current_zone is not None and current_zone != name:
+                changed_zone = current_zone
+            await asyncio.sleep(interval)
 
     async def current_energy(self) -> int | None:
         """

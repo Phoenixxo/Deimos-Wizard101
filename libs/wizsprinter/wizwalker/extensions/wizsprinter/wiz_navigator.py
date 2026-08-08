@@ -3,7 +3,7 @@ import asyncio
 import sys
 import traceback
 
-from wizwalker import XYZ, ClientHandler
+from wizwalker import HookNotReady, MemoryReadError, XYZ, ClientHandler
 from wizwalker import Keycode
 from loguru import logger
 from itertools import takewhile
@@ -24,7 +24,39 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-@logger.catch()
+
+class NavigationError(RuntimeError):
+    pass
+
+
+async def _zone_when_ready(p, *, timeout=30.0, sleep_time=0.25):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            zone = await p.zone_name()
+            is_loading = getattr(p, "is_loading", None)
+            loading = await is_loading() if callable(is_loading) else False
+            if isinstance(zone, str) and zone.strip() and not loading:
+                return zone.strip()
+        except (HookNotReady, MemoryReadError):
+            pass
+
+        if asyncio.get_running_loop().time() >= deadline:
+            raise NavigationError(
+                "Wizard101 did not publish a stable zone before navigation timed out."
+            )
+        await asyncio.sleep(sleep_time)
+
+
+async def _require_zone(p, expected_zone):
+    actual_zone = await _zone_when_ready(p)
+    if actual_zone != expected_zone.strip():
+        raise NavigationError(
+            f"Expected Wizard101 to enter {expected_zone.strip()}, but it entered "
+            f"{actual_zone}. Navigation stopped."
+        )
+    return actual_zone
+
 async def go_through_dialog(p):
     while await p.is_in_dialog():
         await p.send_key(Keycode.SPACEBAR, 0.1)
@@ -32,8 +64,9 @@ async def go_through_dialog(p):
     await asyncio.sleep(.5)
 
 
-@logger.catch()
 async def gateTypeDifferentiation(x, y, z, p, zoneAccessType):
+    await _zone_when_ready(p)
+
     # standard zone gate, just teleport
     if zoneAccessType == 'standard':
         await p.teleport(XYZ(float(x), float(y), float(z)))
@@ -473,8 +506,8 @@ async def gateTypeDifferentiation(x, y, z, p, zoneAccessType):
 
 
 # uses an interactive teleporter (such as those in empyrea and later worlds) to teleport between zones
-@logger.catch()
 async def interactiveTeleportToZone(p, menuButtonNumber):
+    await _zone_when_ready(p)
 
     while not await p.is_in_npc_range():
         pass
@@ -508,7 +541,6 @@ async def interactiveTeleportToZone(p, menuButtonNumber):
     await p.mouse_handler.deactivate_mouseless()
 
 
-@logger.catch()
 async def createStack(p1WorldName):
 
     lines = await parseFile("traversalData/zoneMap.txt", p1WorldName)
@@ -533,7 +565,6 @@ async def createStack(p1WorldName):
     return fullZonePaths
 
 
-@logger.catch()
 # returns true if a special interactable teleporter was found and teleported to
 async def teleportToInteractiveTeleportIfAvailable(p, currentZone, destinationZone, teleporterList):
 
@@ -573,9 +604,10 @@ async def read_control_checkbox_text(checkbox: Window) -> str:
     return await checkbox.read_wide_string_from_offset(616)
 
 
-@logger.catch()
 # trace back to the nearest spiral door and teleport to destinationWorld
 async def goToNewWorld(p, destinationWorld):
+    await _zone_when_ready(p)
+
     while not await p.is_in_npc_range():
         pass
 
@@ -630,6 +662,13 @@ async def goToNewWorld(p, destinationWorld):
                     await p.mouse_handler.click_window_with_name('teleportButton')
                     await p.wait_for_zone_change()
 
+                    actual_zone = await _zone_when_ready(p)
+                    if actual_zone.split('/', 1)[0] != destinationWorld:
+                        raise NavigationError(
+                            f"The Spiral Door entered {actual_zone} instead of "
+                            f"{destinationWorld}. Navigation stopped."
+                        )
+
                     await p.mouse_handler.deactivate_mouseless()
 
                     # move away from the spiral door so we dont accidentally click on it again after teleporting later
@@ -653,6 +692,12 @@ async def goToNewWorld(p, destinationWorld):
                         pageCount = pageCount[8:-9]
                         currentPage = pageCount.split('/', 1)[0]
                 #print(f"{await child.name()}: {await read_control_checkbox_text(child)}")
+
+    if not isChildFound:
+        await p.mouse_handler.deactivate_mouseless()
+        raise NavigationError(
+            f"The Spiral Door did not offer {destinationWorld}. Navigation stopped."
+        )
 
     # 4 buttons per page - menuButtonNum / 4 rounded up to nearest whole number equals the page that the button is on
     # worldIndex = worldList.index(destinationWorld)
@@ -681,6 +726,10 @@ async def goToNewWorld(p, destinationWorld):
     # await p.send_key(Keycode.W, 1.5)
 
     bigStackDestinations = await createStack(destinationWorld)
+    if not bigStackDestinations:
+        raise NavigationError(
+            f"No traversal route data is available for {destinationWorld}."
+        )
     return bigStackDestinations
 
 async def parseFile(fileName, worldName):
@@ -699,11 +748,15 @@ async def parseFile(fileName, worldName):
     return lines
 
 
-@logger.catch()
 # from any zone in any world (excluding certain ones, such as aquila), travel to a destination zone
 async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations, interactiveTeleportersOriginal):
 
-    currentZone = await p.zone_name()
+    if not bigStackDestinations:
+        raise NavigationError(
+            f"No traversal route data is available for {p1WorldName}."
+        )
+
+    currentZone = await _zone_when_ready(p)
     currentWorld = currentZone.split('/', 1)[0]
     destinationWorld = destinationZone.split('/', 1)[0]
 
@@ -712,7 +765,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
 
     # user may not be in the correct world.  Find the nearest spiral door and teleport to the correct world
     if currentWorld != destinationWorld:
-        p1ZoneNameNew = await p.zone_name()
+        p1ZoneNameNew = await _zone_when_ready(p)
         p1WorldNameNew = p1ZoneNameNew.split('/', 1)[0]
 
         # read list of unique locations, such as NPC locations and spiral door coordinates
@@ -745,7 +798,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
         p1WorldName = destinationWorld
 
     i = 0
-    currentZone = await p.zone_name()
+    currentZone = await _zone_when_ready(p)
     if currentZone.strip() != destinationZone.strip():
         currentZoneInZoneMap = False
         while i < len(bigStackDestinations):
@@ -764,14 +817,14 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
             # this makes it impossible to account for zone changes without having ridiculously long sleeps or hardcoded zone names
             worldHubsList = ['WizardCity/WC_Ravenwood_Teleporter', 'WizardCity/WC_Ravenwood', 'Krokotopia/KT_WorldTeleporter', 'Krokotopia/KT_Hub', 'Marleybone/Interiors/MB_WolfminsterAbbey', 'Marleybone/MB_Hub', 'DragonSpire/DS_Hub_Cathedral', 'MooShu/Interiors/MS_Teleport_Chamber', 'MooShu/MS_Hub', 'Celestia/CL_Hub', 'Wysteria/PA_Hub', 'Grizzleheim/GH_MainHub', 'Zafaria/ZF_Z00_Hub', 'Avalon/AV_Z00_Hub', 'Azteca/AZ_Z00_Zocalo', 'Khrysalis/KR_Z00_Hub', 'Polaris/PL_Z00_Walruskberg', 'Mirage/MR_Z00_Hub', 'Karamelle/KM_Z00_HUB', 'Empyrea/EM_Z00_Aeriel_HUB', 'Lemuria/LM_Z00_Hub']
 
-            currentZone = await p.zone_name()
+            currentZone = await _zone_when_ready(p)
             while currentZone not in worldHubsList:
                 await p.send_key(Keycode.END)
                 await asyncio.sleep(.6)
-                currentZone = await p.zone_name()
+                currentZone = await _zone_when_ready(p)
 
             await asyncio.sleep(3)
-            currentZone = await p.zone_name()
+            currentZone = await _zone_when_ready(p)
 
 
     # for certain worlds, check if there is a teleporter between currentZone and destinationZone before traversing zones manually
@@ -839,7 +892,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
 
             a = 0
             countRemoved = 0
-            currZone = await p.zone_name()
+            currZone = await _zone_when_ready(p)
 
             pathCurrentSplitModified = pathCurrentSplit
             pathDestinationSplitModified = pathDestinationSplit
@@ -898,7 +951,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
                 while i >= 0:
 
                     lines = iter(linesOriginal)
-                    currZone = await p.zone_name()
+                    currZone = await _zone_when_ready(p)
                     gateFrom = pathToCurrentZoneStack[i].strip() + ';' + currZone
 
                     # zonemap zones are stored as zone gates, from beginning of world to end
@@ -915,9 +968,10 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
                             y = splitString[2].strip()
                             z = splitString[3].strip()
 
+                            expected_zone = pathToCurrentZoneStack[i].strip()
                             await gateTypeDifferentiation(float(x), float(y), float(z), p, splitString[0])
 
-                            currentZone = await p.zone_name()
+                            currentZone = await _require_zone(p, expected_zone)
 
                             if p1WorldName in ['Empyrea', 'Karamelle', 'Lemuria']:
                                 await teleportToInteractiveTeleportIfAvailable(p, currentZone, destinationZone, interactiveTeleportersOriginal)
@@ -936,7 +990,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
             teleportedToZone = False
 
             lines = iter(linesOriginal)
-            currZone = await p.zone_name()
+            currZone = await _zone_when_ready(p)
             zoneTo = pathToDestinationStack[i].strip()
 
             gateFrom = currZone + ';' + zoneTo
@@ -957,7 +1011,7 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
                         z = splitString[3].strip()
                         await gateTypeDifferentiation(float(x), float(y), float(z), p, splitString[0])
 
-                        currentZone = await p.zone_name()
+                        currentZone = await _require_zone(p, zoneTo)
 
                         if p1WorldName in ['Empyrea', 'Karamelle', 'Lemuria']:
                             await teleportToInteractiveTeleportIfAvailable(p, currentZone, destinationZone, interactiveTeleportersOriginal)
@@ -967,15 +1021,16 @@ async def goToDestination(p, destinationZone, p1WorldName, bigStackDestinations,
             i += 1
 
             # if we didn't find a gate matching the next destination zone, the two zones are probably connected by teleporters.  Try teleporting there
-            zone = await p.zone_name()
+            zone = await _zone_when_ready(p)
             if zone != destinationZone.strip():
                 if p1WorldName in ['Empyrea', 'Karamelle', 'Lemuria']:
                     logger.info(f'Physical gate not found.  Attempting interactive teleport')
                     await teleportToInteractiveTeleportIfAvailable(p, zone, zoneTo, interactiveTeleportersOriginal)
 
+    await _require_zone(p, destinationZone)
 
-@logger.catch()
-async def toZoneDisplayName(clients, destinationZoneDisplay):
+
+async def _toZoneDisplayName(clients, destinationZoneDisplay):
     worldAbbreviations = ['WC', 'KT', 'MB', 'MS', 'DS', 'GH', 'CL', 'WT', 'ZF', 'AV', 'AZ', 'KR', 'PL', 'AC', 'MI', 'EM', 'KM', 'LM']
     worldList = ["WizardCity", "Krokotopia", "Marleybone", "MooShu", "DragonSpire", "Grizzleheim", "Celestia",
                  "Wysteria", "Zafaria", "Avalon", "Azteca", "Khrysalis", "Polaris", "Arcanum", "Mirage", "Empyrea",
@@ -1023,26 +1078,56 @@ async def toZoneDisplayName(clients, destinationZoneDisplay):
         return 1
 
 
-@logger.catch()
+async def toZoneDisplayName(clients, destinationZoneDisplay):
+    try:
+        return await _toZoneDisplayName(clients, destinationZoneDisplay)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(
+            f'Zone navigation could not resolve {destinationZoneDisplay}: '
+            f'{type(error).__name__}: {error}'
+        )
+        return 1
+
+
 async def toZone(clients, destinationZone):
     if not clients:
         logger.warning('Zone navigation is unavailable while no Wizard101 client is selected.')
         return 1
-    currentZone = await clients[0].zone_name()
+    try:
+        currentZone = await clients[0].zone_name()
+    except (HookNotReady, MemoryReadError):
+        logger.warning('Zone navigation is unavailable while the current zone is loading.')
+        return 1
     if not isinstance(currentZone, str) or not currentZone.strip():
         logger.warning('Zone navigation is unavailable while the current zone is loading.')
         return 1
-    worldName = currentZone.split('/', 1)[0]
-
-    interactiveTeleportersOriginal = await parseFile("traversalData/interactiveTeleporters.txt", worldName)
-    bigStackDestinations = await createStack(worldName)
-
     try:
+        worldName = currentZone.split('/', 1)[0]
+        interactiveTeleportersOriginal = await parseFile("traversalData/interactiveTeleporters.txt", worldName)
+        bigStackDestinations = await createStack(worldName)
+        if not bigStackDestinations:
+            raise NavigationError(
+                f'Zone navigation has no traversal data for {worldName}.'
+            )
+
         await asyncio.gather(*[goToDestination(p, destinationZone, worldName, bigStackDestinations, interactiveTeleportersOriginal) for p in clients])
+        await asyncio.gather(*[_require_zone(p, destinationZone) for p in clients])
         logger.info(f'reached destination zone: {destinationZone}.')
         return 0
-    except:
-        print(traceback.print_exc())
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        for client in clients:
+            try:
+                await client.mouse_handler.deactivate_mouseless()
+            except Exception:
+                pass
+        logger.warning(
+            f'Zone navigation stopped without reaching {destinationZone}: '
+            f'{type(error).__name__}: {error}'
+        )
         return 1
 
 
