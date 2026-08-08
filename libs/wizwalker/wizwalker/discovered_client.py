@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from functools import partial
 from typing import Any
 
@@ -12,6 +13,24 @@ from .telemetry import (
     ReadOnlyTelemetrySnapshot,
     _TelemetryReadContext,
 )
+
+
+def _log_hook_timing(phase: str, started: float, *, outcome: str = "ok", **details):
+    payload = {
+        "component": "wizwalker",
+        "event": "hook_timing",
+        "phase": phase,
+        "outcome": outcome,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        **details,
+    }
+    try:
+        from loguru import logger as timing_logger
+    except ImportError:
+        return
+    log = getattr(timing_logger, "info", None) or getattr(timing_logger, "debug", None)
+    if log is not None:
+        log(f"HOOK_TIMING {json.dumps(payload, sort_keys=True, default=str)}")
 
 
 class WindowRectangle:
@@ -611,15 +630,25 @@ class DiscoveredClient:
 
     async def _ensure_hook_handler(self):
         """Open an identity-checked mutation session without activating hooks."""
+        total_started = time.perf_counter()
         if not self._running:
+            _log_hook_timing(
+                "client.ensure_hook_handler", total_started, outcome="error"
+            )
             raise RuntimeError(
                 "This Wizard101 client has closed. Rediscover it before activating hooks."
             )
         if self.hook_handler is not None:
+            _log_hook_timing(
+                "client.ensure_hook_handler", total_started, created=False, cached=True
+            )
             return self.hook_handler, False
 
         async with self._hook_attach_lock:
             if self.hook_handler is not None:
+                _log_hook_timing(
+                    "client.ensure_hook_handler", total_started, created=False, cached=True
+                )
                 return self.hook_handler, False
             session_generation = self._session_generation
             process_id = self.process_id
@@ -629,16 +658,30 @@ class DiscoveredClient:
                 sort_keys=True,
             )
             loop = asyncio.get_running_loop()
-            session = await loop.run_in_executor(
-                None,
-                partial(
-                    self._agent_manager.open_hook_process,
-                    process_id,
-                    expected_identity_json=identity_json,
-                ),
-            )
+            open_started = time.perf_counter()
+            try:
+                session = await loop.run_in_executor(
+                    None,
+                    partial(
+                        self._agent_manager.open_hook_process,
+                        process_id,
+                        expected_identity_json=identity_json,
+                    ),
+                )
+            except BaseException:
+                _log_hook_timing(
+                    "client.open_hook_session", open_started, outcome="error"
+                )
+                _log_hook_timing(
+                    "client.ensure_hook_handler", total_started, outcome="error"
+                )
+                raise
+            _log_hook_timing("client.open_hook_session", open_started)
             session_id = session.get("session_id") if isinstance(session, dict) else None
             if not isinstance(session_id, str) or not session_id:
+                _log_hook_timing(
+                    "client.ensure_hook_handler", total_started, outcome="error"
+                )
                 raise ValueError(
                     "The native agent opened the Wizard101 process without "
                     "returning a valid hook session ID."
@@ -648,7 +691,14 @@ class DiscoveredClient:
                 or session_generation != self._session_generation
                 or process_id != self.process_id
             ):
+                cleanup_started = time.perf_counter()
                 await self._close_session(session_id)
+                _log_hook_timing(
+                    "client.close_stale_hook_session", cleanup_started
+                )
+                _log_hook_timing(
+                    "client.ensure_hook_handler", total_started, outcome="error"
+                )
                 raise RuntimeError(
                     "The Wizard101 client changed while its hook session was opening. "
                     "Rediscover it and try again."
@@ -656,6 +706,7 @@ class DiscoveredClient:
 
             from .memory.handler import HookHandler
 
+            build_started = time.perf_counter()
             handler = HookHandler(
                 DeimosNativeMemoryBackend(self._agent_manager, session_id),
                 self,
@@ -664,19 +715,42 @@ class DiscoveredClient:
                 memory_objects = self._build_hook_memory_objects(handler)
             except BaseException:
                 await self._close_session(session_id)
+                _log_hook_timing(
+                    "client.build_memory_objects", build_started, outcome="error"
+                )
+                _log_hook_timing(
+                    "client.ensure_hook_handler", total_started, outcome="error"
+                )
                 raise
+            _log_hook_timing("client.build_memory_objects", build_started)
             self._hook_session_id = session_id
             self.hook_handler = handler
             self.__dict__.update(memory_objects)
+            _log_hook_timing("client.ensure_hook_handler", total_started, created=True)
             return handler, True
 
     async def activate_hooks(self, wait_for_ready: bool = True) -> None:
         """Open a mutation session and activate the core hooks."""
+        total_started = time.perf_counter()
         session_generation = self._session_generation
         process_id = self.process_id
-        handler, created = await self._ensure_hook_handler()
+        ensure_started = time.perf_counter()
         try:
+            handler, created = await self._ensure_hook_handler()
+        except BaseException:
+            _log_hook_timing(
+                "client.ensure_hook_handler_call", ensure_started, outcome="error"
+            )
+            _log_hook_timing("client.activate_hooks", total_started, outcome="error")
+            raise
+        _log_hook_timing(
+            "client.ensure_hook_handler_call", ensure_started, created=created
+        )
+        try:
+            activate_started = time.perf_counter()
             await handler.activate_all_hooks(wait_for_ready=wait_for_ready)
+            _log_hook_timing("client.activate_all_hooks", activate_started)
+            identity_started = time.perf_counter()
             if (
                 not self._running
                 or session_generation != self._session_generation
@@ -691,12 +765,17 @@ class DiscoveredClient:
                     "The Wizard101 client changed identity while its core hooks "
                     "were activating. Rediscover it and try again."
                 )
+            _log_hook_timing("client.validate_identity", identity_started)
         except BaseException:
+            _log_hook_timing("client.activate_hooks", total_started, outcome="error")
             if created and handler is self.hook_handler:
+                cleanup_started = time.perf_counter()
                 session_id = self._detach_hook_session()
                 if session_id is not None:
                     await self._close_session(session_id)
+                _log_hook_timing("client.cleanup_failed_activation", cleanup_started)
             raise
+        _log_hook_timing("client.activate_hooks", total_started)
 
     @property
     def mouse_handler(self):

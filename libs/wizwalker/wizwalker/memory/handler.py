@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
+import time
 from contextlib import suppress
 from typing import Any
 import warnings
@@ -23,6 +25,20 @@ from .hooks import (
     MemoryHook
 )
 from .memory_reader import MemoryReader, Primitive
+
+
+def _log_hook_timing(phase: str, started: float, *, outcome: str = "ok", **details):
+    payload = {
+        "component": "wizwalker",
+        "event": "hook_timing",
+        "phase": phase,
+        "outcome": outcome,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+        **details,
+    }
+    log = getattr(logger, "info", None) or getattr(logger, "debug", None)
+    if log is not None:
+        log(f"HOOK_TIMING {json.dumps(payload, sort_keys=True, default=str)}")
 
 
 # noinspection PyUnresolvedReferences
@@ -180,16 +196,53 @@ class HookHandler(MemoryReader):
         return bool(getattr(self._backend, "supports_feature_hooks", False))
 
     async def _activate_agent_feature_hook(self, hook_type, hook_name: str, exports):
-        await self.run_in_executor(self._backend.activate_feature_hook, hook_name)
+        total_started = time.perf_counter()
+        activate_started = time.perf_counter()
+        try:
+            await self.run_in_executor(self._backend.activate_feature_hook, hook_name)
+        except BaseException:
+            _log_hook_timing(
+                "feature_hook.activate_rpc",
+                activate_started,
+                outcome="error",
+                hook=hook_name,
+            )
+            _log_hook_timing(
+                "feature_hook.total",
+                total_started,
+                outcome="error",
+                hook=hook_name,
+            )
+            raise
+        _log_hook_timing(
+            "feature_hook.activate_rpc", activate_started, hook=hook_name
+        )
         resolved = {}
         try:
             for addr_name, export_name in exports.items():
+                export_started = time.perf_counter()
                 resolved[addr_name] = await self.run_in_executor(
                     self._backend.read_feature_hook_export, export_name
                 )
+                _log_hook_timing(
+                    "feature_hook.read_export",
+                    export_started,
+                    hook=hook_name,
+                    export=export_name,
+                )
         except Exception:
+            _log_hook_timing(
+                "feature_hook.read_exports",
+                total_started,
+                outcome="error",
+                hook=hook_name,
+            )
+            cleanup_started = time.perf_counter()
             await self.run_in_executor(
                 self._backend.deactivate_feature_hook, hook_name
+            )
+            _log_hook_timing(
+                "feature_hook.cleanup", cleanup_started, hook=hook_name
             )
             raise
         self._active_hooks[hook_type] = hook_name
@@ -197,6 +250,7 @@ class HookHandler(MemoryReader):
             self._base_addrs[addr_name] = resolved[addr_name]
             self._agent_feature_exports[addr_name] = export_name
         self._ensure_core_hook_heartbeat()
+        _log_hook_timing("feature_hook.total", total_started, hook=hook_name)
 
     async def _deactivate_agent_feature_hook(self, hook_type, hook_name: str, exports):
         await self.run_in_executor(self._backend.deactivate_feature_hook, hook_name)
@@ -345,11 +399,23 @@ class HookHandler(MemoryReader):
             wait_for_ready: Wait for hook values to be written
             timeout: How long to wait for hook values to be written (None for no timeout)
         """
+        total_started = time.perf_counter()
         if self._uses_agent_core_hooks():
             if self._active_hooks:
                 duplicate = next(iter(self._active_hooks))
                 raise HookAlreadyActivated(duplicate.__name__.removesuffix("Hook"))
-            await self.run_in_executor(self._backend.activate_core_hooks)
+            core_started = time.perf_counter()
+            try:
+                await self.run_in_executor(self._backend.activate_core_hooks)
+            except BaseException:
+                _log_hook_timing(
+                    "activate_all.core_rpc", core_started, outcome="error"
+                )
+                _log_hook_timing(
+                    "activate_all.total", total_started, outcome="error", backend="agent"
+                )
+                raise
+            _log_hook_timing("activate_all.core_rpc", core_started)
             mappings = (
                 (PlayerHook, "player", "player_struct"),
                 (QuestHook, "quest", "quest_struct"),
@@ -359,9 +425,15 @@ class HookHandler(MemoryReader):
                 (RenderContextHook, "render_context", "current_render_context"),
             )
             try:
+                register_started = time.perf_counter()
                 for hook_type, hook_name, addr_name in mappings:
                     self._active_hooks[hook_type] = hook_name
                     self._base_addrs[addr_name] = hook_name
+                _log_hook_timing(
+                    "activate_all.register_core_mappings",
+                    register_started,
+                    hook_count=len(mappings),
+                )
                 if self._uses_agent_feature_hooks():
                     await self._activate_agent_feature_hook(
                         MovementTeleportHook,
@@ -370,9 +442,25 @@ class HookHandler(MemoryReader):
                     )
                 self._ensure_core_hook_heartbeat()
                 if wait_for_ready:
+                    async def wait_for_hook(hook_name):
+                        ready_started = time.perf_counter()
+                        try:
+                            await self._wait_for_core_hook(hook_name, timeout)
+                        except BaseException:
+                            _log_hook_timing(
+                                "activate_all.wait_ready",
+                                ready_started,
+                                outcome="error",
+                                hook=hook_name,
+                            )
+                            raise
+                        _log_hook_timing(
+                            "activate_all.wait_ready", ready_started, hook=hook_name
+                        )
+
                     await asyncio.gather(
                         *(
-                            self._wait_for_core_hook(hook_name, timeout)
+                            wait_for_hook(hook_name)
                             for hook_name in (
                                 "player",
                                 "player_stat",
@@ -383,6 +471,7 @@ class HookHandler(MemoryReader):
                         )
                     )
             except Exception:
+                cleanup_started = time.perf_counter()
                 if MovementTeleportHook in self._active_hooks:
                     try:
                         await self.run_in_executor(
@@ -400,32 +489,70 @@ class HookHandler(MemoryReader):
                     self._base_addrs = {}
                     self._agent_feature_exports = {}
                     await self._stop_core_hook_heartbeat()
+                _log_hook_timing(
+                    "activate_all.cleanup", cleanup_started, outcome="ok"
+                )
+                _log_hook_timing(
+                    "activate_all.total", total_started, outcome="error", backend="agent"
+                )
                 raise
+            _log_hook_timing(
+                "activate_all.total", total_started, backend="agent"
+            )
             return
-        await self.activate_player_hook(wait_for_ready=False)
-        # quest hook is not written if the quest arrow is off
-        await self.activate_quest_hook()
-        await self.activate_player_stat_hook(wait_for_ready=False)
-        await self.activate_client_hook(wait_for_ready=False)
-        await self.activate_root_window_hook(wait_for_ready=False)
-        await self.activate_render_context_hook(wait_for_ready=False)
-        await self.activate_movement_teleport_hook(wait_for_ready=False)
-
-        if wait_for_ready:
-            wait_tasks = []
-            for atter_name in [
-                "player_struct",
-                "player_stat_struct",
-                "current_client",
-                "current_root_window",
-                "current_render_context",
-            ]:
-                value = self._base_addrs[atter_name]
-                wait_tasks.append(
-                    asyncio.create_task(self._wait_for_value(value, timeout))
+        legacy_hooks = (
+            ("player", lambda: self.activate_player_hook(wait_for_ready=False)),
+            ("quest", self.activate_quest_hook),
+            ("player_stat", lambda: self.activate_player_stat_hook(wait_for_ready=False)),
+            ("client", lambda: self.activate_client_hook(wait_for_ready=False)),
+            ("root_window", lambda: self.activate_root_window_hook(wait_for_ready=False)),
+            (
+                "render_context",
+                lambda: self.activate_render_context_hook(wait_for_ready=False),
+            ),
+            (
+                "movement_teleport",
+                lambda: self.activate_movement_teleport_hook(wait_for_ready=False),
+            ),
+        )
+        try:
+            for hook_name, activate in legacy_hooks:
+                hook_started = time.perf_counter()
+                await activate()
+                _log_hook_timing(
+                    "activate_all.legacy_hook", hook_started, hook=hook_name
                 )
 
-            await asyncio.gather(*wait_tasks)
+            if wait_for_ready:
+                async def wait_for_value(attribute_name, address):
+                    ready_started = time.perf_counter()
+                    await self._wait_for_value(address, timeout)
+                    _log_hook_timing(
+                        "activate_all.wait_ready",
+                        ready_started,
+                        hook=attribute_name,
+                    )
+
+                wait_tasks = []
+                for attribute_name in [
+                    "player_struct",
+                    "player_stat_struct",
+                    "current_client",
+                    "current_root_window",
+                    "current_render_context",
+                ]:
+                    value = self._base_addrs[attribute_name]
+                    wait_tasks.append(
+                        asyncio.create_task(wait_for_value(attribute_name, value))
+                    )
+
+                await asyncio.gather(*wait_tasks)
+        except BaseException:
+            _log_hook_timing(
+                "activate_all.total", total_started, outcome="error", backend="legacy"
+            )
+            raise
+        _log_hook_timing("activate_all.total", total_started, backend="legacy")
 
     async def activate_player_hook(
         self, *, wait_for_ready: bool = True, timeout: float = None

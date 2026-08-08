@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use deimos_core::memory::{
     ByteOrder, MemoryBatchReadRequest, MemoryBatchReadResponse, MemoryItemError,
@@ -11,7 +12,9 @@ use deimos_core::memory::{
 };
 use deimos_core::process::{ProcessDescriptor, ProcessIdentity};
 use deimos_core::rpc::{RpcError, RpcErrorCode};
+use serde_json::json;
 
+use crate::diagnostics::HookTimingSpan;
 use crate::process::{MemoryBackend, ProcessApiError, ProcessBackendError, ProcessSessionRegistry};
 
 const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
@@ -222,6 +225,7 @@ pub fn scan<B: MemoryBackend>(
     backend: &B,
     request: &MemoryScanRequest,
 ) -> Result<MemoryScanResponse, MemoryApiError> {
+    let timing = HookTimingSpan::new("memory.scan", "total");
     let signature = parse_signature(&request.signature)?;
     validate_scan_limits(request.max_matches)?;
     let collected =
@@ -236,7 +240,18 @@ pub fn scan<B: MemoryBackend>(
                 request.unique,
             )
         })?;
-    finish_scan(request, collected)
+    let response = finish_scan(request, collected)?;
+    timing.finish(
+        "ok",
+        json!({
+            "signature_count": 1,
+            "match_count": response.matches.len(),
+            "scanned_regions": response.scanned_regions,
+            "skipped_regions": response.skipped_regions,
+            "scope": scan_scope_name(&request.scope),
+        }),
+    );
+    Ok(response)
 }
 
 pub(crate) fn scan_optional_unique_signatures<B: MemoryBackend>(
@@ -246,17 +261,39 @@ pub(crate) fn scan_optional_unique_signatures<B: MemoryBackend>(
     scope: &MemoryScanScope,
     signatures: &[&str],
 ) -> Result<Vec<Option<usize>>, MemoryApiError> {
+    let timing = HookTimingSpan::new("memory.scan_batch", "total");
     let parsed = signatures
         .iter()
         .map(|signature| parse_signature(signature))
         .collect::<Result<Vec<_>, _>>()?;
     if parsed.is_empty() {
+        timing.finish(
+            "ok",
+            json!({"signature_count": 0, "match_count": 0, "scope": scan_scope_name(scope)}),
+        );
         return Ok(Vec::new());
     }
 
-    sessions.with_live_session(backend, session_id, |backend, handle, process| {
-        scan_for_optional_unique_signatures(backend, handle, process, scope, &parsed)
-    })
+    let resolved =
+        sessions.with_live_session(backend, session_id, |backend, handle, process| {
+            scan_for_optional_unique_signatures(backend, handle, process, scope, &parsed)
+        })?;
+    timing.finish(
+        "ok",
+        json!({
+            "signature_count": signatures.len(),
+            "match_count": resolved.iter().flatten().count(),
+            "scope": scan_scope_name(scope),
+        }),
+    );
+    Ok(resolved)
+}
+
+fn scan_scope_name(scope: &MemoryScanScope) -> &'static str {
+    match scope {
+        MemoryScanScope::Process => "process",
+        MemoryScanScope::Module { .. } => "module",
+    }
 }
 
 pub fn pointer_chain<B: MemoryBackend>(
@@ -366,9 +403,11 @@ fn scan_for_addresses<B: MemoryBackend>(
     unique: bool,
 ) -> Result<ScanCollected, MemoryApiError> {
     let identity = process_identity(process)?;
+    let enumerate_timing = HookTimingSpan::new("memory.scan", "enumerate_regions");
     let mut regions = backend
         .enumerate_memory_regions(handle, identity)
         .map_err(MemoryApiError::from)?;
+    enumerate_timing.finish("ok", json!({"region_count": regions.len()}));
     regions.sort_by_key(|region| parse_address(&region.base_address).unwrap_or(usize::MAX));
     if regions.len() > deimos_core::memory::MAX_SCAN_REGIONS {
         return Err(MemoryApiError::request(
@@ -376,10 +415,12 @@ fn scan_for_addresses<B: MemoryBackend>(
             "scan region count exceeds the protocol limit",
         ));
     }
+    let bounds_timing = HookTimingSpan::new("memory.scan", "resolve_scope_bounds");
     let bounds = match scope {
         MemoryScanScope::Process => None,
         MemoryScanScope::Module { name } => Some(module_bounds(backend, handle, identity, name)?),
     };
+    bounds_timing.finish("ok", json!({"scope": scan_scope_name(scope)}));
     let mut collected = ScanCollected {
         matches: Vec::new(),
         scanned_regions: 0,
@@ -434,9 +475,11 @@ fn scan_for_optional_unique_signatures<B: MemoryBackend>(
     signatures: &[Vec<Option<u8>>],
 ) -> Result<Vec<Option<usize>>, MemoryApiError> {
     let identity = process_identity(process)?;
+    let enumerate_timing = HookTimingSpan::new("memory.scan_batch", "enumerate_regions");
     let mut regions = backend
         .enumerate_memory_regions(handle, identity)
         .map_err(MemoryApiError::from)?;
+    enumerate_timing.finish("ok", json!({"region_count": regions.len()}));
     regions.sort_by_key(|region| parse_address(&region.base_address).unwrap_or(usize::MAX));
     if regions.len() > deimos_core::memory::MAX_SCAN_REGIONS {
         return Err(MemoryApiError::request(
@@ -444,10 +487,12 @@ fn scan_for_optional_unique_signatures<B: MemoryBackend>(
             "scan region count exceeds the protocol limit",
         ));
     }
+    let bounds_timing = HookTimingSpan::new("memory.scan_batch", "resolve_scope_bounds");
     let bounds = match scope {
         MemoryScanScope::Process => None,
         MemoryScanScope::Module { name } => Some(module_bounds(backend, handle, identity, name)?),
     };
+    bounds_timing.finish("ok", json!({"scope": scan_scope_name(scope)}));
     let mut matches = vec![Vec::new(); signatures.len()];
     for region in regions {
         let start = parse_address(&region.base_address)?;
@@ -501,6 +546,12 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
     signatures: &[Vec<Option<u8>>],
     matches: &mut [Vec<usize>],
 ) -> Result<(), MemoryApiError> {
+    let timing = HookTimingSpan::new("memory.scan_batch", "scan_region");
+    let mut read_elapsed = Duration::ZERO;
+    let mut match_elapsed = Duration::ZERO;
+    let mut chunk_count = 0usize;
+    let mut read_attempts = 0usize;
+    let mut bytes_read = 0usize;
     let overlap = signatures
         .iter()
         .map(Vec::len)
@@ -518,11 +569,30 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
                 "scan address overflowed",
             )
         })?;
-        let (bytes, actual_request_size) =
+        let read_started = Instant::now();
+        let (bytes, actual_request_size, attempts) =
             match read_scan_chunk(backend, handle, address, request_size) {
                 Ok(result) => result,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    read_elapsed += read_started.elapsed();
+                    timing.finish(
+                        "skipped",
+                        json!({
+                            "region_size": size,
+                            "chunk_count": chunk_count,
+                            "read_attempts": read_attempts,
+                            "bytes_read": bytes_read,
+                            "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+                            "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+                        }),
+                    );
+                    return Ok(());
+                }
             };
+        read_elapsed += read_started.elapsed();
+        chunk_count += 1;
+        read_attempts += attempts;
+        bytes_read += bytes.len();
         chunk_size = actual_request_size;
         let previous_end = start.checked_add(offset).ok_or_else(|| {
             MemoryApiError::request(
@@ -533,6 +603,7 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
         let mut combined = previous;
         combined.extend_from_slice(&bytes);
         let combined_start = address.saturating_sub(combined.len() - bytes.len());
+        let match_started = Instant::now();
         for (signature_index, signature) in signatures.iter().enumerate() {
             if matches[signature_index].len() > 1 || signature.len() > combined.len() {
                 continue;
@@ -557,13 +628,40 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
                 Ok(matches[signature_index].len() <= 1)
             })?;
         }
+        match_elapsed += match_started.elapsed();
         offset += bytes.len();
         if bytes.len() < actual_request_size {
+            timing.finish(
+                "partial",
+                json!({
+                    "region_size": size,
+                    "signature_count": signatures.len(),
+                    "chunk_count": chunk_count,
+                    "read_attempts": read_attempts,
+                    "fallback_attempts": read_attempts.saturating_sub(chunk_count),
+                    "bytes_read": bytes_read,
+                    "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+                    "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+                }),
+            );
             return Ok(());
         }
         previous = combined.into_iter().rev().take(overlap).collect::<Vec<_>>();
         previous.reverse();
     }
+    timing.finish(
+        "ok",
+        json!({
+            "region_size": size,
+            "signature_count": signatures.len(),
+            "chunk_count": chunk_count,
+            "read_attempts": read_attempts,
+            "fallback_attempts": read_attempts.saturating_sub(chunk_count),
+            "bytes_read": bytes_read,
+            "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+            "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+        }),
+    );
     Ok(())
 }
 
@@ -575,6 +673,12 @@ fn scan_region<B: MemoryBackend>(
     options: ScanOptions<'_>,
     collected: &mut ScanCollected,
 ) -> Result<(), MemoryApiError> {
+    let timing = HookTimingSpan::new("memory.scan", "scan_region");
+    let mut read_elapsed = Duration::ZERO;
+    let mut match_elapsed = Duration::ZERO;
+    let mut chunk_count = 0usize;
+    let mut read_attempts = 0usize;
+    let mut bytes_read = 0usize;
     let overlap = options.signature.len().saturating_sub(1);
     let mut offset = 0usize;
     let mut chunk_size = SCAN_CHUNK_SIZE;
@@ -587,10 +691,12 @@ fn scan_region<B: MemoryBackend>(
                 "scan address overflowed",
             )
         })?;
-        let (bytes, actual_request_size) =
+        let read_started = Instant::now();
+        let (bytes, actual_request_size, attempts) =
             match read_scan_chunk(backend, handle, address, request_size) {
                 Ok(result) => result,
                 Err(error) => {
+                    read_elapsed += read_started.elapsed();
                     collected.skipped_regions += 1;
                     if collected.errors.len() < MAX_SCAN_ERRORS {
                         collected.errors.push(MemoryScanRegionError {
@@ -598,14 +704,30 @@ fn scan_region<B: MemoryBackend>(
                             message: error.message,
                         });
                     }
+                    timing.finish(
+                        "skipped",
+                        json!({
+                            "region_size": size,
+                            "chunk_count": chunk_count,
+                            "read_attempts": read_attempts,
+                            "bytes_read": bytes_read,
+                            "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+                            "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+                        }),
+                    );
                     return Ok(());
                 }
             };
+        read_elapsed += read_started.elapsed();
+        chunk_count += 1;
+        read_attempts += attempts;
+        bytes_read += bytes.len();
         chunk_size = actual_request_size;
         let old_end = offset;
         let mut combined = previous;
         combined.extend_from_slice(&bytes);
         let combined_start = address.saturating_sub(combined.len() - bytes.len());
+        let match_started = Instant::now();
         visit_signature_matches(&combined, options.signature, |match_offset| {
             let candidate = combined_start.checked_add(match_offset).ok_or_else(|| {
                 MemoryApiError::request(
@@ -646,17 +768,58 @@ fn scan_region<B: MemoryBackend>(
             }
             Ok(true)
         })?;
+        match_elapsed += match_started.elapsed();
         if options.unique && collected.matches.len() > 1 {
+            timing.finish(
+                "short_circuit",
+                json!({
+                    "region_size": size,
+                    "signature_count": 1,
+                    "match_count": collected.matches.len(),
+                    "chunk_count": chunk_count,
+                    "read_attempts": read_attempts,
+                    "fallback_attempts": read_attempts.saturating_sub(chunk_count),
+                    "bytes_read": bytes_read,
+                    "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+                    "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+                }),
+            );
             return Ok(());
         }
         offset += bytes.len();
         if bytes.len() < actual_request_size {
             collected.skipped_regions += 1;
+            timing.finish(
+                "partial",
+                json!({
+                    "region_size": size,
+                    "signature_count": 1,
+                    "chunk_count": chunk_count,
+                    "read_attempts": read_attempts,
+                    "fallback_attempts": read_attempts.saturating_sub(chunk_count),
+                    "bytes_read": bytes_read,
+                    "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+                    "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+                }),
+            );
             return Ok(());
         }
         previous = combined.into_iter().rev().take(overlap).collect::<Vec<_>>();
         previous.reverse();
     }
+    timing.finish(
+        "ok",
+        json!({
+            "region_size": size,
+            "signature_count": 1,
+            "chunk_count": chunk_count,
+            "read_attempts": read_attempts,
+            "fallback_attempts": read_attempts.saturating_sub(chunk_count),
+            "bytes_read": bytes_read,
+            "read_ms": read_elapsed.as_secs_f64() * 1000.0,
+            "match_ms": match_elapsed.as_secs_f64() * 1000.0,
+        }),
+    );
     Ok(())
 }
 
@@ -665,11 +828,13 @@ fn read_scan_chunk<B: MemoryBackend>(
     handle: &B::Handle,
     address: usize,
     preferred_size: usize,
-) -> Result<(Vec<u8>, usize), ProcessBackendError> {
+) -> Result<(Vec<u8>, usize, usize), ProcessBackendError> {
     let mut request_size = preferred_size;
+    let mut attempts = 0usize;
     loop {
+        attempts += 1;
         match backend.read_memory(handle, address, request_size) {
-            Ok(bytes) => return Ok((bytes, request_size)),
+            Ok(bytes) => return Ok((bytes, request_size, attempts)),
             Err(_) if request_size > MIN_SCAN_CHUNK_SIZE => {
                 request_size = (request_size / 2).max(MIN_SCAN_CHUNK_SIZE);
             }

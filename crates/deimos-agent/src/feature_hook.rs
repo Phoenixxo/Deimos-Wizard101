@@ -15,8 +15,10 @@ use deimos_core::memory::{
 };
 use deimos_core::process::{ModuleDescriptor, ProcessKind, ProcessSessionId};
 use deimos_core::rpc::{RpcError, RpcErrorCode};
+use serde_json::json;
 
 use crate::core_hook;
+use crate::diagnostics::HookTimingSpan;
 use crate::hook::{self, HookApiError, HookMetadata, HookPatch, HookState};
 use crate::memory::{self, MemoryApiError};
 use crate::mutation::{self, MutationApiError, MutationState};
@@ -157,6 +159,9 @@ pub fn activate<B: MutationBackend>(
         ));
     }
     let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
+    let operation = format!("feature_hook.activate.{}", hook_key(request.hook));
+    let timing = HookTimingSpan::new(&operation, "total");
+    let template_timing = HookTimingSpan::new(&operation, "build_template");
     let template = template_for_target(
         sessions,
         backend,
@@ -164,6 +169,13 @@ pub fn activate<B: MutationBackend>(
         request.hook,
         fixture,
     )?;
+    template_timing.finish(
+        "ok",
+        json!({
+            "fixture": fixture,
+            "auxiliary_patch_count": template.auxiliary_patches.len(),
+        }),
+    );
     let mut metadata = HookMetadata::default();
     for (export, (offset, size)) in &template.exports {
         metadata
@@ -215,6 +227,13 @@ pub fn activate<B: MutationBackend>(
         &|allocation| Ok(payload_builder(allocation)),
         now,
     )?;
+    timing.finish(
+        "ok",
+        json!({
+            "fixture": fixture,
+            "hook": hook_key(request.hook),
+        }),
+    );
     Ok(FeatureHookResponse {
         session_id: request.session_id.clone(),
         hook: request.hook,

@@ -3490,10 +3490,12 @@ if __name__ == "__main__":
 	if sys.platform == 'darwin':
 		try:
 			import deimos_native
-			from src.macos_runtime import start_configured_agent
+			from src.macos_runtime import configured_bottle, start_configured_agent
 			agent_manager = start_configured_agent(settings, native_module=deimos_native)
 			if agent_manager is not None:
 				_write_lifecycle_event('started configured CrossOver helper agent')
+				agent_log = configured_bottle(settings) / '.deimos' / 'agent-stderr.log'
+				logger.info(f'Native hook timing details are written to {agent_log}')
 		except Exception as error:
 			runtime_error = str(error)
 			logger.warning(f'Could not start the configured CrossOver helper agent: {runtime_error}')

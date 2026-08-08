@@ -10,7 +10,9 @@ use deimos_core::memory::{
 };
 use deimos_core::process::ProcessKind;
 use deimos_core::rpc::RpcErrorCode;
+use serde_json::json;
 
+use crate::diagnostics::HookTimingSpan;
 use crate::hook::{self, HookApiError, HookState};
 use crate::memory;
 use crate::mutation::MutationState;
@@ -94,7 +96,9 @@ pub fn activate_all<B: MutationBackend>(
     request: &CoreHookSessionRequest,
     now: Instant,
 ) -> Result<CoreHooksResponse, HookApiError> {
+    let total_timing = HookTimingSpan::new("core_hooks.activate_all", "total");
     let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
+    let template_timing = HookTimingSpan::new("core_hooks.activate_all", "build_templates");
     let inactive = CoreHook::ALL
         .into_iter()
         .filter(|selected| {
@@ -111,6 +115,11 @@ pub fn activate_all<B: MutationBackend>(
         .iter()
         .map(|template| template.signature)
         .collect::<Vec<_>>();
+    template_timing.finish(
+        "ok",
+        json!({"hook_count": inactive.len(), "fixture": fixture}),
+    );
+    let scan_timing = HookTimingSpan::new("core_hooks.activate_all", "resolve_signatures");
     let resolved_matches = memory::scan_optional_unique_signatures(
         sessions,
         backend,
@@ -118,6 +127,13 @@ pub fn activate_all<B: MutationBackend>(
         &scan_scope(fixture),
         &signatures,
     )?;
+    scan_timing.finish(
+        "ok",
+        json!({
+            "signature_count": signatures.len(),
+            "resolved_count": resolved_matches.iter().flatten().count(),
+        }),
+    );
     let mut resolved_targets = BTreeMap::new();
     for ((selected, template), match_address) in
         inactive.into_iter().zip(templates).zip(resolved_matches)
@@ -139,6 +155,10 @@ pub fn activate_all<B: MutationBackend>(
     let mut activated = Vec::new();
     let mut responses = Vec::new();
     for selected in CoreHook::ALL {
+        let hook_timing = HookTimingSpan::new(
+            "core_hooks.activate_all",
+            format!("activate_{}", hook_key(selected)),
+        );
         let key = hook_key(selected);
         let was_active = hooks
             .allocation_address(&request.session_id, &key)
@@ -160,6 +180,7 @@ pub fn activate_all<B: MutationBackend>(
                     activated.push(selected);
                 }
                 responses.push(response);
+                hook_timing.finish("ok", json!({"already_active": was_active}));
             }
             Err(activation_error) => {
                 let mut rollback_failures = Vec::new();
@@ -191,6 +212,7 @@ pub fn activate_all<B: MutationBackend>(
             }
         }
     }
+    total_timing.finish("ok", json!({"hook_count": responses.len()}));
     Ok(CoreHooksResponse {
         session_id: request.session_id.clone(),
         hooks: responses,

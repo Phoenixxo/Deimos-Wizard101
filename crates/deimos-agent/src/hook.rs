@@ -13,7 +13,9 @@ use deimos_core::memory::{
 };
 use deimos_core::process::ProcessSessionId;
 use deimos_core::rpc::{RpcError, RpcErrorCode};
+use serde_json::json;
 
+use crate::diagnostics::HookTimingSpan;
 use crate::memory::{self, MemoryApiError};
 use crate::mutation::{self, MutationApiError, MutationState};
 use crate::process::{MutationBackend, ProcessSessionRegistry};
@@ -328,6 +330,8 @@ fn activate_transactional_template<B: MutationBackend>(
     payload_builder: Option<&dyn Fn(usize) -> Result<Vec<u8>, HookApiError>>,
     now: Instant,
 ) -> Result<HookActivateResponse, HookApiError> {
+    let operation = format!("hook.activate.{}", request.hook_key);
+    let activation_timing = HookTimingSpan::new(&operation, "total");
     validate_hook_key(&request.hook_key)?;
     let signature = memory::parse_signature(&request.signature)?;
     if signature.len() < MIN_HOOK_SIGNATURE_BYTES {
@@ -376,10 +380,12 @@ fn activate_transactional_template<B: MutationBackend>(
             .and_then(|entries| entries.get_mut(&request.hook_key))
             .expect("existing hook record must remain present")
             .lease_deadline = now + HOOK_LEASE;
+        activation_timing.finish("cached", json!({"hook_key": request.hook_key}));
         return Ok(response);
     }
 
     // Every target is resolved and verified before allocation or protection changes.
+    let target_timing = HookTimingSpan::new(&operation, "resolve_and_validate_target");
     let target_address = if let Some(target) = resolved_target {
         target
     } else {
@@ -479,6 +485,14 @@ fn activate_transactional_template<B: MutationBackend>(
     if replay_original {
         validate_relocatable_x64(&original_bytes)?;
     }
+    target_timing.finish(
+        "ok",
+        json!({
+            "pre_resolved": resolved_target.is_some(),
+            "overwrite_size": overwrite_size,
+        }),
+    );
+    let auxiliary_timing = HookTimingSpan::new(&operation, "validate_auxiliary_patches");
     let mut prepared_auxiliary = Vec::with_capacity(auxiliary_patches.len());
     for patch in auxiliary_patches {
         if patch.expected_bytes.is_empty()
@@ -543,6 +557,10 @@ fn activate_transactional_template<B: MutationBackend>(
             keep_writable: patch.keep_writable,
         });
     }
+    auxiliary_timing.finish(
+        "ok",
+        json!({"auxiliary_patch_count": prepared_auxiliary.len()}),
+    );
     let trampoline_size = request
         .payload
         .len()
@@ -561,6 +579,7 @@ fn activate_transactional_template<B: MutationBackend>(
         ));
     }
 
+    let allocation_timing = HookTimingSpan::new(&operation, "allocate_trampoline");
     let allocation = if overwrite_size < ABSOLUTE_JUMP_BYTES {
         mutation::allocate_near(
             sessions,
@@ -582,6 +601,13 @@ fn activate_transactional_template<B: MutationBackend>(
             },
         )?
     };
+    allocation_timing.finish(
+        "ok",
+        json!({
+            "allocation_size": trampoline_size,
+            "near_target": overwrite_size < ABSOLUTE_JUMP_BYTES,
+        }),
+    );
     let allocation_address = parse_agent_address(&allocation.address);
     let record = HookRecord {
         spec,
@@ -602,6 +628,7 @@ fn activate_transactional_template<B: MutationBackend>(
         lease_deadline: now + HOOK_LEASE,
     };
     hooks.insert(request.session_id.clone(), request.hook_key.clone(), record);
+    let payload_timing = HookTimingSpan::new(&operation, "build_payload_and_trampoline");
     let payload = match payload_builder {
         Some(builder) => match builder(allocation_address) {
             Ok(payload) if payload.len() == request.payload.len() => payload,
@@ -638,6 +665,11 @@ fn activate_transactional_template<B: MutationBackend>(
             )
         })?,
     );
+    payload_timing.finish(
+        "ok",
+        json!({"payload_size": payload.len(), "trampoline_size": trampoline.len()}),
+    );
+    let trampoline_timing = HookTimingSpan::new(&operation, "write_trampoline");
     if let Err(error) = mutation::write(
         sessions,
         backend,
@@ -649,6 +681,8 @@ fn activate_transactional_template<B: MutationBackend>(
     ) {
         return activation_failure(sessions, backend, mutations, hooks, request, error.into());
     }
+    trampoline_timing.finish("ok", json!({"bytes": trampoline_size}));
+    let flush_timing = HookTimingSpan::new(&operation, "flush_trampoline_instruction_cache");
     if let Err(error) = mutation::flush_instruction_cache(
         sessions,
         backend,
@@ -658,6 +692,7 @@ fn activate_transactional_template<B: MutationBackend>(
     ) {
         return activation_failure(sessions, backend, mutations, hooks, request, error.into());
     }
+    flush_timing.finish("ok", json!({"bytes": trampoline_size}));
 
     let activation_patches = hooks
         .get(&request.session_id, &request.hook_key)
@@ -691,6 +726,15 @@ fn activate_transactional_template<B: MutationBackend>(
         .expect("active hook record must remain tracked");
     record.activation_complete = true;
     let response = activation_response(request, record);
+    activation_timing.finish(
+        "ok",
+        json!({
+            "hook_key": request.hook_key,
+            "overwrite_size": overwrite_size,
+            "payload_size": request.payload.len(),
+            "auxiliary_patch_count": activation_patches.len(),
+        }),
+    );
     Ok(response)
 }
 
@@ -703,28 +747,52 @@ fn commit_activation<B: MutationBackend>(
     activation_patches: &[usize],
     detour: Vec<u8>,
 ) -> Result<(), HookApiError> {
+    let operation = format!("hook.activate.{hook_key}");
+    let commit_timing = HookTimingSpan::new(&operation, "suspended_commit_total");
+    let suspend_timing = HookTimingSpan::new(&operation, "suspend_threads");
     let suspended = mutation::suspend_process_threads(sessions, backend, session_id)?;
+    suspend_timing.finish("ok", json!({}));
     let commit = (|| {
         let record = hooks
             .get(session_id, hook_key)
             .cloned()
             .expect("provisional hook record must remain tracked");
+        let idle_timing = HookTimingSpan::new(&operation, "validate_thread_instruction_ranges");
         ensure_activation_ranges_are_idle(&suspended, &record, activation_patches)?;
+        idle_timing.finish("ok", json!({"range_count": activation_patches.len() + 1}));
+        let revalidate_timing = HookTimingSpan::new(&operation, "revalidate_target_bytes");
         revalidate_activation_bytes(sessions, backend, session_id, &record, activation_patches)?;
+        revalidate_timing.finish("ok", json!({"range_count": activation_patches.len() + 1}));
         for index in activation_patches {
+            let patch_timing =
+                HookTimingSpan::new(&operation, format!("apply_auxiliary_patch_{index}"));
             apply_auxiliary_patch(sessions, backend, hooks, session_id, hook_key, *index)?;
+            patch_timing.finish("ok", json!({"patch_index": index}));
         }
         apply_primary_detour(sessions, backend, hooks, session_id, hook_key, detour)
     })();
     let rollback = if commit.is_err() {
-        rollback_activation_changes(sessions, backend, hooks, session_id, hook_key)
+        let rollback_timing = HookTimingSpan::new(&operation, "rollback_while_suspended");
+        let result = rollback_activation_changes(sessions, backend, hooks, session_id, hook_key);
+        rollback_timing.finish(if result.is_ok() { "ok" } else { "error" }, json!({}));
+        result
     } else {
         Ok(())
     };
+    let resume_timing = HookTimingSpan::new(&operation, "resume_threads");
     let resume = suspended
         .resume()
         .map_err(MutationApiError::from)
         .map_err(HookApiError::from);
+    resume_timing.finish(if resume.is_ok() { "ok" } else { "error" }, json!({}));
+    commit_timing.finish(
+        if commit.is_ok() && rollback.is_ok() && resume.is_ok() {
+            "ok"
+        } else {
+            "error"
+        },
+        json!({"auxiliary_patch_count": activation_patches.len()}),
+    );
     match (commit, rollback, resume) {
         (Ok(()), Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(()), Ok(())) => Err(error),
@@ -824,12 +892,14 @@ fn apply_primary_detour<B: MutationBackend>(
     hook_key: &str,
     detour: Vec<u8>,
 ) -> Result<(), HookApiError> {
+    let operation = format!("hook.activate.{hook_key}");
     let target_address = hooks
         .get(session_id, hook_key)
         .expect("provisional hook record must remain tracked")
         .target
         .address;
     let target_address_text = format_address(target_address);
+    let protect_timing = HookTimingSpan::new(&operation, "primary_make_writable");
     let protection = mutation::protect(
         sessions,
         backend,
@@ -840,6 +910,7 @@ fn apply_primary_detour<B: MutationBackend>(
             protection: MemoryProtection::ExecuteReadWrite,
         },
     )?;
+    protect_timing.finish("ok", json!({"bytes": detour.len()}));
     {
         let target = &mut hooks
             .hooks
@@ -850,6 +921,7 @@ fn apply_primary_detour<B: MutationBackend>(
         target.original_protection = Some(protection.previous_protection);
         target.may_be_modified = true;
     }
+    let write_timing = HookTimingSpan::new(&operation, "primary_write_detour");
     mutation::write(
         sessions,
         backend,
@@ -859,6 +931,8 @@ fn apply_primary_detour<B: MutationBackend>(
             bytes: detour.clone(),
         },
     )?;
+    write_timing.finish("ok", json!({"bytes": detour.len()}));
+    let flush_timing = HookTimingSpan::new(&operation, "primary_flush_instruction_cache");
     mutation::flush_instruction_cache(
         sessions,
         backend,
@@ -866,6 +940,8 @@ fn apply_primary_detour<B: MutationBackend>(
         &target_address_text,
         detour.len(),
     )?;
+    flush_timing.finish("ok", json!({"bytes": detour.len()}));
+    let restore_timing = HookTimingSpan::new(&operation, "primary_restore_protection");
     mutation::protect(
         sessions,
         backend,
@@ -876,6 +952,7 @@ fn apply_primary_detour<B: MutationBackend>(
             protection: protection.previous_protection,
         },
     )?;
+    restore_timing.finish("ok", json!({"bytes": detour.len()}));
     Ok(())
 }
 
@@ -1381,14 +1458,18 @@ fn activation_failure<B: MutationBackend>(
     request: &HookActivateRequest,
     activation_error: HookApiError,
 ) -> Result<HookActivateResponse, HookApiError> {
-    match cleanup_one(
+    let operation = format!("hook.activate.{}", request.hook_key);
+    let cleanup_timing = HookTimingSpan::new(&operation, "cleanup_failed_activation");
+    let cleanup = cleanup_one(
         sessions,
         backend,
         mutations,
         hooks,
         &request.session_id,
         &request.hook_key,
-    ) {
+    );
+    cleanup_timing.finish(if cleanup.is_ok() { "ok" } else { "error" }, json!({}));
+    match cleanup {
         Ok(()) => Err(activation_error),
         Err(_) => Err(HookApiError::request(
             RpcErrorCode::MemoryWriteFailed,

@@ -61,6 +61,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SHUTDOWN_WORKER_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub mod core_hook;
+mod diagnostics;
 pub mod feature_hook;
 pub mod game_login;
 pub mod game_process;
