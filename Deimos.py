@@ -1546,6 +1546,28 @@ async def main(agent_manager: Any = None):
 			_build_hooked_clients_info()
 		))
 
+	async def _resolve_client_account(client):
+		"""Resolve optional account metadata after the client is usable."""
+		try:
+			uid = await client.game_client.user_id()
+			logger.debug(f"[GID] _resolve_client_account '{client.title}': user_id={_mask_uid(uid)}")
+			if uid and uid != 0:
+				client.player_gid = uid
+				vault_nick = wizlaunch.get_nickname_by_gid(uid)
+				identity = _client_identity(client)
+				if vault_nick and identity not in launched_account_map:
+					launched_account_map[identity] = vault_nick
+				nick = launched_account_map.get(identity)
+				if nick:
+					wizlaunch.update_player_gid(nick, uid)
+					logger.debug(f"[GID] Saved user_id {_mask_uid(uid)} for vault account '{nick}'")
+			else:
+				client.player_gid = None
+				logger.debug(f"[GID] _resolve_client_account '{client.title}': user_id is 0, deferring")
+		except Exception as e:
+			client.player_gid = None
+			logger.debug(f"[GID] _resolve_client_account '{client.title}': exception {e}")
+
 	async def _init_client_attrs(client):
 		"""Initialize all per-client attributes. Called once per client after hooking."""
 		_safe_client_title(client)
@@ -1577,26 +1599,7 @@ async def main(agent_manager: Any = None):
 		client.buy_potions = buy_potions
 		client.client_to_follow = client_to_follow
 
-		# Resolve vault nickname via account-level user_id
-		try:
-			uid = await client.game_client.user_id()
-			logger.debug(f"[GID] _init_client_attrs '{client.title}': user_id={_mask_uid(uid)}")
-			if uid and uid != 0:
-				client.player_gid = uid
-				vault_nick = wizlaunch.get_nickname_by_gid(uid)
-				identity = _client_identity(client)
-				if vault_nick and identity not in launched_account_map:
-					launched_account_map[identity] = vault_nick
-				nick = launched_account_map.get(identity)
-				if nick:
-					wizlaunch.update_player_gid(nick, uid)
-					logger.debug(f"[GID] Saved user_id {_mask_uid(uid)} for vault account '{nick}'")
-			else:
-				client.player_gid = None
-				logger.debug(f"[GID] _init_client_attrs '{client.title}': user_id is 0, deferring")
-		except Exception as e:
-			client.player_gid = None
-			logger.debug(f"[GID] _init_client_attrs '{client.title}': exception {e}")
+		client.player_gid = None
 
 		# Set follower/leader statuses for auto questing/sigil
 		if client_to_follow and client_to_follow in client.title:
@@ -2033,12 +2036,16 @@ async def main(agent_manager: Any = None):
 						except wizwalker.errors.HookAlreadyActivated:
 							already_activated = True
 						await _init_client_attrs(nc)
+						_hooking_in_progress.discard(handle)
+						_send_hooked_clients_update()
 						_auto_hook_retries.clear(handle)
 						activation_note = ", already hooked" if already_activated else ""
 						logger.info(
 							f"Auto-hooked vault-launched client '{nc.title}' "
 							f"({launched_account_map[handle]}{activation_note})."
 						)
+						await _resolve_client_account(nc)
+						_send_hooked_clients_update()
 						hooked_any = True
 					except AutoHookClientNotReady as e:
 						cleaned = await _release_failed_auto_hook(nc, handle)
@@ -2106,16 +2113,23 @@ async def main(agent_manager: Any = None):
 						identity = _client_identity(nc)
 						_hooking_in_progress.add(identity)
 						_send_hooked_clients_update()
+						hook_succeeded = False
 						try:
 							await nc.activate_hooks()
+							hook_succeeded = True
 						except wizwalker.errors.HookAlreadyActivated:
+							hook_succeeded = True
 							logger.debug(f"Client '{nc.title}' already hooked, skipping.")
 						except Exception as e:
 							logger.error(f"Failed to hook client '{nc.title}': {e}")
 						finally:
 							_hooking_in_progress.discard(identity)
+						if not hook_succeeded:
+							continue
 						await _init_client_attrs(nc)
+						_send_hooked_clients_update()
 						logger.info(f"New client '{nc.title}' hooked.")
+						await _resolve_client_account(nc)
 					_send_hooked_clients_update()
 
 					# Check if count restored
@@ -2801,6 +2815,7 @@ async def main(agent_manager: Any = None):
 								continue
 							# Create client, assign title, hook, init
 							nc = None
+							already_activated = False
 							try:
 								nc = walker.manage_client(handle)
 								existing_nums = set()
@@ -2814,11 +2829,8 @@ async def main(agent_manager: Any = None):
 								_hooking_in_progress.add(handle)
 								_send_hooked_clients_update()
 								await nc.activate_hooks()
-								await _init_client_attrs(nc)
-								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}).")
 							except wizwalker.errors.HookAlreadyActivated:
-								await _init_client_attrs(nc)
-								logger.info(f"Manually hooked client '{nc.title}' (handle {handle}, already hooked).")
+								already_activated = True
 							except Exception as e:
 								_failed_hook_handles.add(handle)
 								_log_native_failure(f"Failed to hook client (handle {handle})", e)
@@ -2835,7 +2847,15 @@ async def main(agent_manager: Any = None):
 								_hooking_in_progress.discard(handle)
 								_send_hooked_clients_update()
 								continue
+							await _init_client_attrs(nc)
 							_hooking_in_progress.discard(handle)
+							_send_hooked_clients_update()
+							activation_note = ", already hooked" if already_activated else ""
+							logger.info(
+								f"Manually hooked client '{nc.title}' "
+								f"(handle {handle}{activation_note})."
+							)
+							await _resolve_client_account(nc)
 							_send_hooked_clients_update()
 							_restart_always_on_tasks()
 							await _restart_active_toggle_tasks()

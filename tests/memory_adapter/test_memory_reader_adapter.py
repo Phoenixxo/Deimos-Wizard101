@@ -474,6 +474,52 @@ class DeimosNativeBackendTests(unittest.IsolatedAsyncioTestCase):
             0x140001000,
         )
 
+    async def test_module_single_scan_uses_agent_scan_operation(self):
+        self.manager.scan_memory = MagicMock(
+            return_value={"matches": ["0x140001234"]}
+        )
+
+        result = await self.reader.pattern_scan(
+            rb"\x48\x8B..\x90",
+            module="WizardGraphicalClient.exe",
+        )
+
+        self.assertEqual(result, 0x140001234)
+        self.manager.scan_memory.assert_called_once_with(
+            "session-1",
+            "48 8B ?? ?? 90",
+            module_name="WizardGraphicalClient.exe",
+            required=False,
+            unique=True,
+            max_matches=2,
+        )
+        self.assertEqual(self.manager.read_sizes, [])
+
+    async def test_agent_scan_ambiguity_preserves_legacy_exception(self):
+        ambiguity = FakeNativeMemoryError(code="memory_ambiguous_match")
+        self.manager.scan_memory = MagicMock(side_effect=ambiguity)
+
+        with self.assertRaises(PatternMultipleResults) as raised:
+            await self.reader.pattern_scan(
+                b"\x90",
+                module="WizardGraphicalClient.exe",
+            )
+
+        self.assertIs(raised.exception.__cause__, ambiguity)
+
+    async def test_multiple_result_scan_keeps_unbounded_streaming_behavior(self):
+        self.manager.map_memory(0x140001000, b"\x90\x00\x90")
+        self.manager.scan_memory = MagicMock()
+
+        result = await self.reader.pattern_scan(
+            b"\x90",
+            module="WizardGraphicalClient.exe",
+            return_multiple=True,
+        )
+
+        self.assertEqual(result, [0x140001000, 0x140001002])
+        self.manager.scan_memory.assert_not_called()
+
     async def test_scan_result_shapes_and_existing_exceptions_are_preserved(self):
         self.manager.map_memory(0x1000, b"\x00")
         with self.assertRaises(PatternFailed):

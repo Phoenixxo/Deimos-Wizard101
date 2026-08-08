@@ -3,7 +3,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-from wizwalker.errors import UnsupportedMemoryOperation
+from wizwalker.errors import PatternMultipleResults, UnsupportedMemoryOperation
 
 
 _MAX_READ_SIZE = 64 * 1024
@@ -276,6 +276,47 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         module_name: str | None,
         return_multiple: bool,
     ) -> list[int]:
+        # The agent can enforce uniqueness efficiently, but its result count is
+        # bounded. Keep legacy streaming for process scans and callers that need
+        # every match so their historical result semantics remain unchanged.
+        if (
+            module_name is not None
+            and not return_multiple
+            and hasattr(self.manager, "scan_memory")
+        ):
+            try:
+                response = self.manager.scan_memory(
+                    self.session_id,
+                    signature,
+                    module_name=module_name,
+                    required=False,
+                    unique=True,
+                    max_matches=2,
+                )
+            except Exception as error:
+                if getattr(error, "code", None) == "memory_ambiguous_match":
+                    raise PatternMultipleResults(
+                        f"Got multiple results for signature {signature}"
+                    ) from error
+                raise
+
+            matches = response.get("matches") if isinstance(response, dict) else None
+            if not isinstance(matches, list):
+                raise IncompleteMemoryScanError(
+                    "The native backend returned an invalid memory scan response.",
+                    details={"response_type": type(response).__name__},
+                )
+            try:
+                return [
+                    int(address, 0) if isinstance(address, str) else int(address)
+                    for address in matches
+                ]
+            except (TypeError, ValueError) as error:
+                raise IncompleteMemoryScanError(
+                    "The native backend returned an invalid memory scan address.",
+                    details={"matches": matches},
+                ) from error
+
         pattern = self._parse_fixed_signature(signature)
         intervals = self._scan_intervals(module_name)
         matches = []
