@@ -168,9 +168,11 @@ class _TelemetryReadContext:
         self,
         memory: MemoryReader,
         signature_addresses: dict[bytes, int],
+        selector_cache: dict[str, tuple[int, int]] | None = None,
     ):
         self.memory = memory
         self.signature_addresses = signature_addresses
+        self.selector_cache = selector_cache if selector_cache is not None else {}
         self._cache: dict[str, Any | _CachedReadFailure] = {}
 
     async def _cached(
@@ -277,6 +279,10 @@ class _TelemetryReadContext:
         return await self._cached("game_client", locate)
 
     async def _client_tree_selector(self) -> tuple[int, int]:
+        cached = self.selector_cache.get("client_tree")
+        if cached is not None:
+            return cached
+
         async def locate() -> tuple[int, int]:
             last_error: PatternFailed | None = None
             for pattern, player_gid_offset in _CLIENT_TREE_SELECTORS:
@@ -289,7 +295,9 @@ class _TelemetryReadContext:
                     instruction + 3,
                     Primitive.uint32,
                 )
-                return root_offset, player_gid_offset
+                selected = (root_offset, player_gid_offset)
+                self.selector_cache["client_tree"] = selected
+                return selected
 
             if last_error is not None:
                 raise last_error
@@ -548,6 +556,7 @@ class ReadOnlyTelemetryReader:
     def __init__(self, memory: MemoryReader):
         self.memory = memory
         self._signature_addresses: dict[bytes, int] = {}
+        self._selector_cache: dict[str, tuple[int, int]] = {}
 
     @staticmethod
     def _diagnostic(error: BaseException) -> TelemetryDiagnostic:
@@ -645,6 +654,7 @@ class ReadOnlyTelemetryReader:
         context = _TelemetryReadContext(
             self.memory,
             self._signature_addresses,
+            self._selector_cache,
         )
         fields = {
             "character_identity": await self._capture(

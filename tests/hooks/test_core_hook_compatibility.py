@@ -4,7 +4,6 @@ import unittest
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -348,56 +347,38 @@ class DiscoveredClientHookRaceTests(unittest.IsolatedAsyncioTestCase):
         await client.close()
         self.assertEqual(manager.closed_sessions, ["hook-448"])
 
-    async def test_hook_memory_resolvers_refresh_dynamic_addresses_and_cache_signatures(self):
+    async def test_hook_memory_objects_follow_agent_core_hook_exports(self):
         manager = BlockingHookManager()
         client = DiscoveredClient(manager, descriptor("client-a", 448))
-        handler = HookHandler(AgentCoreHookBackend(), client=client)
-        dynamic = {
-            "root_client_object": 0x1000,
-            "actor_body": 0x2000,
-            "game_stats": 0x3000,
-        }
-        scans = 0
+        backend = AgentCoreHookBackend()
+        handler = HookHandler(backend, client=client)
+        handler._base_addrs.update(
+            current_client="client",
+            player_struct="player",
+            player_stat_struct="player_stat",
+        )
+        backend.bases.update(client=0x1000, player=0x2000, player_stat=0x3000)
+        objects = client._build_hook_memory_objects(handler)
 
-        class FakeTelemetryContext:
-            def __init__(self, memory, signature_addresses):
-                self.signature_addresses = signature_addresses
+        self.assertEqual(await objects["client_object"].read_base_address(), 0x1000)
+        self.assertEqual(await objects["body"].read_base_address(), 0x2000)
+        self.assertEqual(await objects["stats"].read_base_address(), 0x3000)
 
-            async def _resolve(self, name):
-                nonlocal scans
-                if b"stable-signature" not in self.signature_addresses:
-                    scans += 1
-                    self.signature_addresses[b"stable-signature"] = 0x9000
-                return dynamic[name]
-
-            async def root_client_object(self):
-                return await self._resolve("root_client_object")
-
-            async def actor_body(self):
-                return await self._resolve("actor_body")
-
-            async def game_stats(self):
-                return await self._resolve("game_stats")
-
-        with patch(
-            "wizwalker.discovered_client._TelemetryReadContext",
-            FakeTelemetryContext,
-        ):
-            objects = client._build_hook_memory_objects(handler)
-            self.assertEqual(await objects["client_object"].read_base_address(), 0x1000)
-            self.assertEqual(await objects["body"].read_base_address(), 0x2000)
-            self.assertEqual(await objects["stats"].read_base_address(), 0x3000)
-
-            dynamic.update(
-                root_client_object=0x4000,
-                actor_body=0x5000,
-                game_stats=0x6000,
-            )
-            self.assertEqual(await objects["client_object"].read_base_address(), 0x4000)
-            self.assertEqual(await objects["body"].read_base_address(), 0x5000)
-            self.assertEqual(await objects["stats"].read_base_address(), 0x6000)
-
-        self.assertEqual(scans, 1)
+        backend.bases.update(client=0x4000, player=0x5000, player_stat=0x6000)
+        self.assertEqual(await objects["client_object"].read_base_address(), 0x4000)
+        self.assertEqual(await objects["body"].read_base_address(), 0x5000)
+        self.assertEqual(await objects["stats"].read_base_address(), 0x6000)
+        self.assertEqual(
+            [call for call in backend.calls if call[0] == "read_base"],
+            [
+                ("read_base", "client"),
+                ("read_base", "player"),
+                ("read_base", "player_stat"),
+                ("read_base", "client"),
+                ("read_base", "player"),
+                ("read_base", "player_stat"),
+            ],
+        )
 
     def test_native_client_exposes_hook_backed_legacy_operations(self):
         client = DiscoveredClient(

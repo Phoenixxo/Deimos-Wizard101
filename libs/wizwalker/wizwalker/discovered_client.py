@@ -11,7 +11,6 @@ from .memory import DeimosNativeMemoryBackend, MemoryReader
 from .telemetry import (
     ReadOnlyTelemetryReader,
     ReadOnlyTelemetrySnapshot,
-    _TelemetryReadContext,
 )
 
 
@@ -482,24 +481,12 @@ class DiscoveredClient:
             CurrentSocialSystemsManager,
             TeleportHelper,
         )
-        signature_addresses: dict[bytes, int] = {}
-
-        def dynamic_address(method_name: str):
-            async def resolve() -> int:
-                context = _TelemetryReadContext(handler, signature_addresses)
-                return await getattr(context, method_name)()
-
-            return resolve
-
         return {
-            "stats": CurrentGameStats(handler, dynamic_address("game_stats")),
-            "body": CurrentActorBody(handler, dynamic_address("actor_body")),
+            "stats": CurrentGameStats(handler),
+            "body": CurrentActorBody(handler),
             "duel": CurrentDuel(handler),
             "quest_position": CurrentQuestPosition(handler),
-            "client_object": CurrentClientObject(
-                handler,
-                dynamic_address("root_client_object"),
-            ),
+            "client_object": CurrentClientObject(handler),
             "root_window": CurrentRootWindow(handler),
             "render_context": CurrentRenderContext(handler),
             "game_client": CurrentGameClient(handler),

@@ -515,6 +515,15 @@ class ReadOnlyTelemetryParityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fixture.pattern_scan_calls, 3)
 
+    async def test_current_selector_choice_is_reused_across_snapshots(self):
+        fixture = TelemetryFixture(current_selector=True)
+        reader, _ = telemetry_reader(fixture, "native")
+
+        await reader.snapshot()
+        await reader.snapshot()
+
+        self.assertEqual(fixture.pattern_scan_calls, 4)
+
     async def test_transient_signature_failure_is_not_cached(self):
         fixture = TelemetryFixture()
         reader, _ = telemetry_reader(fixture, "native")
