@@ -43,6 +43,35 @@ class FeatureUnavailableError(RuntimeError):
         )
 
 
+class ClientTelemetryTransition(RuntimeError):
+    """The selected client changed memory generations during a display read."""
+
+
+async def read_consistent_hook_snapshot(
+    client: Any,
+    read_snapshot: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Discard a display snapshot if its hook-backed objects changed mid-read."""
+    handler = getattr(client, "hook_handler", None)
+    if handler is None:
+        return await read_snapshot()
+
+    async def generation() -> tuple[int, int]:
+        return (
+            await handler.read_current_client_base(),
+            await handler.read_current_player_base(),
+        )
+
+    before = await generation()
+    snapshot = await read_snapshot()
+    after = await generation()
+    if before != after:
+        raise ClientTelemetryTransition(
+            "Wizard101 changed zones while Deimos was reading client telemetry."
+        )
+    return snapshot
+
+
 def client_supports_operations(client: Any, *operation_names: str) -> bool:
     """Return whether a client exposes every operation required by a UI action."""
     for operation_name in operation_names:

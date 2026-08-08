@@ -11,12 +11,14 @@ from src.runtime_recovery import (
     AgentRuntimeRecovery,
     AutoHookClientNotReady,
     AutoHookRetryPolicy,
+    ClientTelemetryTransition,
     FeatureUnavailableError,
     client_supports_operations,
     error_diagnostics,
     is_recoverable_agent_error,
     require_auto_hook_character_ready,
     require_agent_capabilities,
+    read_consistent_hook_snapshot,
     run_guarded_feature,
     task_is_active,
 )
@@ -58,6 +60,40 @@ class FakeManager:
 
 
 class RuntimeRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_consistent_hook_snapshot_rejects_a_zone_generation_change(self):
+        class HookHandler:
+            def __init__(self):
+                self.client_bases = iter((0x1000, 0x2000))
+
+            async def read_current_client_base(self):
+                return next(self.client_bases)
+
+            async def read_current_player_base(self):
+                return 0x3000
+
+        client = SimpleNamespace(hook_handler=HookHandler())
+
+        with self.assertRaises(ClientTelemetryTransition):
+            await read_consistent_hook_snapshot(
+                client,
+                AsyncMock(return_value=("Zone/One", "position")),
+            )
+
+    async def test_consistent_hook_snapshot_returns_a_stable_generation(self):
+        handler = SimpleNamespace(
+            read_current_client_base=AsyncMock(return_value=0x1000),
+            read_current_player_base=AsyncMock(return_value=0x2000),
+        )
+        client = SimpleNamespace(hook_handler=handler)
+        read = AsyncMock(return_value=("Zone/Two", "position"))
+
+        self.assertEqual(
+            await read_consistent_hook_snapshot(client, read),
+            ("Zone/Two", "position"),
+        )
+        self.assertEqual(handler.read_current_client_base.await_count, 2)
+        self.assertEqual(handler.read_current_player_base.await_count, 2)
+
     async def test_memory_read_failures_retry_background_toggle_tasks(self):
         attempts = 0
 

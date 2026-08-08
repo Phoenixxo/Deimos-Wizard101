@@ -90,11 +90,13 @@ from src.runtime_recovery import (
 	AgentRuntimeRecovery,
 	AutoHookClientNotReady,
 	AutoHookRetryPolicy,
+	ClientTelemetryTransition,
 	client_supports_operations,
 	format_error_diagnostics,
 	is_recoverable_agent_error,
 	require_agent_capabilities,
 	require_auto_hook_character_ready,
+	read_consistent_hook_snapshot,
 	run_guarded_feature,
 	task_is_active,
 )
@@ -1860,6 +1862,46 @@ async def main(agent_manager: Any = None):
 		current_pos = None
 		current_rotation = None
 
+		def _show_loading_telemetry(client):
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Title', f'Client: {client.title}')))
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Zone', 'Zone: Loading…')))
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('xyz', 'Position (XYZ): ')))
+			gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('pry', 'Orientation (PRY): ')))
+
+		async def _read_foreground_telemetry(client):
+			current_zone = await client.zone_name()
+			if not current_zone or await client.is_loading():
+				raise ClientTelemetryTransition(
+					'Wizard101 is loading the selected client telemetry.'
+				)
+
+			if await client.game_client.is_freecam():
+				camera = await client.game_client.free_camera_controller()
+				current_pos = await camera.position()
+				current_rotation = await camera.orientation()
+			else:
+				parent = await client.client_object.parent()
+				if parent and await parent.object_name() == "Player Object":
+					children = await parent.children()
+					if not children:
+						raise ClientTelemetryTransition(
+							'Wizard101 has not published the selected pet body yet.'
+						)
+					pet_object = children[-1]
+					current_pos = await pet_object.location()
+					current_rotation = await pet_object.orientation()
+				else:
+					current_pos = await client.body.position()
+					current_rotation = await client.body.orientation()
+
+			current_pos.x = trunc(current_pos.x, 3)
+			current_pos.y = trunc(current_pos.y, 3)
+			current_pos.z = trunc(current_pos.z, 3)
+			current_rotation.yaw = trunc(current_rotation.yaw, 3)
+			current_rotation.pitch = trunc(current_rotation.pitch, 3)
+			current_rotation.roll = trunc(current_rotation.roll, 3)
+			return current_zone, current_pos, current_rotation
+
 		# Pause/resume state for client disconnect resilience
 		paused_task_names = None
 		previous_client_count = None
@@ -1869,42 +1911,22 @@ async def main(agent_manager: Any = None):
 		while True:
 			if walker.clients and foreground_client:
 				try:
-					current_zone = await foreground_client.zone_name()
-					if current_zone and not await foreground_client.is_loading():
-						if await foreground_client.game_client.is_freecam():
-							camera = await foreground_client.game_client.free_camera_controller()
-							current_pos = await camera.position()
-							current_rotation: Orient = await camera.orientation()
-							current_pos.x = trunc(current_pos.x, 3)
-							current_pos.y = trunc(current_pos.y, 3)
-							current_pos.z = trunc(current_pos.z, 3)
-							current_rotation.yaw = trunc(current_rotation.yaw, 3)
-							current_rotation.pitch = trunc(current_rotation.pitch, 3)
-							current_rotation.roll = trunc(current_rotation.roll, 3)
-						else:
-							if parent := await foreground_client.client_object.parent():
-								if await parent.object_name() == "Player Object":
-									children = await parent.children()
-									for pet_object in children:
-										current_pos = await pet_object.location()
-										current_rotation = await pet_object.orientation()
-								else:
-									current_pos: XYZ = await foreground_client.body.position()
-									current_rotation: Orient = await foreground_client.body.orientation()
-									current_pos.x = trunc(current_pos.x, 3)
-									current_pos.y = trunc(current_pos.y, 3)
-									current_pos.z = trunc(current_pos.z, 3)
-									current_rotation.yaw = trunc(current_rotation.yaw, 3)
-									current_rotation.pitch = trunc(current_rotation.pitch, 3)
-									current_rotation.roll = trunc(current_rotation.roll, 3)
-					else:
-						current_pos: XYZ = XYZ(0, 0, 0)
-						current_rotation: Orient = Orient(0, 0, 0)
+					current_zone, current_pos, current_rotation = await read_consistent_hook_snapshot(
+						foreground_client,
+						lambda: _read_foreground_telemetry(foreground_client),
+					)
 
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Title', f'Client: {foreground_client.title}')))
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('Zone', f'Zone: {current_zone}')))
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('xyz', f'Position (XYZ): {current_pos.x}, {current_pos.y}, {current_pos.z}')))
 					gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.UpdateWindow, ('pry', f'Orientation (PRY): {current_rotation.pitch}, {current_rotation.roll}, {current_rotation.yaw}')))
+				except (
+					wizwalker.errors.HookNotReady,
+					wizwalker.errors.MemoryReadError,
+					ClientTelemetryTransition,
+				):
+					_show_loading_telemetry(foreground_client)
+					await asyncio.sleep(0.1)
 				except Exception:
 					# Client process likely closed — remove dead clients, keep title gaps
 					count_before = len(walker.clients)
