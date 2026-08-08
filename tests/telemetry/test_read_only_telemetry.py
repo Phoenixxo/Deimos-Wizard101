@@ -390,6 +390,19 @@ class BlockingOpenNativeManager(FakeNativeManager):
         return super().open_process(pid, expected_identity_json)
 
 
+class BlockingCloseNativeManager(FakeNativeManager):
+    def __init__(self, memory: SparseMemory):
+        super().__init__(memory)
+        self.close_started = threading.Event()
+        self.allow_close = threading.Event()
+
+    def close_process(self, session_id: str) -> dict[str, str]:
+        self.close_started.set()
+        if not self.allow_close.wait(timeout=1):
+            raise TimeoutError("test did not allow the native process session to close")
+        return super().close_process(session_id)
+
+
 def telemetry_reader(
     fixture: TelemetryFixture,
     backend: str,
@@ -650,15 +663,22 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await client.attach_telemetry()
 
     async def test_identity_change_discards_the_existing_session(self):
-        manager = FakeNativeManager(SparseMemory())
+        manager = BlockingCloseNativeManager(SparseMemory())
         client = DiscoveredClient(manager, descriptor("client-a", 448))
         await client.attach_telemetry()
 
         changed = descriptor("client-a", 448)
         changed["process"]["identity"]["creation_time_100ns"] = "9999"
         client._update(changed)
-        await asyncio.sleep(0)
-        await client.attach_telemetry()
+        attaching = asyncio.create_task(client.attach_telemetry())
+
+        self.assertTrue(
+            await asyncio.to_thread(manager.close_started.wait, 1),
+            "the retired native process session did not start closing",
+        )
+        self.assertEqual(len(manager.open_calls), 1)
+        manager.allow_close.set()
+        await attaching
 
         self.assertEqual(manager.closed_sessions, ["session-448"])
         self.assertEqual(len(manager.open_calls), 2)

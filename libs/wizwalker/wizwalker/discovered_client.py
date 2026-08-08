@@ -541,6 +541,13 @@ class DiscoveredClient:
 
         task.add_done_callback(remember_cleanup_result)
 
+    async def _await_session_cleanup(self) -> None:
+        pending_cleanup = tuple(self._session_cleanup_tasks)
+        if pending_cleanup:
+            await asyncio.gather(*pending_cleanup)
+        if self._last_session_cleanup_error is not None:
+            raise self._last_session_cleanup_error
+
     async def attach_telemetry(self) -> ReadOnlyTelemetryReader:
         """Open an identity-checked, read-only process session when needed."""
         if not self._running:
@@ -553,6 +560,8 @@ class DiscoveredClient:
         async with self._attach_lock:
             if self._telemetry_reader is not None:
                 return self._telemetry_reader
+
+            await self._await_session_cleanup()
 
             session_generation = self._session_generation
             process_id = self.process_id
@@ -637,6 +646,7 @@ class DiscoveredClient:
                     "client.ensure_hook_handler", total_started, created=False, cached=True
                 )
                 return self.hook_handler, False
+            await self._await_session_cleanup()
             session_generation = self._session_generation
             process_id = self.process_id
             identity_json = json.dumps(
@@ -788,11 +798,7 @@ class DiscoveredClient:
         session_id = self._detach_session()
         if session_id is not None:
             await self._close_session(session_id)
-        pending_cleanup = tuple(self._session_cleanup_tasks)
-        if pending_cleanup:
-            await asyncio.gather(*pending_cleanup)
-        if self._last_session_cleanup_error is not None:
-            raise self._last_session_cleanup_error
+        await self._await_session_cleanup()
 
     def __repr__(self) -> str:
         return (
