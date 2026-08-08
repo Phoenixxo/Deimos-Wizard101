@@ -667,81 +667,22 @@ fn activate_transactional_template<B: MutationBackend>(
         .enumerate()
         .filter_map(|(index, patch)| patch.apply_on_activation.then_some(index))
         .collect::<Vec<_>>();
-    for index in activation_patches {
-        if let Err(error) = apply_auxiliary_patch(
-            sessions,
-            backend,
-            hooks,
-            &request.session_id,
-            &request.hook_key,
-            index,
-        ) {
-            return activation_failure(sessions, backend, mutations, hooks, request, error);
-        }
-    }
-
-    let target_address_text = format_address(target_address);
-    let protection = match mutation::protect(
-        sessions,
-        backend,
-        &MemoryProtectRequest {
-            session_id: request.session_id.clone(),
-            address: target_address_text.clone(),
-            size: overwrite_size,
-            protection: MemoryProtection::ExecuteReadWrite,
-        },
-    ) {
-        Ok(protection) => protection,
-        Err(error) => {
-            return activation_failure(sessions, backend, mutations, hooks, request, error.into());
-        }
-    };
-    {
-        let record = hooks
-            .hooks
-            .get_mut(&request.session_id)
-            .and_then(|records| records.get_mut(&request.hook_key))
-            .expect("provisional hook record must remain tracked");
-        record.target.original_protection = Some(protection.previous_protection);
-        record.target.may_be_modified = true;
-    }
     let detour = match build_target_detour(target_address, allocation_address, overwrite_size) {
         Ok(detour) => detour,
         Err(error) => {
             return activation_failure(sessions, backend, mutations, hooks, request, error);
         }
     };
-    if let Err(error) = mutation::write(
+    if let Err(error) = commit_activation(
         sessions,
         backend,
-        &MemoryWriteRequest {
-            session_id: request.session_id.clone(),
-            address: target_address_text.clone(),
-            bytes: detour,
-        },
-    ) {
-        return activation_failure(sessions, backend, mutations, hooks, request, error.into());
-    }
-    if let Err(error) = mutation::flush_instruction_cache(
-        sessions,
-        backend,
+        hooks,
         &request.session_id,
-        &target_address_text,
-        overwrite_size,
+        &request.hook_key,
+        &activation_patches,
+        detour,
     ) {
-        return activation_failure(sessions, backend, mutations, hooks, request, error.into());
-    }
-    if let Err(error) = mutation::protect(
-        sessions,
-        backend,
-        &MemoryProtectRequest {
-            session_id: request.session_id.clone(),
-            address: target_address_text,
-            size: overwrite_size,
-            protection: protection.previous_protection,
-        },
-    ) {
-        return activation_failure(sessions, backend, mutations, hooks, request, error.into());
+        return activation_failure(sessions, backend, mutations, hooks, request, error);
     }
     let record = hooks
         .hooks
@@ -751,6 +692,218 @@ fn activate_transactional_template<B: MutationBackend>(
     record.activation_complete = true;
     let response = activation_response(request, record);
     Ok(response)
+}
+
+fn commit_activation<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &mut HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+    activation_patches: &[usize],
+    detour: Vec<u8>,
+) -> Result<(), HookApiError> {
+    let suspended = mutation::suspend_process_threads(sessions, backend, session_id)?;
+    let commit = (|| {
+        let record = hooks
+            .get(session_id, hook_key)
+            .cloned()
+            .expect("provisional hook record must remain tracked");
+        ensure_activation_ranges_are_idle(&suspended, &record, activation_patches)?;
+        revalidate_activation_bytes(sessions, backend, session_id, &record, activation_patches)?;
+        for index in activation_patches {
+            apply_auxiliary_patch(sessions, backend, hooks, session_id, hook_key, *index)?;
+        }
+        apply_primary_detour(sessions, backend, hooks, session_id, hook_key, detour)
+    })();
+    let rollback = if commit.is_err() {
+        rollback_activation_changes(sessions, backend, hooks, session_id, hook_key)
+    } else {
+        Ok(())
+    };
+    let resume = suspended
+        .resume()
+        .map_err(MutationApiError::from)
+        .map_err(HookApiError::from);
+    match (commit, rollback, resume) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (commit, rollback, resume) => {
+            let mut failures = Vec::new();
+            if let Err(error) = commit {
+                failures.push(format!("commit failed: {}", error.summary()));
+            }
+            if let Err(error) = rollback {
+                failures.push(format!("rollback failed: {}", error.summary()));
+            }
+            if let Err(error) = resume {
+                failures.push(format!("thread resume failed: {}", error.summary()));
+            }
+            Err(HookApiError::request(
+                RpcErrorCode::MemoryWriteFailed,
+                format!(
+                    "atomic hook activation could not be completed safely: {}",
+                    failures.join("; ")
+                ),
+            ))
+        }
+    }
+}
+
+fn ensure_activation_ranges_are_idle(
+    suspended: &crate::process::SuspendedProcess,
+    record: &HookRecord,
+    activation_patches: &[usize],
+) -> Result<(), HookApiError> {
+    if suspended.executes_range(record.target.address, record.target.original_bytes.len())
+        || activation_patches.iter().any(|index| {
+            let patch = &record.auxiliary_patches[*index];
+            suspended.executes_range(patch.address, patch.original_bytes.len())
+        })
+    {
+        return Err(HookApiError::request(
+            RpcErrorCode::Timeout,
+            "hook activation found a target thread executing bytes that would be replaced; retry after execution leaves the hook site",
+        ));
+    }
+    Ok(())
+}
+
+fn revalidate_activation_bytes<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    record: &HookRecord,
+    activation_patches: &[usize],
+) -> Result<(), HookApiError> {
+    revalidate_patch_bytes(sessions, backend, session_id, &record.target)?;
+    for index in activation_patches {
+        revalidate_patch_bytes(
+            sessions,
+            backend,
+            session_id,
+            &record.auxiliary_patches[*index],
+        )?;
+    }
+    Ok(())
+}
+
+fn revalidate_patch_bytes<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    patch: &PatchRecord,
+) -> Result<(), HookApiError> {
+    let actual = memory::read(
+        sessions,
+        backend,
+        &MemoryReadRequest {
+            session_id: session_id.clone(),
+            address: format_address(patch.address),
+            size: patch.original_bytes.len(),
+        },
+    )?
+    .bytes;
+    if actual != patch.original_bytes {
+        return Err(HookApiError::request(
+            RpcErrorCode::MemoryRequiredMatchNotFound,
+            format!(
+                "hook target at {:#x} changed after scanning and before suspended activation",
+                patch.address
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_primary_detour<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &mut HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+    detour: Vec<u8>,
+) -> Result<(), HookApiError> {
+    let target_address = hooks
+        .get(session_id, hook_key)
+        .expect("provisional hook record must remain tracked")
+        .target
+        .address;
+    let target_address_text = format_address(target_address);
+    let protection = mutation::protect(
+        sessions,
+        backend,
+        &MemoryProtectRequest {
+            session_id: session_id.clone(),
+            address: target_address_text.clone(),
+            size: detour.len(),
+            protection: MemoryProtection::ExecuteReadWrite,
+        },
+    )?;
+    {
+        let target = &mut hooks
+            .hooks
+            .get_mut(session_id)
+            .and_then(|records| records.get_mut(hook_key))
+            .expect("provisional hook record must remain tracked")
+            .target;
+        target.original_protection = Some(protection.previous_protection);
+        target.may_be_modified = true;
+    }
+    mutation::write(
+        sessions,
+        backend,
+        &MemoryWriteRequest {
+            session_id: session_id.clone(),
+            address: target_address_text.clone(),
+            bytes: detour.clone(),
+        },
+    )?;
+    mutation::flush_instruction_cache(
+        sessions,
+        backend,
+        session_id,
+        &target_address_text,
+        detour.len(),
+    )?;
+    mutation::protect(
+        sessions,
+        backend,
+        &MemoryProtectRequest {
+            session_id: session_id.clone(),
+            address: target_address_text,
+            size: detour.len(),
+            protection: protection.previous_protection,
+        },
+    )?;
+    Ok(())
+}
+
+fn rollback_activation_changes<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &HookState,
+    session_id: &ProcessSessionId,
+    hook_key: &str,
+) -> Result<(), HookApiError> {
+    let record = hooks
+        .get(session_id, hook_key)
+        .cloned()
+        .expect("provisional hook record must remain tracked");
+    let mut failures = Vec::new();
+    if let Err(error) = restore_patch(sessions, backend, session_id, &record.target) {
+        failures.push(format!("primary target: {}", error.summary()));
+    }
+    for (index, patch) in record.auxiliary_patches.iter().enumerate().rev() {
+        if let Err(error) = restore_patch(sessions, backend, session_id, patch) {
+            failures.push(format!("auxiliary target {index}: {}", error.summary()));
+        }
+    }
+    cleanup_failures(
+        "during suspended activation rollback",
+        Some(session_id),
+        failures,
+    )
 }
 
 pub(crate) fn apply_owned_patch<B: MutationBackend>(
@@ -1516,7 +1669,8 @@ pub(crate) mod tests {
     use crate::mutation::MutationState;
     use crate::process::{
         MemoryBackend, MutationBackend, OpenedProcess, ProcessBackend, ProcessBackendError,
-        ProcessBackendErrorKind, ProcessSessionRegistry, RemoteThreadPoll, StartedRemoteThread,
+        ProcessBackendErrorKind, ProcessSessionRegistry, ProcessThreadResume, RemoteThreadPoll,
+        StartedRemoteThread,
     };
 
     use super::{
@@ -1546,6 +1700,7 @@ pub(crate) mod tests {
         TargetFlush,
         TargetRestore,
         TrampolineExecuting,
+        TargetExecuting,
         Free,
         ProcessExited,
     }
@@ -1557,10 +1712,23 @@ pub(crate) mod tests {
         next_allocation: usize,
         failures: Vec<Failure>,
         target_writes: usize,
+        suspended: bool,
+        suspension_count: usize,
+        unsafe_target_writes: usize,
+        suspended_target_reads: usize,
     }
 
     #[derive(Clone)]
     pub(crate) struct Backend(Arc<Mutex<Data>>);
+
+    struct ResumeGuard(Arc<Mutex<Data>>);
+
+    impl ProcessThreadResume for ResumeGuard {
+        fn resume(&mut self) -> Result<(), ProcessBackendError> {
+            self.0.lock().expect("data lock").suspended = false;
+            Ok(())
+        }
+    }
 
     #[derive(Clone, Copy)]
     pub(crate) struct Handle;
@@ -1581,6 +1749,10 @@ pub(crate) mod tests {
                 next_allocation: ALLOCATION,
                 failures,
                 target_writes: 0,
+                suspended: false,
+                suspension_count: 0,
+                unsafe_target_writes: 0,
+                suspended_target_reads: 0,
             })))
         }
 
@@ -1641,6 +1813,20 @@ pub(crate) mod tests {
 
         pub(crate) fn target_protection(&self) -> MemoryProtection {
             self.0.lock().expect("data lock").target_protection
+        }
+
+        fn activation_safety(&self) -> (bool, usize, usize, usize) {
+            let data = self.0.lock().expect("data lock");
+            (
+                data.suspended,
+                data.suspension_count,
+                data.unsafe_target_writes,
+                data.suspended_target_reads,
+            )
+        }
+
+        pub(crate) fn fail_next(&self, failure: Failure) {
+            self.0.lock().expect("data lock").failures.push(failure);
         }
 
         fn exit_process(&self) {
@@ -1739,7 +1925,7 @@ pub(crate) mod tests {
             address: usize,
             size: usize,
         ) -> Result<Vec<u8>, ProcessBackendError> {
-            let data = self.0.lock().expect("data lock");
+            let mut data = self.0.lock().expect("data lock");
             if let Some((base, allocation)) = data.allocations.iter().find(|(base, allocation)| {
                 **base <= address
                     && address
@@ -1755,6 +1941,9 @@ pub(crate) mod tests {
             };
             if address < TARGET || end_outside_primary {
                 return Err(failure("read range"));
+            }
+            if data.suspended {
+                data.suspended_target_reads += 1;
             }
             Ok(data.primary[address - TARGET..address - TARGET + size].to_vec())
         }
@@ -1782,6 +1971,9 @@ pub(crate) mod tests {
             let target_range = address >= TARGET && address < TARGET + data.primary.len();
             if target_range {
                 data.target_writes += 1;
+                if !data.suspended {
+                    data.unsafe_target_writes += 1;
+                }
             }
             if target_range && take_failure(&mut data, Failure::TargetWrite) {
                 return Err(failure("forced target write failure"));
@@ -1854,17 +2046,20 @@ pub(crate) mod tests {
             &self,
             _handle: &Self::Handle,
         ) -> Result<crate::process::SuspendedProcess, ProcessBackendError> {
-            let instruction_pointers = if take_failure(
-                &mut self.0.lock().expect("data lock"),
-                Failure::TrampolineExecuting,
-            ) {
+            let mut data = self.0.lock().expect("data lock");
+            data.suspended = true;
+            data.suspension_count += 1;
+            let instruction_pointers = if take_failure(&mut data, Failure::TrampolineExecuting) {
                 vec![ALLOCATION]
+            } else if take_failure(&mut data, Failure::TargetExecuting) {
+                vec![TARGET]
             } else {
                 Vec::new()
             };
+            drop(data);
             Ok(crate::process::SuspendedProcess::new(
                 instruction_pointers,
-                (),
+                ResumeGuard(self.0.clone()),
             ))
         }
 
@@ -2116,6 +2311,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn activation_revalidates_and_commits_only_while_target_threads_are_suspended() {
+        let backend = Backend::new(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request(session_id),
+            Instant::now(),
+        )
+        .expect("activation should commit atomically");
+
+        let (suspended, suspension_count, unsafe_target_writes, suspended_target_reads) =
+            backend.activation_safety();
+        assert!(!suspended);
+        assert_eq!(suspension_count, 1);
+        assert_eq!(unsafe_target_writes, 0);
+        assert!(suspended_target_reads > 0);
+    }
+
+    #[test]
+    fn activation_defers_when_a_thread_is_executing_the_hook_site() {
+        let backend = Backend::new(Some(Failure::TargetExecuting));
+        let before = backend.primary();
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+
+        let error = activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request(session_id.clone()),
+            Instant::now(),
+        )
+        .expect_err("activation must not replace instructions under a suspended thread");
+
+        assert_eq!(
+            error.into_rpc_error(1, "hook.activate").code,
+            RpcErrorCode::Timeout
+        );
+        assert_eq!(backend.primary(), before);
+        assert_eq!(backend.allocation_count(), 0);
+        assert_eq!(mutations.tracked_count(&session_id), 0);
+        assert_eq!(hooks.tracked_count(&session_id), 0);
+        assert_eq!(backend.activation_safety().2, 0);
+    }
+
+    #[test]
     fn template_overwrite_does_not_modify_verified_signature_suffix() {
         let backend = Backend::new(None);
         let before = backend.primary();
@@ -2197,6 +2446,12 @@ pub(crate) mod tests {
             );
             assert_eq!(mutations.tracked_count(&session_id), 0);
             assert_eq!(hooks.tracked_count(&session_id), 0);
+            let (suspended, _, unsafe_target_writes, _) = backend.activation_safety();
+            assert!(!suspended);
+            assert_eq!(
+                unsafe_target_writes, 0,
+                "activation rollback must not write executable targets after resuming threads"
+            );
         }
     }
 

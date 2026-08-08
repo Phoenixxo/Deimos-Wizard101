@@ -106,6 +106,7 @@ name = "deimos-agent"
 version = "0.1.0"
 dependencies = [
  "deimos-core",
+ "memchr",
  "serde",
  "serde_json",
  "windows",

@@ -14,7 +14,8 @@ use deimos_core::rpc::{RpcError, RpcErrorCode};
 
 use crate::process::{MemoryBackend, ProcessApiError, ProcessBackendError, ProcessSessionRegistry};
 
-const SCAN_CHUNK_SIZE: usize = 64 * 1024;
+const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
+const MIN_SCAN_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum MemoryApiError {
@@ -507,19 +508,22 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
         .unwrap_or_default()
         .saturating_sub(1);
     let mut offset = 0usize;
+    let mut chunk_size = SCAN_CHUNK_SIZE;
     let mut previous = Vec::new();
     while offset < size {
-        let request_size = (size - offset).min(SCAN_CHUNK_SIZE);
+        let request_size = (size - offset).min(chunk_size);
         let address = start.checked_add(offset).ok_or_else(|| {
             MemoryApiError::request(
                 RpcErrorCode::MemoryInvalidAddress,
                 "scan address overflowed",
             )
         })?;
-        let bytes = match backend.read_memory(handle, address, request_size) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(()),
-        };
+        let (bytes, actual_request_size) =
+            match read_scan_chunk(backend, handle, address, request_size) {
+                Ok(result) => result,
+                Err(_) => return Ok(()),
+            };
+        chunk_size = actual_request_size;
         let previous_end = start.checked_add(offset).ok_or_else(|| {
             MemoryApiError::request(
                 RpcErrorCode::MemoryInvalidAddress,
@@ -533,7 +537,7 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
             if matches[signature_index].len() > 1 || signature.len() > combined.len() {
                 continue;
             }
-            for (match_offset, window) in combined.windows(signature.len()).enumerate() {
+            visit_signature_matches(&combined, signature, |match_offset| {
                 let candidate = combined_start.checked_add(match_offset).ok_or_else(|| {
                     MemoryApiError::request(
                         RpcErrorCode::MemoryInvalidAddress,
@@ -546,21 +550,15 @@ fn scan_region_for_unique_signatures<B: MemoryBackend>(
                         "scan match range overflowed",
                     )
                 })?;
-                if candidate_end <= previous_end
-                    || !window.iter().zip(signature).all(|(actual, expected)| {
-                        expected.is_none() || expected.as_ref() == Some(actual)
-                    })
-                {
-                    continue;
+                if candidate_end <= previous_end {
+                    return Ok(true);
                 }
                 matches[signature_index].push(candidate);
-                if matches[signature_index].len() > 1 {
-                    break;
-                }
-            }
+                Ok(matches[signature_index].len() <= 1)
+            })?;
         }
         offset += bytes.len();
-        if bytes.len() < request_size {
+        if bytes.len() < actual_request_size {
             return Ok(());
         }
         previous = combined.into_iter().rev().take(overlap).collect::<Vec<_>>();
@@ -579,33 +577,36 @@ fn scan_region<B: MemoryBackend>(
 ) -> Result<(), MemoryApiError> {
     let overlap = options.signature.len().saturating_sub(1);
     let mut offset = 0usize;
+    let mut chunk_size = SCAN_CHUNK_SIZE;
     let mut previous = Vec::new();
     while offset < size {
-        let request_size = (size - offset).min(SCAN_CHUNK_SIZE);
+        let request_size = (size - offset).min(chunk_size);
         let address = start.checked_add(offset).ok_or_else(|| {
             MemoryApiError::request(
                 RpcErrorCode::MemoryInvalidAddress,
                 "scan address overflowed",
             )
         })?;
-        let bytes = match backend.read_memory(handle, address, request_size) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                collected.skipped_regions += 1;
-                if collected.errors.len() < MAX_SCAN_ERRORS {
-                    collected.errors.push(MemoryScanRegionError {
-                        base_address: format_address(start),
-                        message: error.message,
-                    });
+        let (bytes, actual_request_size) =
+            match read_scan_chunk(backend, handle, address, request_size) {
+                Ok(result) => result,
+                Err(error) => {
+                    collected.skipped_regions += 1;
+                    if collected.errors.len() < MAX_SCAN_ERRORS {
+                        collected.errors.push(MemoryScanRegionError {
+                            base_address: format_address(start),
+                            message: error.message,
+                        });
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
+        chunk_size = actual_request_size;
         let old_end = offset;
         let mut combined = previous;
         combined.extend_from_slice(&bytes);
         let combined_start = address.saturating_sub(combined.len() - bytes.len());
-        for (match_offset, window) in combined.windows(options.signature.len()).enumerate() {
+        visit_signature_matches(&combined, options.signature, |match_offset| {
             let candidate = combined_start.checked_add(match_offset).ok_or_else(|| {
                 MemoryApiError::request(
                     RpcErrorCode::MemoryInvalidAddress,
@@ -630,19 +631,12 @@ fn scan_region<B: MemoryBackend>(
             // Suppress only a candidate whose complete signature was already
             // contained in the preceding chunk. A candidate whose end crosses
             // the boundary is newly observable in this combined overlap.
-            if candidate_end <= previous_end
-                || !window
-                    .iter()
-                    .zip(options.signature)
-                    .all(|(actual, expected)| {
-                        expected.is_none() || expected.as_ref() == Some(actual)
-                    })
-            {
-                continue;
+            if candidate_end <= previous_end {
+                return Ok(true);
             }
             collected.matches.push(candidate);
             if options.unique && collected.matches.len() > 1 {
-                return Ok(());
+                return Ok(false);
             }
             if collected.matches.len() > options.max_matches {
                 return Err(MemoryApiError::request(
@@ -650,14 +644,98 @@ fn scan_region<B: MemoryBackend>(
                     "scan match count exceeds the requested limit",
                 ));
             }
+            Ok(true)
+        })?;
+        if options.unique && collected.matches.len() > 1 {
+            return Ok(());
         }
         offset += bytes.len();
-        if bytes.len() < request_size {
+        if bytes.len() < actual_request_size {
             collected.skipped_regions += 1;
             return Ok(());
         }
         previous = combined.into_iter().rev().take(overlap).collect::<Vec<_>>();
         previous.reverse();
+    }
+    Ok(())
+}
+
+fn read_scan_chunk<B: MemoryBackend>(
+    backend: &B,
+    handle: &B::Handle,
+    address: usize,
+    preferred_size: usize,
+) -> Result<(Vec<u8>, usize), ProcessBackendError> {
+    let mut request_size = preferred_size;
+    loop {
+        match backend.read_memory(handle, address, request_size) {
+            Ok(bytes) => return Ok((bytes, request_size)),
+            Err(_) if request_size > MIN_SCAN_CHUNK_SIZE => {
+                request_size = (request_size / 2).max(MIN_SCAN_CHUNK_SIZE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn visit_signature_matches(
+    bytes: &[u8],
+    signature: &[Option<u8>],
+    mut visitor: impl FnMut(usize) -> Result<bool, MemoryApiError>,
+) -> Result<(), MemoryApiError> {
+    if signature.is_empty() || signature.len() > bytes.len() {
+        return Ok(());
+    }
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    for (index, expected) in signature.iter().enumerate() {
+        if expected.is_some() {
+            if run_len == 0 {
+                run_start = index;
+            }
+            run_len += 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+
+    let last_offset = bytes.len() - signature.len();
+    if best_len == 0 {
+        for offset in 0..=last_offset {
+            if !visitor(offset)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    let anchor_byte = signature[best_start].expect("the anchor contains only exact bytes");
+    let anchor_haystack = &bytes[best_start..=last_offset + best_start];
+    for offset in memchr::memchr_iter(anchor_byte, anchor_haystack) {
+        if !bytes[offset + best_start..offset + best_start + best_len]
+            .iter()
+            .zip(&signature[best_start..best_start + best_len])
+            .all(|(actual, expected)| expected.as_ref() == Some(actual))
+        {
+            continue;
+        }
+        if best_len != signature.len()
+            && !bytes[offset..offset + signature.len()]
+                .iter()
+                .zip(signature)
+                .all(|(actual, expected)| expected.is_none() || expected.as_ref() == Some(actual))
+        {
+            continue;
+        }
+        if !visitor(offset)? {
+            break;
+        }
     }
     Ok(())
 }
@@ -986,6 +1064,7 @@ mod tests {
         stale_after_read: Arc<AtomicBool>,
         stale: Arc<AtomicBool>,
         large_memory: Option<Arc<Vec<u8>>>,
+        max_read_size: Option<usize>,
         read_count: Arc<AtomicUsize>,
     }
 
@@ -1093,6 +1172,12 @@ mod tests {
             size: usize,
         ) -> Result<Vec<u8>, ProcessBackendError> {
             self.read_count.fetch_add(1, Ordering::SeqCst);
+            if self.max_read_size.is_some_and(|maximum| size > maximum) {
+                return Err(ProcessBackendError::new(
+                    ProcessBackendErrorKind::Native,
+                    "mock read exceeds its supported size",
+                ));
+            }
             if let Some(memory) = &self.large_memory {
                 let offset = address.checked_sub(0x1000).ok_or_else(|| {
                     ProcessBackendError::new(
@@ -1157,6 +1242,7 @@ mod tests {
             stale_after_read: Arc::new(AtomicBool::new(stale_after_read)),
             stale: Arc::new(AtomicBool::new(false)),
             large_memory: None,
+            max_read_size: None,
             read_count: Arc::new(AtomicUsize::new(0)),
         };
         let mut registry = ProcessSessionRegistry::new();
@@ -1185,6 +1271,7 @@ mod tests {
             stale_after_read: Arc::new(AtomicBool::new(false)),
             stale: Arc::new(AtomicBool::new(false)),
             large_memory: Some(Arc::new(memory)),
+            max_read_size: None,
             read_count: Arc::new(AtomicUsize::new(0)),
         };
         let mut registry = ProcessSessionRegistry::new();
@@ -1218,6 +1305,53 @@ mod tests {
                 format!("{:#x}", 0x1000 + cross_chunk_offset),
             ]
         );
+        assert_eq!(backend.read_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scan_falls_back_to_smaller_reads_when_a_large_chunk_is_unavailable() {
+        let signature = [0xa1, 0xb2, 0xc3, 0xd4];
+        let match_offset = super::MIN_SCAN_CHUNK_SIZE - 2;
+        let mut memory = vec![0u8; super::MIN_SCAN_CHUNK_SIZE + 32];
+        memory[match_offset..match_offset + signature.len()].copy_from_slice(&signature);
+        let backend = MockMemoryBackend {
+            stale_after_read: Arc::new(AtomicBool::new(false)),
+            stale: Arc::new(AtomicBool::new(false)),
+            large_memory: Some(Arc::new(memory)),
+            max_read_size: Some(super::MIN_SCAN_CHUNK_SIZE),
+            read_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut registry = ProcessSessionRegistry::new();
+        let session = registry
+            .open(
+                &backend,
+                &OpenProcessRequest {
+                    pid: 336,
+                    expected_identity: None,
+                    access_mode: deimos_core::process::ProcessAccessMode::ReadOnly,
+                },
+            )
+            .expect("mock process should open");
+
+        let response = super::scan(
+            &mut registry,
+            &backend,
+            &MemoryScanRequest {
+                session_id: session.session_id,
+                signature: "A1 B2 C3 D4".to_string(),
+                required: true,
+                unique: true,
+                max_matches: 2,
+                scope: MemoryScanScope::Process,
+            },
+        )
+        .expect("fallback scan should preserve cross-chunk matches");
+
+        assert_eq!(
+            response.matches,
+            vec![format!("{:#x}", 0x1000 + match_offset)]
+        );
+        assert_eq!(backend.read_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]

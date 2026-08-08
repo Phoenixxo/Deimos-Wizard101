@@ -1099,6 +1099,27 @@ fn resolve_unique_pattern<B: MutationBackend>(
     )
 }
 
+fn resolve_unique_patterns<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    signatures: &[&str],
+    scope: MemoryScanScope,
+) -> Result<Vec<usize>, FeatureHookApiError> {
+    memory::scan_optional_unique_signatures(sessions, backend, session_id, &scope, signatures)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, address)| {
+            address.ok_or_else(|| {
+                FeatureHookApiError::request(
+                    RpcErrorCode::MemoryRequiredMatchNotFound,
+                    format!("required feature-hook signature at index {index} was not found"),
+                )
+            })
+        })
+        .collect()
+}
+
 fn resolve_chat_target<B: MutationBackend>(
     sessions: &mut ProcessSessionRegistry<B::Handle>,
     backend: &B,
@@ -1744,26 +1765,24 @@ fn movement_template<B: MutationBackend>(
     backend: &B,
     session_id: &ProcessSessionId,
 ) -> Result<Template, FeatureHookApiError> {
-    let target = resolve_unique_pattern(
+    let resolved = resolve_unique_patterns(
         sessions,
         backend,
         session_id,
-        "48 89 5C 24 08 57 48 83 EC 20 48 8B 99 B8 01 00 00 48 85 DB 74 2F",
+        &[
+            "48 89 5C 24 08 57 48 83 EC 20 48 8B 99 B8 01 00 00 48 85 DB 74 2F",
+            "8B 5F 70 F3",
+            "74 24 F3 0F 10 44 24 58 F3 0F 11 44 24 78 48 8B 06",
+        ],
         module_scope(),
     )?;
-    let movement_state =
-        resolve_unique_pattern(sessions, backend, session_id, "8B 5F 70 F3", module_scope())?;
+    let [target, movement_state, collision]: [usize; 3] = resolved
+        .try_into()
+        .expect("movement scan resolves exactly three signatures");
     let first_je = movement_state + 15;
     let second_je = movement_state + 24;
     let first_original = array8(read_at(sessions, backend, session_id, first_je, 8)?)?;
     let second_original = array8(read_at(sessions, backend, session_id, second_je, 8)?)?;
-    let collision = resolve_unique_pattern(
-        sessions,
-        backend,
-        session_id,
-        "74 24 F3 0F 10 44 24 58 F3 0F 11 44 24 78 48 8B 06",
-        module_scope(),
-    )?;
     let mut auxiliary_patches = vec![patch(
         collision,
         2,
@@ -2708,7 +2727,7 @@ mod tests {
 
     #[test]
     fn every_cleanup_path_retains_execution_ownership_until_quiescent() {
-        let backend = Backend::feature(Some(Failure::TrampolineExecuting));
+        let backend = Backend::feature(None);
         let (mut sessions, session_id) = registry(&backend);
         let mut mutations = MutationState::new();
         let mut hooks = HookState::default();
@@ -2725,6 +2744,7 @@ mod tests {
             Instant::now(),
         )
         .expect("chat-send feature should activate");
+        backend.fail_next(Failure::TrampolineExecuting);
         let key = super::hook_key(FeatureHook::ChatSend);
         hook::cleanup_session(
             &mut sessions,
