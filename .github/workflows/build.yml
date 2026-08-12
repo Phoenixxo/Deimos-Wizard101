@@ -73,12 +73,24 @@ jobs:
         sed -i "s/tool_version: str = '[^']*'/tool_version: str = '${{ steps.version.outputs.VERSION_NUMBER }}'/" Deimos.py
         echo "Updated version in Deimos.py to ${{ steps.version.outputs.VERSION_NUMBER }}"
     
+    - name: Build update helper (Rust)
+      shell: bash
+      run: |
+        cargo build --release --manifest-path libs/updater/Cargo.toml
+        ls -la libs/updater/target/release/deimos-updater.exe
+
+    - name: Build wizpatch patcher (Rust)
+      shell: bash
+      run: |
+        cargo build --release --manifest-path libs/wizpatch/Cargo.toml
+        ls -la libs/wizpatch/target/release/wizpatch.exe
+
     - name: Build with PyInstaller
       run: |
         uv run --group dev pyinstaller --noconfirm --clean Deimos.spec
         echo "Build completed successfully"
         dir dist
-    
+
     - name: Verify required files exist
       shell: bash
       run: |
@@ -93,7 +105,14 @@ jobs:
         fi
         echo "All required files found ✓"
         echo "Deimos.exe size: $(stat -c%s dist/Deimos.exe) bytes"
-    
+
+    - name: Generate checksum
+      shell: powershell
+      run: |
+        $hash = (Get-FileHash "dist/Deimos.exe" -Algorithm SHA256).Hash.ToLower()
+        "$hash  Deimos.exe" | Out-File -FilePath "dist/Deimos.exe.sha256" -Encoding ascii -NoNewline
+        Write-Host "SHA256: $hash"
+
     - name: Create release package
       shell: powershell
       run: |
@@ -155,6 +174,8 @@ jobs:
           **Full Changelog**: https://github.com/${{ github.repository }}/compare/${{ steps.changelog.outputs.LAST_TAG }}...${{ steps.version.outputs.VERSION }}
         files: |
           Deimos-${{ steps.version.outputs.VERSION }}.zip
+          dist/Deimos.exe
+          dist/Deimos.exe.sha256
         draft: false
         prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
       env:
