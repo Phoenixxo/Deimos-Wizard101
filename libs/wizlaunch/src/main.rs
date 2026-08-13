@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod windows_cli {
 use std::collections::HashSet;
 use std::process;
 
@@ -31,7 +33,7 @@ fn usage() {
     );
 }
 
-fn main() {
+pub fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.is_empty() {
@@ -175,4 +177,17 @@ fn detect_game_path() -> String {
     } else {
         default.to_string()
     }
+}
+
+}
+
+#[cfg(windows)]
+fn main() {
+    windows_cli::run();
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("wizlaunch-cli is available only on Windows; use the Python runtime adapter for Wine/CrossOver launch operations");
+    std::process::exit(1);
 }

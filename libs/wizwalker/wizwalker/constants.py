@@ -1,12 +1,19 @@
 import ctypes
 import struct
+import sys
 from enum import Enum
 
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-gdi32 = ctypes.windll.gdi32
-ntdll = ctypes.windll.ntdll
+if sys.platform == "win32":
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    gdi32 = ctypes.windll.gdi32
+    ntdll = ctypes.windll.ntdll
+else:
+    user32 = None
+    kernel32 = None
+    gdi32 = None
+    ntdll = None
 
 
 WM_KEYDOWN = 0x100

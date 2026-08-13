@@ -77,7 +77,7 @@ def build_flythrough_tab(ctx):
         ctx.send_queue.put(GUICommand(GUICommandType.ExecuteFlythrough, editor.toPlainText()))
 
     def kill_flythrough_callback():
-        ctx.send_queue.put(GUICommand(GUICommandType.KillFlythrough))
+        ctx.control_queue.put(GUICommand(GUICommandType.KillFlythrough))
 
     toggle_btn, set_flythrough_running = _make_toggle_btn(
         ctx, ctx.tl('execute_flythrough'), ctx.tl('kill_flythrough'),
@@ -136,7 +136,7 @@ def build_bot_tab(ctx):
         ctx.send_queue.put(GUICommand(GUICommandType.ExecuteBot, editor.toPlainText()))
 
     def kill_bot_callback():
-        ctx.send_queue.put(GUICommand(GUICommandType.KillBot))
+        ctx.control_queue.put(GUICommand(GUICommandType.KillBot))
 
     def bot_search():
         from src.gui.popups import show_bot_search_popup

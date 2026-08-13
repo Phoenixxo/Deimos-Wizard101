@@ -155,6 +155,7 @@ select_pet_world=Select a pet world:
 # Console
 console_support=Be sure to include your logs when asking for support.
 collapse_expand_logs=Collapse / Expand Logs
+open_logs=Open Logs
 copy_logs=Copy Logs
 
 # Tooltips

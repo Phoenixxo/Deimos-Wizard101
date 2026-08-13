@@ -148,6 +148,14 @@ class ChatOwner(MemoryObject):
         if not message:
             raise ValueError("Message cannot be empty")
 
+        if getattr(self.hook_handler._backend, "supports_feature_hooks", False):
+            await self.hook_handler.run_in_executor(
+                self.hook_handler._backend.feature_send_chat,
+                message,
+                target_gid,
+            )
+            return
+
         trigger_addr = self.hook_handler._base_addrs.get("send_trigger")
         struct_addr = self.hook_handler._base_addrs.get("send_struct")
         if trigger_addr is None or struct_addr is None:
@@ -289,6 +297,13 @@ class ChatOwner(MemoryObject):
         Raises:
             RuntimeError: If ChatSendHook is not active
         """
+        if getattr(self.hook_handler._backend, "supports_feature_hooks", False):
+            await self.hook_handler.run_in_executor(
+                self.hook_handler._backend.feature_add_buddy,
+                target_gid,
+            )
+            return
+
         trigger_addr = self.hook_handler._base_addrs.get("buddy_trigger")
         obj_addr = self.hook_handler._base_addrs.get("buddy_obj")
         if trigger_addr is None or obj_addr is None:

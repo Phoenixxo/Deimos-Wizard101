@@ -22,6 +22,17 @@ class ClientClosedError(WizWalkerError):
         super().__init__("Client must be running to preform this action.")
 
 
+class UnsupportedClientOperation(WizWalkerError):
+    """Raised when native discovery does not support a legacy window action."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(
+            f"Native client discovery does not support {operation} yet. "
+            "Use the legacy Windows client until native window and input support is available."
+        )
+
+
 class HookNotActive(WizWalkerError):
     """
     Raised when doing something that requires a hook to be active,
@@ -104,6 +115,17 @@ class MemoryWriteError(WizWalkerMemoryError):
         super().__init__(f"Unable to write memory at address {address}.")
 
 
+class UnsupportedMemoryOperation(WizWalkerMemoryError):
+    """Raised when a selected memory backend does not support a mutation."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(
+            f"The selected memory backend does not support {operation}. "
+            "Use the Pymem backend until Rust mutation support is available."
+        )
+
+
 class ReadingEnumFailed(WizWalkerMemoryError):
     """
     Raised when the value passed to an enum is not valid
@@ -162,6 +184,66 @@ class CardAlreadyEnchanted(WizWalkerError):
 
 
 # TODO: remove in 2.0
-class HotkeyAlreadyRegistered(WizWalkerError):
-    def __init__(self, key: str):
-        super().__init__(f"{key} already registered")
+class HotkeyRegistrationError(WizWalkerError):
+    """A global shortcut could not be registered or removed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        keycode: int | None = None,
+        modifiers: int | None = None,
+        details=None,
+        technical_message: str | None = None,
+        operation: str | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.operation = operation or (
+            "hotkey.unregister"
+            if code == "hotkey_not_registered"
+            else "hotkey.register"
+        )
+        self.keycode = keycode
+        self.modifiers = modifiers
+        self.details = details or {}
+        self.technical_message = technical_message
+
+
+class HotkeyAlreadyRegistered(HotkeyRegistrationError):
+    def __init__(
+        self,
+        keycode,
+        modifiers=0,
+        *,
+        message=None,
+        details=None,
+        technical_message=None,
+    ):
+        raw_keycode = getattr(keycode, "value", keycode)
+        try:
+            numeric_keycode = int(raw_keycode)
+        except (TypeError, ValueError):
+            numeric_keycode = None
+        if message is None:
+            if numeric_keycode is None:
+                message = f"{keycode} already registered"
+            else:
+                message = (
+                    f"The shortcut using key {numeric_keycode} and modifiers "
+                    f"{int(modifiers)} is already registered."
+                )
+        super().__init__(
+            message,
+            code="hotkey_conflict",
+            keycode=numeric_keycode,
+            modifiers=int(modifiers),
+            details=details,
+            technical_message=technical_message,
+        )
+
+
+class HotkeyBackendUnavailable(HotkeyRegistrationError):
+    def __init__(self, message: str):
+        super().__init__(message, code="hotkey_backend_unavailable")

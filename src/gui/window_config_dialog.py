@@ -27,7 +27,8 @@ import wizlaunch
 
 
 # ---- physical monitor enumeration (matches SetWindowPos screen coords) ----
-_user32 = ctypes.windll.user32
+_windll = getattr(ctypes, "windll", None)
+_user32 = _windll.user32 if _windll is not None else None
 
 
 class _MONITORINFO(ctypes.Structure):
@@ -35,7 +36,7 @@ class _MONITORINFO(ctypes.Structure):
                 ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
 
-_MONENUMPROC = ctypes.WINFUNCTYPE(
+_MONENUMPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
     ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_double
 )
 
@@ -51,6 +52,18 @@ def enum_monitors():
     (see ``_taskbar_rect``).
     """
     out = []
+    if _user32 is None:
+        from PyQt6.QtGui import QGuiApplication
+
+        for screen in QGuiApplication.screens():
+            geometry = screen.geometry()
+            available = screen.availableGeometry()
+            out.append((
+                geometry.x(), geometry.y(), geometry.width(), geometry.height(),
+                screen is QGuiApplication.primaryScreen(),
+                (available.x(), available.y(), available.width(), available.height()),
+            ))
+        return out
 
     def _cb(hmon, hdc, lprc, lparam):
         mi = _MONITORINFO()

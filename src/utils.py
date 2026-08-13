@@ -1,5 +1,4 @@
 import asyncio
-import ctypes
 import logging
 import time
 import traceback
@@ -8,12 +7,13 @@ import re
 import os
 
 import wizwalker.errors
-from wizwalker import Client, Keycode, XYZ, Primitive, kernel32
+from wizwalker import Client, Keycode, XYZ, Primitive
 from wizwalker.memory.memory_objects.character_registry import DynamicMemoryObject
-from wizwalker.utils import get_all_wizard_handles, override_wiz_install_location, get_pid_from_handle
+from wizwalker.utils import get_all_wizard_handles, override_wiz_install_location
 from wizwalker.extensions.scripting.utils import _maybe_get_named_window, _cycle_to_online_friends, _click_on_friend, _teleport_to_friend, _friend_list_entry
 from wizwalker.extensions.wizsprinter.wiz_navigator import toZone
 from wizwalker.memory import ObjectType, Window, WindowFlags
+from wizwalker.platform_adapter import legacy_windows, send_key_message
 from wizwalker.combat import CombatMember
 from loguru import logger
 
@@ -752,11 +752,8 @@ async def wait_and_return_window_by_path(parent, *path):
 
 
 async def post_keys(client, keys):
-    user32_dance = ctypes.windll.user32
-
     for key in keys:
-        user32_dance.PostMessageW(client.window_handle, 0x100, ord(key), 0)
-        user32_dance.PostMessageW(client.window_handle, 0x101, ord(key), 0)
+        await send_key_message(client, Keycode[key.upper()], post=True)
 
 
 async def logout_and_in(client: Client):
@@ -1260,7 +1257,12 @@ async def try_task_coro(coro: Coroutine, clients: List[Client], deactive_mousele
             await asyncio.gather(*[attempt_deactivate_dance_hook(p) for p in clients])
             return
 
-        except (wizwalker.errors.MemoryInvalidated, wizwalker.errors.ExceptionalTimeout):
+        except (
+            wizwalker.errors.HookNotReady,
+            wizwalker.errors.MemoryInvalidated,
+            wizwalker.errors.MemoryReadError,
+            wizwalker.errors.ExceptionalTimeout,
+        ):
             if attempt < max_retries:
                 logger.debug(f'Task {task_coro} encountered a memory error, retrying ({attempt + 1}/{max_retries})...')
                 await asyncio.sleep(1)
@@ -1436,10 +1438,8 @@ def override_wiz_install_using_handle(max_size = 100):
     """
     This function allows you to automatically override your wiz install location, provided that wizard101 is open.
     """
-    path = ctypes.create_unicode_buffer(max_size)
-    pid = get_pid_from_handle(get_all_wizard_handles()[0])
-    handle = kernel32.OpenProcess(0x410, 0, pid) # PROCESS_QUERY_INFORMATION and PROCESS_VM_READ
-    ctypes.windll.psapi.GetModuleFileNameExW(handle, None, ctypes.byref(path), max_size)
-    kernel32.CloseHandle(handle)
-    install_location = path.value.replace("\\Bin\\WizardGraphicalClient.exe", "")
-    override_wiz_install_location(install_location)
+    window_handle = get_all_wizard_handles()[0]
+    if not isinstance(window_handle, int):
+        return
+    executable_path = legacy_windows.process_path(window_handle, max_size)
+    override_wiz_install_location(str(executable_path.parent.parent))

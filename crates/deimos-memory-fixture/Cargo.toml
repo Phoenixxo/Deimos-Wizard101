@@ -1,0 +1,26 @@
+[package]
+name = "deimos-memory-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+deimos-agent = { path = "../deimos-agent" }
+deimos-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

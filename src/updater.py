@@ -304,7 +304,7 @@ def _bootloader_parent_pid() -> Optional[int]:
         import ctypes.wintypes
 
         _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        k32 = ctypes.windll.kernel32
+        k32 = getattr(ctypes, "windll").kernel32
 
         def image_of(pid: int) -> Optional[str]:
             handle = k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)

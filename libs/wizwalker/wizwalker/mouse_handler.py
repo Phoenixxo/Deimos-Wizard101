@@ -1,10 +1,7 @@
 import asyncio
-import ctypes
-import ctypes.wintypes
-
 import wizwalker
-from wizwalker import user32
 from wizwalker.memory.hooks import MouselessCursorMoveHook
+from wizwalker.platform_adapter import legacy_windows
 
 
 class MouseHandler:
@@ -20,7 +17,7 @@ class MouseHandler:
         self._ref_lock = None
         self._ref_count = 0
         # Make our app dpi aware so scaling works for free
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        legacy_windows.set_process_dpi_awareness()
 
     async def __aenter__(self):
         if self._ref_lock is None:
@@ -140,11 +137,6 @@ class MouseHandler:
         else:
             button_down_message = 0x201
 
-        if use_post:
-            send_method = user32.PostMessageW
-        else:
-            send_method = user32.SendMessageW
-
         # so MouseHandler can be inited in sync funcs like other __init__s
         if self.click_lock is None:
             self.click_lock = asyncio.Lock()
@@ -155,11 +147,23 @@ class MouseHandler:
             await self.set_mouse_position(x, y)
             await asyncio.sleep(self.click_predelay)
             # mouse button down
-            send_method(self.client.window_handle, button_down_message, 1, 0)
+            legacy_windows.send_window_message(
+                self.client.window_handle,
+                button_down_message,
+                1,
+                0,
+                post=use_post,
+            )
             if sleep_duration > 0:
                 await asyncio.sleep(sleep_duration)
             # mouse button up
-            send_method(self.client.window_handle, button_down_message + 1, 0, 0)
+            legacy_windows.send_window_message(
+                self.client.window_handle,
+                button_down_message + 1,
+                0,
+                0,
+                post=use_post,
+            )
             # move mouse outside of client area
             await self.set_mouse_position(-100, -100)
 
@@ -181,28 +185,17 @@ class MouseHandler:
             convert_from_client: If the position should be converted from client to screen
             use_post: If PostMessage should be used instead of SendMessage
         """
-        if use_post:
-            send_method = user32.PostMessageW
-        else:
-            send_method = user32.SendMessageW
-
         if convert_from_client:
-            point = ctypes.wintypes.tagPOINT(x, y)
-
-            # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-clienttoscreen
-            if (
-                user32.ClientToScreen(self.client.window_handle, ctypes.byref(point))
-                == 0
-            ):
-                raise RuntimeError("Client to screen conversion failed")
-
-            # same point structure is overwritten by ClientToScreen; these are also ints and not
-            # c_longs for some reason?
-            x = point.x
-            y = point.y
+            x, y = legacy_windows.client_to_screen(self.client.window_handle, x, y)
 
         res = await self.client.hook_handler.write_mouse_position(x, y)
         # position doesn't matter here; sending mouse move
         # mouse move is here so that items are highlighted
-        send_method(self.client.window_handle, 0x200, 0, 0)
+        legacy_windows.send_window_message(
+            self.client.window_handle,
+            0x200,
+            0,
+            0,
+            post=use_post,
+        )
         return res

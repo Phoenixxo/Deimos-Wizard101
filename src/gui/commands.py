@@ -72,7 +72,7 @@ class GUICommandType(Enum):
     HighlightEntity = auto()    # GUI -> Backend, data = (x, y, z, height)
     HighlightUIWindow = auto()  # GUI -> Backend, data = list[str] (name path)
     ClearHighlight = auto()     # GUI -> Backend, data = None
-    UpdateHighlightBox = auto() # Backend -> GUI, data = (window_handle, x1, y1, x2, y2) or None
+    UpdateHighlightBox = auto() # Backend -> GUI, data = (window geometry/target, x1, y1, x2, y2) or None
 
     StartEntityStream = auto()   # GUI -> Backend, data = None
     StopEntityStream = auto()    # GUI -> Backend, data = None

@@ -3,17 +3,17 @@ import queue
 import re
 import sys
 import time
+from pathlib import Path
 
 from loguru import logger
-import ctypes
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QLineEdit, QTextEdit,
     QPlainTextEdit, QComboBox, QFrame, QDialog, QMessageBox,
 )
-from PyQt6.QtCore import QTimer, Qt, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QFont, QPainter
+from PyQt6.QtCore import QTimer, Qt, QSize, QUrl
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QPainter, QDesktopServices
 from PyQt6.QtSvg import QSvgRenderer
 
 from src.lang import load_lang
@@ -21,7 +21,7 @@ from src.gui.commands import GUICommand, GUICommandType, GUIKeys, _format_bindin
 from src.gui.widgets import AnimatedTabWidget, ConsoleTextEdit, PyQtSink, HighlightOverlay
 from src.gui.helpers import (
     resource_path, centered_label, copy_icon_btn, copy_callback, build_shared_svgs,
-    init_recent_imports,
+    init_recent_imports, guarded_qt_callback,
 )
 from src.gui.actions import ActionRegistry
 from src.gui.theme import compute_styles
@@ -33,6 +33,8 @@ from src.gui.tab_camera import build_camera_tab
 from src.gui.tab_dev_utils import build_dev_utils_tab
 from src.gui.tab_stats import build_stats_tab
 from src.gui.tab_actions import build_flythrough_tab, build_bot_tab, build_combat_tab
+from src.platform_adapter import host_platform
+from src.logging_paths import application_log_directory
 
 
 class GUIContext:
@@ -40,16 +42,21 @@ class GUIContext:
     pass
 
 
-def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None):
+def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, tool_name, tool_version, gui_on_top, langcode, gui_font='Segoe UI', gui_font_size=9, tool_author='Deimos-Wizard101', settings=None, runtime_error=None, control_queue=None, shutdown_event=None, log_directory=None, account_prompt=None):
     tl = load_lang(langcode)
+    control_queue = control_queue or send_queue
+    log_directory = Path(log_directory or application_log_directory())
 
-    # Set AppUserModelID so Windows uses our icon in taskbar/process list
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"deimos.{tool_name}")
+        host_platform.set_app_user_model_id(f"deimos.{tool_name}")
     except Exception:
         pass
 
     app = QApplication(sys.argv)
+    try:
+        host_platform.request_input_monitoring_permission()
+    except Exception:
+        pass
     app.setFont(QFont(gui_font if gui_font else "Segoe UI", gui_font_size if gui_font_size else 9))
 
     _vp_height = 450
@@ -76,16 +83,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     window.setWindowFlags(_window_flags)
     window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
-    # Enable Windows 11 rounded corners on frameless window
     try:
-        import ctypes, ctypes.wintypes
-        _hwnd = ctypes.wintypes.HWND(int(window.winId()))
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = ctypes.c_int(2)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            _hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-            ctypes.byref(DWMWCP_ROUND), ctypes.sizeof(DWMWCP_ROUND)
-        )
+        host_platform.enable_rounded_corners(int(window.winId()))
     except Exception:
         pass
     window.setStyleSheet(styles['groupbox_style'])
@@ -175,18 +174,12 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
         else:
             pin_btn.setIcon(_pin_icon if _is_pinned[0] else _unpin_icon)
         pin_btn.setToolTip(tl('always_on_top') if _is_pinned[0] else tl('not_on_top'))
-        import ctypes.wintypes
-        _SetWindowPos = ctypes.windll.user32.SetWindowPos
-        _SetWindowPos.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-        _SetWindowPos.restype = ctypes.wintypes.BOOL
-        hwnd = ctypes.wintypes.HWND(int(window.winId()))
-        HWND_TOPMOST = ctypes.wintypes.HWND(-1)
-        HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_NOACTIVATE = 0x0010
-        insert_after = HWND_TOPMOST if _is_pinned[0] else HWND_NOTOPMOST
-        _SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        if not host_platform.set_topmost(int(window.winId()), _is_pinned[0]):
+            window.setWindowFlag(
+                Qt.WindowType.WindowStaysOnTopHint,
+                _is_pinned[0],
+            )
+            window.show()
 
     pin_btn.clicked.connect(_toggle_pin)
     titlebar_layout.addWidget(pin_btn)
@@ -270,6 +263,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     # ==================== GUIContext ====================
     ctx = GUIContext()
     ctx.send_queue = send_queue
+    ctx.control_queue = control_queue
+    ctx.account_prompt = account_prompt
     ctx.widget_tags = widget_tags
     ctx.tl = tl
     ctx.settings = settings
@@ -372,16 +367,16 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
     widget_tags['-CONSOLE-'] = console_text
     console_layout.addWidget(console_text, 1)
 
-    _logs_expanded = [False]
+    _logs_expanded = [True]
 
     toggle_expand_btn = QPushButton()
-    toggle_expand_btn.setIcon(_titlebar_svg_icon(svgs['expand'], 32))
+    toggle_expand_btn.setIcon(_titlebar_svg_icon(svgs['collapse'], 32))
     toggle_expand_btn.setFixedSize(40, 40)
     toggle_expand_btn.setStyleSheet(icon_btn_style)
     toggle_expand_btn.setToolTip(tl('collapse_expand_logs'))
     toggle_expand_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-    # Track with current SVG for restyle (expand is default state)
-    ctx.tracked_icon_buttons.append((toggle_expand_btn, svgs['expand'], 32))
+    # Track with current SVG for restyle (full messages are shown by default)
+    ctx.tracked_icon_buttons.append((toggle_expand_btn, svgs['collapse'], 32))
 
     console_psg = PyQtSink(console_text)
 
@@ -393,9 +388,20 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
 
     toggle_expand_btn.clicked.connect(_toggle_expand_logs)
 
+    def _open_logs():
+        try:
+            log_directory.mkdir(parents=True, exist_ok=True)
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_directory)))
+            if not opened:
+                raise RuntimeError("the desktop could not open the log directory")
+        except Exception as error:
+            logger.warning("Could not open the Deimos log directory: {}", error)
+            QMessageBox.warning(window, tl('open_logs'), str(error))
+
     console_btn_row = QHBoxLayout()
     console_btn_row.addStretch()
     console_btn_row.addWidget(toggle_expand_btn)
+    console_btn_row.addWidget(registry.action_icon_btn(svgs['folder'], tl('open_logs'), _open_logs))
     console_btn_row.addWidget(registry.action_icon_btn(svgs['copy_logs'], tl('copy_logs'), copy_callback(send_queue, GUIKeys.copy_logs)))
     console_btn_row.addStretch()
     console_layout.addLayout(console_btn_row)
@@ -487,7 +493,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
             event.accept()
             return
         event.ignore()
-        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+        if shutdown_event is not None:
+            shutdown_event.set()
+        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
 
     window.closeEvent = close_event
 
@@ -541,7 +549,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                         return
 
                     case GUICommandType.CloseFromBackend:
-                        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+                        if shutdown_event is not None:
+                            shutdown_event.set()
+                        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
 
                     case GUICommandType.UpdateWindow:
                         tag = com.data[0]
@@ -669,8 +679,8 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
                         if com.data is not None:
                             if highlight_overlay[0] is None:
                                 highlight_overlay[0] = HighlightOverlay()
-                            game_hwnd, x1, y1, x2, y2 = com.data
-                            highlight_overlay[0].update_box(game_hwnd, x1, y1, x2, y2)
+                            overlay_target, x1, y1, x2, y2 = com.data
+                            highlight_overlay[0].update_box(overlay_target, x1, y1, x2, y2)
                         else:
                             if highlight_overlay[0] is not None:
                                 highlight_overlay[0].clear_box()
@@ -762,10 +772,17 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
             pass
 
     timer = QTimer()
-    timer.timeout.connect(poll_queue)
+    timer.timeout.connect(guarded_qt_callback("main.poll_queue", poll_queue))
     timer.start(16)
 
     window.show()
+    if runtime_error:
+        QMessageBox.warning(
+            window,
+            "Wizard101 runtime unavailable",
+            f"Deimos could not start the configured CrossOver helper agent.\n\n{runtime_error}\n\n"
+            "Update the macOS Wizard101 settings and restart Deimos.",
+        )
     # Lock width to the tab bar width + content margins
     tab_bar_width = tabs.tabBar().sizeHint().width()
     margins = content_layout.contentsMargins()
@@ -774,7 +791,9 @@ def manage_gui(send_queue: queue.Queue, recv_queue: queue.Queue, theme_dict, too
 
     # After app exits, signal backend
     if not close_accepted[0]:
-        send_queue.put(GUICommand(GUICommandType.AttemptedClose))
+        if shutdown_event is not None:
+            shutdown_event.set()
+        control_queue.put(GUICommand(GUICommandType.AttemptedClose))
         timeout = 30
         start = time.time()
         while time.time() - start < timeout:

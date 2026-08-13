@@ -400,10 +400,13 @@ class MovementTeleportHook(SimpleHook):
         )
 
         old_inside_event_je_bytes = await self.read_bytes(inside_event_je_addr, 2)
-        old_event_dispatch_je_addr = await self.read_bytes(event_dispatch_je_addr, 2)
+        old_event_dispatch_je_bytes = await self.read_bytes(event_dispatch_je_addr, 2)
 
         self._collision_je_addrs = (inside_event_je_addr, event_dispatch_je_addr)
-        self._old_collision_jes_bytes = (old_inside_event_je_bytes, old_event_dispatch_je_addr)
+        self._old_collision_jes_bytes = (
+            old_inside_event_je_bytes,
+            old_event_dispatch_je_bytes,
+        )
 
         for addr in self._collision_je_addrs:
             await self.write_bytes(addr, b"\x90\x90")

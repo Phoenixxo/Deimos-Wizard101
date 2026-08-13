@@ -1,0 +1,32 @@
+# Deimos memory fixture
+
+This Windows-only process provides deterministic memory for integration tests
+without launching Wizard101.
+
+At startup it allocates one `PAGE_READONLY` region and one `PAGE_READWRITE`
+region, initializes known primitive values and a two-hop pointer chain, then
+publishes one line of runtime JSON on stdout:
+
+```text
+{"schema_version":1,"pid":1234,...}
+```
+
+The metadata contains the process ID, runtime region addresses, field offsets,
+exact and wildcard signatures, expected bytes, pointer-chain offsets, region
+protections, and mutation capability. Consumers must use this metadata or scan
+the published signatures; addresses are intentionally allocated at runtime and
+must never be hardcoded.
+
+For a pointer chain, start at the named root-pattern match. Add and dereference
+each offset covered by `dereference_count`, then add the final offset to reach
+the target value.
+
+Successful metadata parsing is the readiness signal. Send a line containing
+`shutdown` on stdin to stop the fixture; closing stdin also stops it. A
+successful process exit is the authoritative shutdown signal.
+
+The read/write region and read-only region are controlled targets for mutation
+tests, and metadata declares `mutation_enabled: true`. Read-only tests still
+open the process with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`; mutation
+tests explicitly request a separate mutation session and never target
+Wizard101.

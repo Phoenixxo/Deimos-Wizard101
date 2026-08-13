@@ -155,6 +155,7 @@ select_pet_world=选择宠物世界：
 # 控制台
 console_support=请求帮助时请附带日志。
 collapse_expand_logs=折叠 / 展开日志
+open_logs=打开日志
 copy_logs=复制日志
 
 # 工具提示

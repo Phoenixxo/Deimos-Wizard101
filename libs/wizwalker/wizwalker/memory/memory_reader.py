@@ -1,25 +1,105 @@
 import asyncio
 import functools
-import regex
-import struct
+from importlib import import_module
 from typing import Any, Union
 
-import pefile
-import pymem
-import pymem.exception
-import pymem.process
-import pymem.ressources.structure
-
-from wizwalker import (
+from wizwalker.constants import Primitive
+from wizwalker.errors import (
     AddressOutOfRange,
     ClientClosedError,
     MemoryReadError,
     MemoryWriteError,
     PatternFailed,
     PatternMultipleResults,
-    Primitive,
-    utils,
+    UnsupportedMemoryOperation,
 )
+from .backends import MemoryBackend, PymemMemoryBackend
+
+
+_REGEX_META_BYTES = frozenset(b"*+?{}[]()|^$")
+_ASCII_ALPHANUMERIC = frozenset(
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
+
+
+def __getattr__(name: str):
+    # Preserve the existing module attribute without importing Pymem eagerly.
+    if name == "pymem":
+        pymem = import_module("pymem")
+        import_module("pymem.exception")
+        import_module("pymem.process")
+        return pymem
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _legacy_pattern_to_signature(pattern: bytes) -> str:
+    """
+    Convert WizWalker's fixed-width byte-regex subset into an agent signature.
+
+    Legacy patterns use exact bytes plus ``.`` as a one-byte wildcard. Regex
+    constructs that could change the consumed length are deliberately rejected
+    instead of being silently interpreted as literal bytes.
+    """
+    if not isinstance(pattern, bytes):
+        raise TypeError("pattern must be bytes")
+    if not pattern:
+        raise ValueError("pattern must not be empty")
+
+    signature = []
+    index = 0
+    while index < len(pattern):
+        value = pattern[index]
+
+        if value == ord("."):
+            signature.append("??")
+            index += 1
+            continue
+
+        if value in _REGEX_META_BYTES:
+            character = chr(value)
+            raise ValueError(
+                f"Unsupported variable-length regex construct {character!r} in "
+                "memory pattern. Rust scans support exact bytes and single-byte "
+                "'.' wildcards only."
+            )
+
+        if value != ord("\\"):
+            signature.append(f"{value:02X}")
+            index += 1
+            continue
+
+        if index + 1 >= len(pattern):
+            raise ValueError("Memory pattern ends with an incomplete escape.")
+
+        escaped = pattern[index + 1]
+        if escaped == ord("x"):
+            if index + 3 >= len(pattern):
+                raise ValueError("Memory pattern contains an incomplete hexadecimal escape.")
+            digits = pattern[index + 2 : index + 4]
+            try:
+                signature.append(f"{int(digits.decode('ascii'), 16):02X}")
+            except (UnicodeDecodeError, ValueError) as error:
+                raise ValueError(
+                    f"Memory pattern contains an invalid hexadecimal escape {digits!r}."
+                ) from error
+            index += 4
+            continue
+
+        if escaped in _ASCII_ALPHANUMERIC:
+            raise ValueError(
+                f"Unsupported semantic regex escape "
+                f"{bytes((value, escaped))!r} in memory pattern. Rust scans "
+                "support exact bytes, hexadecimal escapes, and single-byte "
+                "'.' wildcards only."
+            )
+
+        # regex.escape emits a backslash followed by the literal byte for
+        # punctuation and whitespace. Those escapes do not change width or
+        # matching semantics and can be represented exactly by the agent.
+        signature.append(f"{escaped:02X}")
+        index += 2
+
+    return " ".join(signature)
 
 
 class MemoryReader:
@@ -27,8 +107,13 @@ class MemoryReader:
     Represents anything that needs to read/write from/to memory
     """
 
-    def __init__(self, process: pymem.Pymem):
-        self.process = process
+    def __init__(self, process):
+        if isinstance(process, MemoryBackend):
+            self._backend = process
+            self.process = process.process
+        else:
+            self._backend = PymemMemoryBackend(process)
+            self.process = process
 
         self._symbol_table = {}
 
@@ -37,7 +122,7 @@ class MemoryReader:
         """
         If the process we're reading/writing to/from is running
         """
-        return utils.check_if_process_running(self.process.process_handle)
+        return self._backend.is_running()
 
     @staticmethod
     async def run_in_executor(func, *args, **kwargs):
@@ -59,6 +144,7 @@ class MemoryReader:
             return dll_table
 
         # exe_path = utils.get_wiz_install() / "Bin" / "WizardGraphicalClient.exe"
+        pefile = import_module("pefile")
         pe = pefile.PE(file_path)
 
         symbols = {}
@@ -75,21 +161,24 @@ class MemoryReader:
 
     @staticmethod
     def _scan_page_return_all(handle, address, pattern):
-        mbi = pymem.memory.virtual_query(handle, address)
+        pymem_memory = import_module("pymem.memory")
+        pymem_structure = import_module("pymem.ressources.structure")
+        regex = import_module("regex")
+        mbi = pymem_memory.virtual_query(handle, address)
         next_region = mbi.BaseAddress + mbi.RegionSize
         allowed_protections = [
-            pymem.ressources.structure.MEMORY_PROTECTION.PAGE_EXECUTE_READ,
-            pymem.ressources.structure.MEMORY_PROTECTION.PAGE_EXECUTE_READWRITE,
-            pymem.ressources.structure.MEMORY_PROTECTION.PAGE_READWRITE,
-            pymem.ressources.structure.MEMORY_PROTECTION.PAGE_READONLY,
+            pymem_structure.MEMORY_PROTECTION.PAGE_EXECUTE_READ,
+            pymem_structure.MEMORY_PROTECTION.PAGE_EXECUTE_READWRITE,
+            pymem_structure.MEMORY_PROTECTION.PAGE_READWRITE,
+            pymem_structure.MEMORY_PROTECTION.PAGE_READONLY,
         ]
         if (
-            mbi.state != pymem.ressources.structure.MEMORY_STATE.MEM_COMMIT
+            mbi.state != pymem_structure.MEMORY_STATE.MEM_COMMIT
             or mbi.protect not in allowed_protections
         ):
             return next_region, None
 
-        page_bytes = pymem.memory.read_bytes(handle, address, mbi.RegionSize)
+        page_bytes = pymem_memory.read_bytes(handle, address, mbi.RegionSize)
 
         found = []
 
@@ -153,28 +242,48 @@ class MemoryReader:
         Returns:
             A list of results if return_multple is True otherwise one result
         """
-        if module:
-            module_object = pymem.process.module_from_name(self.process.process_handle, module)
+        if isinstance(self._backend, PymemMemoryBackend):
+            if module:
+                module_object = await self.run_in_executor(
+                    self._backend.module,
+                    module,
+                )
 
-            if module_object is None:
-                raise ValueError(f"{module} module not found.")
+                if module_object is None:
+                    raise ValueError(f"{module} module not found.")
 
-            # this can take a long time to run when collecting multiple results
-            # so must be run in an executor
-            found_addresses = await self.run_in_executor(
-                self._scan_entire_module,
-                self.process.process_handle,
-                module_object,
-                pattern,
-            )
+                # this can take a long time to run when collecting multiple results
+                # so must be run in an executor
+                found_addresses = await self.run_in_executor(
+                    self._scan_entire_module,
+                    self.process.process_handle,
+                    module_object,
+                    pattern,
+                )
 
+            else:
+                found_addresses = await self.run_in_executor(
+                    self._scan_all,
+                    self.process.process_handle,
+                    pattern,
+                    return_multiple,
+                )
         else:
-            found_addresses = await self.run_in_executor(
-                self._scan_all,
-                self.process.process_handle,
-                pattern,
-                return_multiple,
-            )
+            signature = _legacy_pattern_to_signature(pattern)
+            try:
+                found_addresses = await self.run_in_executor(
+                    self._backend.scan,
+                    signature,
+                    module_name=module,
+                    return_multiple=return_multiple,
+                )
+            except ValueError:
+                raise
+            except Exception as error:
+                mapped = await self._mapped_read_error(error, str(error))
+                if mapped is not None:
+                    raise mapped from error
+                raise
 
         if (found_length := len(found_addresses)) == 0:
             raise PatternFailed(pattern)
@@ -209,7 +318,15 @@ class MemoryReader:
             ValueError: No symbol/module with that name
         """
         if not module_dir:
-            module_dir = utils.get_system_directory()
+            if isinstance(self._backend, PymemMemoryBackend):
+                from wizwalker import utils
+
+                module_dir = utils.get_system_directory()
+            else:
+                raise ValueError(
+                    "module_dir is required when resolving symbols through the "
+                    "Rust memory backend."
+                )
 
         file_path = module_dir / module_name
 
@@ -223,11 +340,21 @@ class MemoryReader:
         if not (symbol := symbols.get(symbol_name)):
             raise ValueError(f"No symbol named {symbol_name} in module {module_name}")
 
-        module = pymem.process.module_from_name(
-            self.process.process_handle, module_name
-        )
+        try:
+            module_base = await self.run_in_executor(
+                self._backend.module_base,
+                module_name,
+            )
+        except Exception as error:
+            mapped = await self._mapped_read_error(error, str(error))
+            if mapped is not None:
+                raise mapped from error
+            raise
 
-        return module.lpBaseOfDll + symbol
+        if module_base is None:
+            raise ValueError(f"{module_name} module not found.")
+
+        return module_base + symbol
 
     async def allocate(self, size: int) -> int:
         """
@@ -239,7 +366,8 @@ class MemoryReader:
         Returns:
             The allocated address
         """
-        return self.process.allocate(size)
+        self._require_mutation("allocate")
+        return await self.run_in_executor(self._backend.allocate, size)
 
     async def free(self, address: int):
         """
@@ -248,7 +376,8 @@ class MemoryReader:
         Args:
              address: The address to free
         """
-        self.process.free(address)
+        self._require_mutation("free")
+        await self.run_in_executor(self._backend.free, address)
 
     # TODO: figure out how params works
     async def start_thread(self, address: int):
@@ -258,7 +387,8 @@ class MemoryReader:
         Args:
             address: The address to start the thread at
         """
-        await self.run_in_executor(self.process.start_thread, address)
+        self._require_mutation("remote thread creation")
+        await self.run_in_executor(self._backend.start_thread, address)
 
     async def read_bytes(self, address: int, size: int) -> bytes:
         """
@@ -277,14 +407,16 @@ class MemoryReader:
             raise AddressOutOfRange(address)
 
         try:
-            return self.process.read_bytes(address, size)
-        except pymem.exception.MemoryReadError:
-            # we don't want to run is running for every read
-            # so we just check after we error
-            if not self.is_running():
-                raise ClientClosedError()
-            else:
-                raise MemoryReadError(address)
+            return await self.run_in_executor(
+                self._backend.read_bytes,
+                address,
+                size,
+            )
+        except Exception as error:
+            mapped = await self._mapped_read_error(error, address)
+            if mapped is not None:
+                raise mapped from error
+            raise
 
     async def write_bytes(self, address: int, value: bytes):
         """
@@ -294,16 +426,87 @@ class MemoryReader:
             address: The address to write to
             value: The bytes to write
         """
-        size = len(value)
+        self._require_mutation("write")
 
         try:
-            self.process.write_bytes(address, value, size)
-        except pymem.exception.MemoryWriteError:
+            await self.run_in_executor(
+                self._backend.write_bytes,
+                address,
+                value,
+            )
+        except Exception as error:
+            if not self._backend.is_write_error(error):
+                raise
+
             # see read_bytes
-            if not self.is_running():
-                raise ClientClosedError()
-            else:
-                raise MemoryWriteError(address)
+            if await self._is_running_after_error() is False:
+                raise ClientClosedError() from error
+            raise MemoryWriteError(address) from error
+
+    def _require_mutation(self, operation: str):
+        capability = {
+            "write": "supports_write",
+            "allocate": "supports_allocation",
+            "free": "supports_allocation",
+            "remote thread creation": "supports_remote_thread",
+        }.get(operation)
+        supported = (
+            getattr(self._backend, capability)
+            if capability is not None and hasattr(self._backend, capability)
+            else self._backend.supports_mutation
+        )
+        if not supported:
+            raise UnsupportedMemoryOperation(operation)
+
+    async def _is_running_after_error(self) -> bool | None:
+        """
+        Probe process status without blocking the event loop.
+
+        A status failure is inconclusive and must not replace the operation
+        error that prompted the probe.
+        """
+        try:
+            return await self.run_in_executor(self.is_running)
+        except Exception:
+            return None
+
+    async def _mapped_read_error(
+        self,
+        error: BaseException,
+        address_or_message: int | str,
+    ) -> Exception | None:
+        if self._backend.is_closed_process_error(error):
+            return self._copy_native_error_context(ClientClosedError(), error)
+
+        if not (
+            self._backend.is_process_error(error)
+            or self._backend.is_read_error(error)
+            or self._backend.is_operation_error(error)
+        ):
+            return None
+
+        if await self._is_running_after_error() is False:
+            return self._copy_native_error_context(ClientClosedError(), error)
+
+        mapped = MemoryReadError(address_or_message)
+        return self._copy_native_error_context(mapped, error)
+
+    @staticmethod
+    def _copy_native_error_context(
+        mapped: Exception,
+        error: BaseException,
+    ) -> Exception:
+        for attribute in (
+            "code",
+            "details",
+            "native_context",
+            "operation",
+            "request_id",
+            "technical_message",
+        ):
+            if hasattr(error, attribute):
+                setattr(mapped, attribute, getattr(error, attribute))
+        return mapped
 
     async def read_typed(self, address: int, data_type: Primitive) -> Any:
         """

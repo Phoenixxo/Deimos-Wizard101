@@ -1,8 +1,6 @@
 import math
 import re
 import time
-import ctypes
-import ctypes.wintypes
 
 import pyperclip
 from PyQt6.QtWidgets import (
@@ -19,6 +17,8 @@ from PyQt6.QtGui import QPixmap, QIcon, QPainter, QColor, QPen, QBrush, QFont, Q
 from PyQt6.QtSvg import QSvgRenderer
 
 from src.gui.commands import _QT_KEY_TO_KEYCODE, _MODIFIER_KEYS, _format_binding
+from src.gui.overlay import OverlayGeometryAdapter
+from src.gui.helpers import guarded_qt_callback
 
 
 class ToggleNameLabel(QLabel):
@@ -312,7 +312,9 @@ class DuelCircleWidget(QWidget):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(16)
-        self._anim_timer.timeout.connect(self._anim_tick)
+        self._anim_timer.timeout.connect(
+            guarded_qt_callback("widgets.animation", self._anim_tick)
+        )
         self._anim_progress = 1.0
         self._anim_start_time = 0.0
         self._anim_duration = 0.6
@@ -855,53 +857,41 @@ class HighlightOverlay(QWidget):
     """Transparent, click-through overlay that covers the game window."""
     THICKNESS = 3
 
-    def __init__(self):
+    def __init__(self, geometry_adapter=None):
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._geometry_adapter = geometry_adapter or OverlayGeometryAdapter()
+        self._geometry_adapter.configure_widget(self, Qt)
         self._box_rect = (0, 0, 0, 0)
         self._has_box = False
         self._click_through_set = False
 
     def _ensure_click_through(self):
         if not self._click_through_set:
+            self._geometry_adapter.ensure_native_behavior(self)
             self._click_through_set = True
-            hwnd = int(self.winId())
-            ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex_style | 0x20 | 0x80000)
 
-    def update_box(self, game_hwnd, x1, y1, x2, y2):
+    def update_box(self, target, x1, y1, x2, y2):
         self._ensure_click_through()
-        origin = ctypes.wintypes.POINT(0, 0)
-        ctypes.windll.user32.ClientToScreen(game_hwnd, ctypes.byref(origin))
-        client_rect = ctypes.wintypes.RECT()
-        ctypes.windll.user32.GetClientRect(game_hwnd, ctypes.byref(client_rect))
+        geometry = self._geometry_adapter.resolve(target)
+        if not self._geometry_adapter.should_display(geometry):
+            self.clear_box()
+            return
 
-        dpr = self.devicePixelRatioF()
+        coordinate_scale = self._geometry_adapter.qt_coordinate_scale(self)
         self.setGeometry(
-            round(origin.x / dpr), round(origin.y / dpr),
-            round(client_rect.right / dpr), round(client_rect.bottom / dpr)
+            round(geometry.left / coordinate_scale), round(geometry.top / coordinate_scale),
+            round(geometry.width / coordinate_scale), round(geometry.height / coordinate_scale)
         )
+        self._geometry_adapter.maintain_stacking(self, geometry)
 
-        overlay_hwnd = int(self.winId())
-        GW_HWNDPREV = 3
-        above_game = ctypes.windll.user32.GetWindow(game_hwnd, GW_HWNDPREV)
-        if above_game != overlay_hwnd:
-            SWP_NOSIZE = 0x0001
-            SWP_NOMOVE = 0x0002
-            SWP_NOACTIVATE = 0x0010
-            insert_after = above_game if above_game else 0
-            ctypes.windll.user32.SetWindowPos(
-                overlay_hwnd, insert_after,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-            )
-
-        self._box_rect = (round(x1 / dpr), round(y1 / dpr), round(x2 / dpr), round(y2 / dpr))
+        self._box_rect = (
+            round(x1 / coordinate_scale), round(y1 / coordinate_scale),
+            round(x2 / coordinate_scale), round(y2 / coordinate_scale)
+        )
         self._has_box = True
         if not self.isVisible():
             self.show()
@@ -926,7 +916,7 @@ class HighlightOverlay(QWidget):
 class ConsoleTextEdit(QPlainTextEdit):
     """QPlainTextEdit subclass with thread-safe slots for log appending."""
 
-    MAX_BLOCK_COUNT = 1000
+    MAX_BLOCK_COUNT = 5000
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -949,8 +939,8 @@ class PyQtSink:
     def __init__(self, console_widget: QPlainTextEdit):
         self.console_widget = console_widget
         self.buffer = []
-        self.max_lines = 1000
-        self.show_expanded_logs = False
+        self.max_lines = 5000
+        self.show_expanded_logs = True
 
     def copy(self):
         log_str = "```\n"

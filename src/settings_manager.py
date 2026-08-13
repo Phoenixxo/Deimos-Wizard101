@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -54,9 +55,13 @@ DEFAULT_SETTINGS = {
     # [updates]
     "check_for_updates": True,
     "auto_install_updates": False,
+    # [macOS launcher]
+    "macos_cx_root": "",
+    "macos_bottle": "",
+    "macos_bottle_name": "wizard101",
 }
 
-RESTART_REQUIRED_KEYS = {"locale"}
+RESTART_REQUIRED_KEYS = {"locale", "macos_cx_root", "macos_bottle", "macos_bottle_name"}
 
 # Maps ini section+key -> DEFAULT_SETTINGS key with type coercion
 _INI_SETTINGS_MAP = {
@@ -124,16 +129,23 @@ _INI_KEY_MAP = {
 }
 
 
+def _settings_directory() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "Deimos"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Deimos"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "Deimos"
+
+
 def _theme_path() -> Path:
-    appdata = os.environ.get("APPDATA", "")
-    return Path(appdata) / "Deimos" / "default_theme.json"
+    return _settings_directory() / "default_theme.json"
 
 
 class DeimosSettings:
     def __init__(self, settings_path: str | None = None):
         if settings_path is None:
-            appdata = os.environ.get("APPDATA", "")
-            settings_dir = Path(appdata) / "Deimos"
+            settings_dir = _settings_directory()
             settings_dir.mkdir(parents=True, exist_ok=True)
             self._path = settings_dir / "settings.json"
         else:

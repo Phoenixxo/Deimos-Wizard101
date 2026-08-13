@@ -11,7 +11,7 @@ from PyQt6.QtCore import Qt, QTimer, QPoint
 from loguru import logger
 
 from src.gui.commands import GUICommand, GUICommandType
-from src.gui.helpers import centered_label, repo_icon_btn
+from src.gui.helpers import centered_label, guarded_qt_callback, repo_icon_btn
 from src.gui.widgets import DuelCircleWidget
 from src.combat_objects import school_id_to_names
 
@@ -338,7 +338,7 @@ def build_stats_tab(ctx):
     def _auto_refresh_stats():
         if ctx.tabs.currentWidget() == tab:
             _send_stat_request()
-    stats_timer.timeout.connect(_auto_refresh_stats)
+    stats_timer.timeout.connect(guarded_qt_callback("stats.auto_refresh", _auto_refresh_stats))
     stats_timer.start()
 
     # Update readout when crit/damage inputs change

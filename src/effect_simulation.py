@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple, Union, Set
 from src.combat_cache import *
 from src.combat_math import curve_stat
 
-from enum import Enum
+from enum import IntEnum
 import random
 from math import trunc
 
@@ -53,29 +53,43 @@ hot_effect_types = {
 }
 
 
-class MagicSchoolID(MagicSchool):
-    '''WizWalker MagicSchool enum extended for universal schools.'''
+class MagicSchoolID(IntEnum):
+    '''School identifiers not represented by WizWalker's MagicSchool enum.'''
     universal = 80289
 
 
-class MagicSchoolIndex(Enum):
+class MagicSchoolIndex(IntEnum):
     '''Converts the name of a magic school to a list index for a list of stats.'''
-    MagicSchool.fire = 0
-    MagicSchool.ice = 1
-    MagicSchool.storm = 2
-    MagicSchool.myth = 3
-    MagicSchool.life = 4
-    MagicSchool.death = 5
-    MagicSchool.balance = 6
-    MagicSchool.star = 7
-    MagicSchool.sun = 8
-    MagicSchool.moon = 9
-    MagicSchool.gardening = 10
-    MagicSchool.shadow = 11
-    MagicSchool.fishing = 12
-    MagicSchool.cantrips = 13
-    MagicSchool.castle_magic = 14
-    MagicSchool.whirly_burly = 15
+    fire = 0
+    ice = 1
+    storm = 2
+    myth = 3
+    life = 4
+    death = 5
+    balance = 6
+    star = 7
+    sun = 8
+    moon = 9
+    gardening = 10
+    shadow = 11
+    fishing = 12
+    cantrips = 13
+    castle_magic = 14
+    whirly_burly = 15
+
+
+SCHOOL_INDEX_BY_ID = {
+    MagicSchool[name].value: index.value
+    for name, index in MagicSchoolIndex.__members__.items()
+}
+
+
+def magic_school_index(school: int | str | MagicSchool) -> int:
+    if isinstance(school, MagicSchool):
+        school = school.value
+    elif isinstance(school, str):
+        school = MagicSchool[school].value
+    return SCHOOL_INDEX_BY_ID[int(school)]
 
 
 # class OppositeMagicSchool(Enum):
@@ -163,7 +177,7 @@ def sim_outgoing_dmg_effects(cache: Cache, damage_type: int, damage: float, pier
     member_effects: List[Cache] = cache_get_multi(cache, hanging_effect_paths[:4])
     result_cache = Cache
 
-    damage_type_index = MagicSchoolIndex[damage_type].value
+    damage_type_index = magic_school_index(damage_type)
 
     #Outgoing effect handling
     for i, m_effects in enumerate(member_effects):
@@ -191,7 +205,7 @@ def sim_outgoing_dmg_effects(cache: Cache, damage_type: int, damage: float, pier
 
                 case SpellEffects.modify_outgoing_damage_type: #Prism blade, Old One's Endgame + Lifebane
                     damage_type = param
-                    damage_type_index = MagicSchoolIndex[param].value
+                    damage_type_index = magic_school_index(param)
 
                 case _:
                     continue
@@ -249,7 +263,7 @@ def sim_incoming_dmg_effects(cache: Cache, damage_type: int, damage: float, pier
     member_effects: List[Cache] = cache_get_multi(cache, hanging_effect_paths[:4])
     result_cache = cache
 
-    damage_type_index = MagicSchoolIndex[damage_type].value
+    damage_type_index = magic_school_index(damage_type)
 
     #Incoming effect (target) effect handling
     for i, m_effects in enumerate(member_effects):
@@ -293,7 +307,7 @@ def sim_incoming_dmg_effects(cache: Cache, damage_type: int, damage: float, pier
 
                 case SpellEffects.modify_incoming_damage_type: #Prisms
                     damage_type = param
-                    damage_type_index = MagicSchoolIndex[param].value
+                    damage_type_index = magic_school_index(param)
 
                 case _:
                     continue
@@ -384,7 +398,7 @@ def sim_damage(duel: Cache, caster: Cache, target: Cache, effect: Cache, crit_th
 
     #For easy access of stat lists, as we only want 1 particular stat
     damage_type = effect["damage_type"]
-    damage_type_index = MagicSchoolIndex[damage_type].value
+    damage_type_index = magic_school_index(damage_type)
 
     #Damage, pierce, and resist stats
     #Get and curve damage
@@ -435,7 +449,7 @@ def sim_damage(duel: Cache, caster: Cache, target: Cache, effect: Cache, crit_th
     else: #If the target is not ourselves, handle them normally
         target_result, damage_type, damage, pierce = sim_incoming_dmg_effects(target_result, damage_type, damage, pierce)
 
-    damage_type_index = MagicSchoolIndex[damage_type].value
+    damage_type_index = magic_school_index(damage_type)
 
     # Flat resist
     damage -= cache_get(target, "get_stats.dmg_reduce_flat")[damage_type_index] + cache_get(target, "get_stats.dmg_reduce_flat_all")
@@ -466,7 +480,7 @@ def sim_incoming_damage(duel: Cache, target: Cache, damage_type: int, damage: fl
     '''Simulates pure damage on a member cache, only on the target side. Useful for effect handling.'''
     target_result = target
 
-    damage_type_index = MagicSchoolIndex[damage].value
+    damage_type_index = magic_school_index(damage_type)
 
     #Get and curve target resist
     resist = cache_get(target, "get_stats.dmg_reduce_percent")[damage_type_index] + cache_get(target, "get_stats.dmg_reduce_percent_all")
@@ -533,7 +547,7 @@ def sim_heal(duel: Cache, caster: Cache, target: Cache, effect: Cache, crit_thre
     target_result = target
 
     heal_type = effect["damage_type"]
-    heal_type_index = MagicSchoolIndex[heal_type].value
+    heal_type_index = magic_school_index(heal_type)
 
     heal = effect["effect_param"]
     heal_percent = cache_get(caster, "get_participant.get_stats.heal_bonus_percent")[heal_type_index] + cache_get(caster, "get_participant.get_stats.heal_bonus_percent_all")

@@ -1,6 +1,5 @@
 import asyncio
 
-from pymem.exception import MemoryReadError
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, Client
 from wizwalker.memory import HookHandler, SimpleHook
 
@@ -33,6 +32,19 @@ async def activate_dance_game_moves_hook(
     if self._check_if_hook_active(DanceGameMovesHook):
         raise HookAlreadyActivated("DanceGameMovesHook")
 
+    if self._uses_agent_feature_hooks():
+        await self._activate_agent_feature_hook(
+            DanceGameMovesHook,
+            "dance_game_moves",
+            {"dance_game_moves": "dance_game_moves"},
+        )
+        if wait_for_ready:
+            address = await self._read_feature_hook_export(
+                "dance_game_moves", "DanceGameMovesHook"
+            )
+            await self._wait_for_value(address, timeout)
+        return
+
     await self._check_for_autobot()
 
     hook = DanceGameMovesHook(self)
@@ -52,6 +64,13 @@ HookHandler.activate_dance_game_moves_hook = activate_dance_game_moves_hook
 async def deactivate_dance_game_moves_hook(self):
     if not self._check_if_hook_active(DanceGameMovesHook):
         raise HookNotActive("DanceGameMovesHook")
+
+    if self._uses_agent_feature_hooks():
+        return await self._deactivate_agent_feature_hook(
+            DanceGameMovesHook,
+            "dance_game_moves",
+            ("dance_game_moves",),
+        )
 
     hook = self._get_hook_by_type(DanceGameMovesHook)
     #self._active_hooks.remove(hook)
@@ -94,10 +113,16 @@ async def read_current_dance_game_moves(self) -> str:
     except KeyError:
         raise HookNotActive("DanceGameMovesHook")
 
+    if self._uses_agent_feature_hooks():
+        addr = await self._read_feature_hook_export(
+            "dance_game_moves", "DanceGameMovesHook"
+        )
     try:
         moves = await self.read_bytes(addr, 8)
-    except MemoryReadError:
-        raise HookNotReady("DanceGameMovesHook")
+    except Exception as error:
+        if self._backend.is_read_error(error):
+            raise HookNotReady("DanceGameMovesHook") from error
+        raise
     return moves.partition(b"\0")[0].decode().translate(_dance_moves_transtable)
 
 
