@@ -4,26 +4,31 @@ import os
 import subprocess
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
-# Always rebuild the native update helper so local builds pick up Rust source
-# changes (cargo is incremental, so this is cheap when nothing changed). A
-# missing cargo / build failure is non-fatal — the os.path.exists guard below
-# then simply omits the helper from the bundle.
-try:
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path",
-         os.path.join("libs", "updater", "Cargo.toml")],
-        check=False,
-    )
-    # The wizpatch game-file patcher (bundled and invoked as a subprocess for
-    # the optional "verify/patch before launch" feature). Its default features
-    # include the `cli` bin target.
-    subprocess.run(
-        ["cargo", "build", "--release", "--manifest-path",
-         os.path.join("libs", "wizpatch", "Cargo.toml")],
-        check=False,
-    )
-except FileNotFoundError:
-    print("WARNING: cargo not found; skipping update-helper / wizpatch build.")
+# Always rebuild the native helpers so local builds pick up Rust source changes
+# (cargo is incremental, so this is cheap when nothing changed). A missing cargo
+# is non-fatal — the os.path.exists guards below then omit the helper from the
+# bundle. A cargo *failure* is not silently swallowed: without the warning below
+# a stale target/release/*.exe from an earlier build gets bundled instead, which
+# is how a moved manifest path went unnoticed until CI caught it.
+#
+#   libs/updater  -> deimos-updater.exe, the self-update helper
+#   libs/wizpatch -> wizpatch.exe, the "verify/patch before launch" patcher
+#                    (its default features include the `cli` bin target)
+for _crate in ("updater", "wizpatch"):
+    _manifest = os.path.join("libs", _crate, "Cargo.toml")
+    if not os.path.exists(_manifest):
+        print(f"WARNING: {_manifest} not found; skipping {_crate} build.")
+        continue
+    try:
+        _r = subprocess.run(
+            ["cargo", "build", "--release", "--manifest-path", _manifest],
+            check=False,
+        )
+        if _r.returncode != 0:
+            print(f"WARNING: cargo build failed for {_crate} (exit {_r.returncode}); "
+                  "any binary bundled below is stale.")
+    except FileNotFoundError:
+        print(f"WARNING: cargo not found; skipping {_crate} build.")
 
 # wizsprinter installs into the wizwalker.extensions namespace at runtime via a
 # sys.path scan in wizwalker/extensions/__init__.py. PyInstaller's static
