@@ -226,7 +226,7 @@ jobs:
       - name: Smoke test independent wizlaunch package
         run: >-
           uv run python -c
-          "import wizlaunch; assert wizlaunch.__version__ == '0.2.0'; assert callable(wizlaunch.launch_instance)"
+          "import wizlaunch; assert wizlaunch.__version__ == '0.3.1'; assert callable(wizlaunch.launch_instance)"
 
       - name: Smoke test Windows WizWalker import
         if: runner.os == 'Windows'
