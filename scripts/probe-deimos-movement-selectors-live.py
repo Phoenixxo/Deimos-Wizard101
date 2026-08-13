@@ -57,7 +57,7 @@ SELECTORS = (
     ),
     Selector(
         "core.player_stat",
-        "2B D8 B8 ?? ?? ?? ?? 0F 49 C3 48 83 C4 20 5B C3",
+        "0F 5B C0 F3 0F 59 81 3C 03 00 00 E8 ?? ?? ?? ?? 2B D8 B8 ?? ?? ?? ?? 0F 49 C3 48 83 C4 20 5B C3",
     ),
     Selector(
         "core.root_window",

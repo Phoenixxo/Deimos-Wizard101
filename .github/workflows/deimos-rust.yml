@@ -14,6 +14,7 @@ on:
       - "Deimos.spec"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
+      - "scripts/certify-deimos-addresses-live.py"
       - "scripts/package_artifacts.py"
       - "scripts/prepare-windows-package.ps1"
       - "scripts/test-deimos-native-live.py"
@@ -42,6 +43,7 @@ on:
       - "Deimos.spec"
       - "scripts/build-wine-agent.ps1"
       - "scripts/check-wine-agent-imports.ps1"
+      - "scripts/certify-deimos-addresses-live.py"
       - "scripts/package_artifacts.py"
       - "scripts/prepare-windows-package.ps1"
       - "scripts/test-deimos-native-live.py"
@@ -98,6 +100,7 @@ jobs:
         run: >-
           python -m py_compile
           scripts/package_artifacts.py
+          scripts/certify-deimos-addresses-live.py
           scripts/test-deimos-native-live.py
           scripts/test-deimos-launch-live.py
           scripts/test-deimos-telemetry-live.py
