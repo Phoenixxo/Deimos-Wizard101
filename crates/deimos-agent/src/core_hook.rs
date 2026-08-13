@@ -367,6 +367,35 @@ pub fn read_base<B: MutationBackend>(
             .try_into()
             .expect("an eight-byte agent read must return eight bytes"),
     );
+    if request.hook == CoreHook::PlayerStat && value != 0 {
+        if value % 8 != 0 {
+            return Err(HookApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                format!(
+                    "core hook {:?} published a base address that is not 8-byte aligned",
+                    request.hook
+                ),
+            ));
+        }
+        let address = usize::try_from(value).map_err(|_| {
+            HookApiError::request(
+                RpcErrorCode::MemoryInvalidAddress,
+                format!(
+                    "core hook {:?} published a base address wider than the agent process",
+                    request.hook
+                ),
+            )
+        })?;
+        memory::read(
+            sessions,
+            backend,
+            &MemoryReadRequest {
+                session_id: request.session_id.clone(),
+                address: format!("{address:#x}"),
+                size: 1,
+            },
+        )?;
+    }
     Ok(CoreHookBaseResponse {
         session_id: request.session_id.clone(),
         hook: request.hook,
@@ -409,9 +438,9 @@ fn template(hook: CoreHook) -> Template {
             &[0x49, 0x8d, 0x87, 0xfc, 0x0c, 0x00, 0x00][..], // lea rax,[r15+0xcfc]
         ),
         CoreHook::PlayerStat => (
-            "2B D8 B8 ?? ?? ?? ?? 0F 49 C3 48 83 C4 20 5B C3",
+            "0F 5B C0 F3 0F 59 81 3C 03 00 00 E8 ?? ?? ?? ?? 2B D8 B8 ?? ?? ?? ?? 0F 49 C3 48 83 C4 20 5B C3",
+            3,
             0,
-            14,
             &[0x48, 0x89, 0xc8][..], // mov rax, rcx
         ),
         CoreHook::RootWindow => (
@@ -499,12 +528,15 @@ mod tests {
     use std::time::Instant;
 
     use super::{
-        activate, activate_all, deactivate, deactivate_all, heartbeat_all, hook_key, template,
+        activate, activate_all, deactivate, deactivate_all, heartbeat_all, hook_key, read_base,
+        template,
     };
     use crate::hook::tests::{registry, Backend, Failure};
     use crate::hook::HookState;
-    use crate::mutation::MutationState;
-    use deimos_core::memory::{CoreHook, CoreHookRequest, CoreHookSessionRequest};
+    use crate::mutation::{self, MutationState};
+    use deimos_core::memory::{
+        CoreHook, CoreHookRequest, CoreHookSessionRequest, MemoryWriteRequest,
+    };
     use deimos_core::rpc::RpcErrorCode;
 
     #[test]
@@ -540,6 +572,58 @@ mod tests {
             &template.payload[1..8],
             &[0x49, 0x8b, 0x85, 0xd8, 0x00, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn player_stat_hook_captures_rcx_before_the_adjacent_call() {
+        let template = template(CoreHook::PlayerStat);
+        assert!(template
+            .signature
+            .starts_with("0F 5B C0 F3 0F 59 81 3C 03 00 00 E8"));
+        assert_eq!(template.target_offset, 3);
+        assert_eq!(template.overwrite_size, 0);
+        assert_eq!(&template.payload[1..4], &[0x48, 0x89, 0xc8]);
+    }
+
+    #[test]
+    fn invalid_player_stat_exports_fail_before_reaching_python() {
+        let backend = Backend::core(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut mutations = MutationState::new();
+        let mut hooks = HookState::default();
+        let request = CoreHookRequest {
+            session_id: session_id.clone(),
+            hook: CoreHook::PlayerStat,
+        };
+        activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &request,
+            Instant::now(),
+        )
+        .expect("player-stat hook should activate");
+        let export_address = hooks
+            .allocation_address(&session_id, &hook_key(CoreHook::PlayerStat))
+            .expect("active hook should own an allocation")
+            + template(CoreHook::PlayerStat).export_offset;
+        mutation::write(
+            &mut sessions,
+            &backend,
+            &MemoryWriteRequest {
+                session_id: session_id.clone(),
+                address: format!("{export_address:#x}"),
+                bytes: 0xffff_ff81u64.to_le_bytes().to_vec(),
+            },
+        )
+        .expect("fixture export should be writable");
+
+        let error = read_base(&mut sessions, &backend, &hooks, &request)
+            .expect_err("invalid exports must fail closed")
+            .into_rpc_error(1, "core_hook.read_base");
+
+        assert_eq!(error.code, RpcErrorCode::MemoryInvalidAddress);
     }
 
     #[test]

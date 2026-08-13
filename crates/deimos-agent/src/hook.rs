@@ -1577,9 +1577,8 @@ pub(crate) fn validate_relocatable_x64(bytes: &[u8]) -> Result<(), HookApiError>
                     ));
                 }
                 match extended {
-                    0x10 | 0x11 | 0x1f | 0x28 | 0x29 | 0x49 | 0xaf | 0xb6 | 0xb7 | 0xbe | 0xbf => {
-                        (true, 0)
-                    }
+                    0x10 | 0x11 | 0x1f | 0x28 | 0x29 | 0x49 | 0x59 | 0xaf | 0xb6 | 0xb7 | 0xbe
+                    | 0xbf => (true, 0),
                     _ => return Err(invalid_instruction(instruction_start)),
                 }
             }
@@ -2294,6 +2293,17 @@ pub(crate) mod tests {
                 .into_rpc_error(1, "hook.activate")
                 .code,
             RpcErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            relocatable_prefix_len(
+                &[
+                    0xf3, 0x0f, 0x59, 0x81, 0x3c, 0x03, 0x00, 0x00, // mulss xmm0,[rcx+33c]
+                    0xe8, 0, 0, 0, 0, // adjacent call must not be relocated
+                ],
+                5,
+            )
+            .expect("player-stat capture instruction should decode"),
+            8
         );
         assert_eq!(
             relocatable_prefix_len(
