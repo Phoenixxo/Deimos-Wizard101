@@ -582,7 +582,7 @@ def get_window_title(handle: int, max_size: int = 100) -> str:
     """
     # https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw
     window_title = ctypes.create_unicode_buffer(max_size)
-    user32.GetWindowTextW(handle, ctypes.byref(window_title), max_size)
+    user32.GetWindowTextW(handle, window_title, max_size)
     return window_title.value
 
 

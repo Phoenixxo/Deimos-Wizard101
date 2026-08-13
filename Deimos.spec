@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 # Always rebuild the native helpers so local builds pick up Rust source changes
@@ -41,6 +42,8 @@ hiddenimports = (
     + collect_submodules('lark')
     + ['wizlaunch']
 )
+if sys.platform == 'win32':
+    hiddenimports += collect_submodules('pymem')
 
 datas = [
     ('Deimos-logo.ico', '.'),
