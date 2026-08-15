@@ -11,6 +11,7 @@ from scripts.package_artifacts import (
     ArtifactValidationError,
     read_manifest,
     validate_archive_listing,
+    verify_archive,
     verify_app_bundle,
     validate_package_inputs,
 )
@@ -121,12 +122,44 @@ class PackageArtifactTests(unittest.TestCase):
         validate_archive_listing(
             "0, 7, 7, 0, 'b', 'deimos-agent.exe'\n"
             "7, 2, 2, 0, 'x', 'deimos-agent.json'\n"
-            "9, 4, 4, 0, 'b', 'deimos_native.cpython-313-darwin.so'"
+            "9, 4, 4, 0, 'b', 'deimos_native.cp313-win_amd64.pyd'\n"
+            "13, 4, 4, 1, 'm', 'pymem'"
         )
         with self.assertRaisesRegex(ArtifactValidationError, "deimos-agent.json"):
             validate_archive_listing(
                 "0, 7, 7, 0, 'b', 'deimos-agent.exe'\n"
                 "7, 4, 4, 0, 'b', 'deimos_native.cp313-win_amd64.pyd'"
+            )
+
+    def test_archive_must_contain_pymem(self) -> None:
+        with self.assertRaisesRegex(ArtifactValidationError, "pymem"):
+            validate_archive_listing(
+                "0, 7, 7, 0, 'b', 'deimos-agent.exe'\n"
+                "7, 2, 2, 0, 'x', 'deimos-agent.json'\n"
+                "9, 4, 4, 0, 'b', 'deimos_native.cp313-win_amd64.pyd'"
+            )
+
+    def test_archive_verification_recurses_into_python_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "Deimos.exe"
+            archive.write_bytes(b"MZpackage")
+            with patch("scripts.package_artifacts.subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = (
+                    "0, 7, 7, 0, 'b', 'deimos-agent.exe'\n"
+                    "7, 2, 2, 0, 'x', 'deimos-agent.json'\n"
+                    "9, 4, 4, 0, 'b', 'deimos_native.cp313-win_amd64.pyd'\n"
+                    "13, 4, 4, 1, 'm', 'pymem'"
+                )
+                run.return_value.stderr = ""
+
+                verify_archive(archive, "archive-viewer")
+
+            run.assert_called_once_with(
+                ["archive-viewer", "-r", "-l", str(archive.resolve())],
+                check=False,
+                capture_output=True,
+                text=True,
             )
 
     def test_helper_must_match_manifest_contents(self) -> None:

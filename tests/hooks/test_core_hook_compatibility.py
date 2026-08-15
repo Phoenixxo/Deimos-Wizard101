@@ -16,6 +16,7 @@ from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
 from wizwalker.discovered_client import DiscoveredClient
 from wizwalker.memory.backends import MemoryBackend
 from wizwalker.memory.handler import HookHandler
+from wizwalker.memory.hooks import ClientHook
 
 
 class AgentCoreHookBackend(MemoryBackend):
@@ -168,6 +169,20 @@ class CoreHookCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.backend.calls[-2:],
             [("heartbeat_all",), ("heartbeat_all",)],
         )
+
+    def test_legacy_patterns_match_upstream_client_layout(self):
+        self.assertEqual(
+            HookHandler.AUTOBOT_PATTERN,
+            (
+                rb"\x48\x89\x5C\x24.\x48\x89\x74\x24.\x48\x89\x7C\x24."
+                rb"\x55\x41\x54\x41\x55\x41\x56\x41\x57"
+                rb"\x48\x8D\xAC\x24....\x48\x81\xEC...."
+                rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x85...."
+                rb"\x4C\x8B\xF1.......\x80......\x0F\x84...."
+            ),
+        )
+        self.assertEqual(HookHandler.AUTOBOT_SIZE, 4100)
+        self.assertIn(rb"\x48\x8B\x7C\x24\x38", ClientHook.pattern)
 
 
 class LegacyReadError(Exception):
