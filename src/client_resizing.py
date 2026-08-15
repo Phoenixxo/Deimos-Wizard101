@@ -30,6 +30,10 @@ import sys
 from ctypes import wintypes
 
 from loguru import logger
+from wizwalker.errors import (
+    await_cleanup_preserving_cancellation,
+    preserve_cleanup_errors,
+)
 
 try:
     from wizwalker.extensions.wizsprinter.resolution_hook import ResolutionForcer
@@ -416,6 +420,7 @@ class ClientResizingManager:
         self._forcers: dict[int, object] = {}     # hwnd -> ResolutionForcer
         self._borders: dict[int, object] = {}      # hwnd -> WindowResizeBorder
         self._pending: dict[int, tuple] = {}       # hwnd -> (size, stable_count)
+        self._suspended: set[int] = set()
         # Handles whose window/resolution/border config was applied at launch
         # (before activate_hooks). The tick loop must NOT tear these down just
         # because they aren't hooked yet (not in walker.clients); they're kept
@@ -438,6 +443,24 @@ class ClientResizingManager:
         """Stop protecting a launch-managed handle (window closed / client killed)."""
         self._keep_alive.discard(hwnd)
 
+    def suspend_client(self, hwnd: int):
+        """Stop servicing a client before its in-process hooks are torn down."""
+        self._suspended.add(hwnd)
+        self.drop_keep_alive(hwnd)
+
+    def resume_client(self, hwnd: int):
+        """Allow resize servicing after a client has been freshly managed."""
+        self._suspended.discard(hwnd)
+
+    def owned_client_identities(self) -> tuple[int, ...]:
+        """Return every client whose resize state still requires reconciliation."""
+        return tuple(
+            set(self._forcers)
+            | set(self._borders)
+            | set(_armed)
+            | set(_borderless)
+        )
+
     def _install_lock(self, hwnd: int) -> asyncio.Lock:
         """The per-client install lock for `hwnd` (created on first use). Creating
         the entry is a single synchronous dict op, so concurrent callers for the same
@@ -452,9 +475,15 @@ class ClientResizingManager:
         if self._shutdown:
             return
         if not enabled:
-            if self._enabled:
-                self._enabled = False
+            if (
+                self._enabled
+                or self._forcers
+                or self._borders
+                or _armed
+                or _borderless
+            ):
                 await self._teardown_all()
+            self._enabled = False
             return
         self._enabled = True
 
@@ -490,40 +519,53 @@ class ClientResizingManager:
         tick. Every touched piece of state is keyed by this hwnd, so it is safe to run
         concurrently for several clients; a failure is logged and isolated so it never
         aborts the other clients' servicing."""
+        if hwnd in self._suspended:
+            return
         try:
             await self._ensure_forcer(client, hwnd)
             await self._ensure_border(client, hwnd)
-            if hwnd in _borderless:
-                set_borderless(hwnd, True)     # self-heal: re-strip caption if the client restyled
-                if self._borders.get(hwnd) is not None:
-                    arm_window(hwnd)           # WS_THICKFRAME; the NCCALCSIZE hook hides the frame
-                    await self._update_border(hwnd)   # push the frameless flag before the reflow
-                    reflow_frame_if_framed(hwnd)      # drop the (now-hidden) frame if still shown
+            async with self._install_lock(hwnd):
+                if hwnd in self._suspended:
+                    return
+                if hwnd in _borderless:
+                    set_borderless(hwnd, True)     # self-heal: re-strip caption if the client restyled
+                    if self._borders.get(hwnd) is not None:
+                        arm_window(hwnd)           # WS_THICKFRAME; the NCCALCSIZE hook hides the frame
+                        await self._update_border(hwnd)   # push the frameless flag before the reflow
+                        reflow_frame_if_framed(hwnd)      # drop the (now-hidden) frame if still shown
+                    else:
+                        strip_sizing_frame(hwnd)   # no hook to hide a frame -> stay frameless (unresizable)
+                        await self._update_border(hwnd)
                 else:
-                    strip_sizing_frame(hwnd)   # no hook to hide a frame -> stay frameless (unresizable)
+                    arm_window(hwnd)
                     await self._update_border(hwnd)
-            else:
-                arm_window(hwnd)
-                await self._update_border(hwnd)
-            await self._handle_resize(client, hwnd)
-            # Re-assert the aspect fix on every controller each tick so switching
-            # cameras (free / combat) reflects it within a tick, even with no resize.
-            await correct_aspect(client, hwnd)
+                await self._handle_resize(client, hwnd)
+                # Re-assert the aspect fix on every controller each tick so switching
+                # cameras (free / combat) reflects it within a tick, even with no resize.
+                await correct_aspect(client, hwnd)
         except Exception as e:
             logger.opt(exception=e).debug(f"[client_resizing] service tick error {hwnd:#x}")
 
     async def _ensure_forcer(self, client, hwnd: int):
-        if ResolutionForcer is None or hwnd in self._forcers:
+        if (
+            ResolutionForcer is None
+            or hwnd in self._forcers
+            or hwnd in self._suspended
+        ):
             return
         async with self._install_lock(hwnd):
-            if hwnd in self._forcers:          # re-check after acquiring the lock
+            if hwnd in self._forcers or hwnd in self._suspended:
                 return
+            forcer = ResolutionForcer(client)
+            self._forcers[hwnd] = forcer
             try:
-                forcer = ResolutionForcer(client)
                 await forcer.install()
-                self._forcers[hwnd] = forcer
                 logger.debug(f"[client_resizing] resolution hook installed {hwnd:#x}")
-            except Exception as e:
+            except BaseException as e:
+                if not forcer.installed:
+                    self._forcers.pop(hwnd, None)
+                if not isinstance(e, Exception):
+                    raise
                 logger.opt(exception=e).warning(f"[client_resizing] resolution hook unavailable {hwnd:#x}")
 
     async def apply_account_window(self, client, hwnd: int, x: int, y: int, w: int, h: int,
@@ -538,54 +580,76 @@ class ClientResizingManager:
         Reuses the manager's single per-client forcer/border (see note above) and
         keeps the handle alive so the tick loop won't tear those hooks down while
         the client is launched-but-not-yet-hooked."""
-        if not hwnd or not user32.IsWindow(hwnd):
+        if not hwnd or not user32.IsWindow(hwnd) or hwnd in self._suspended:
             return False
-        borderless = bool(borderless)
-        # Strip the caption first so the client-area sizing below accounts for it.
-        set_borderless(hwnd, borderless)
-        await self._ensure_forcer(client, hwnd)
-        forcer = self._forcers.get(hwnd)
-        if forcer is not None:
-            try:
-                for _ in range(15):            # wait for the video-manager capture
-                    if await forcer._manager_address():
-                        break
-                    await asyncio.sleep(0.2)
-                await forcer.force(res_w, res_h)
-                await asyncio.sleep(0.4)        # let the engine run its apply
-            except Exception as e:
-                logger.opt(exception=e).debug(f"[client_resizing] launch force failed {hwnd:#x}")
-        await self._ensure_border(client, hwnd)    # in-process WndProc hook (resize + frameless)
-        # Sizing border so the window is drag-resizable. A borderless window keeps it
-        # only when the WndProc hook is present to hide the frame (WM_NCCALCSIZE);
-        # otherwise drop it so the window is at least visually borderless.
-        if not borderless or self._borders.get(hwnd) is not None:
-            arm_window(hwnd)
-        elif borderless:
-            strip_sizing_frame(hwnd)
-        await self._update_border(hwnd)            # push rect + frameless flag before placing
         try:
-            set_window_placement(hwnd, x, y, w, h, borderless=borderless)
-        except Exception:
-            pass
-        self._keep_alive.add(hwnd)             # protect these hooks until the window closes
-        return True
+            borderless = bool(borderless)
+            # Strip the caption first so the client-area sizing below accounts for it.
+            set_borderless(hwnd, borderless)
+            await self._ensure_forcer(client, hwnd)
+            async with self._install_lock(hwnd):
+                if hwnd in self._suspended:
+                    return False
+                forcer = self._forcers.get(hwnd)
+                if forcer is not None:
+                    try:
+                        for _ in range(15):            # wait for the video-manager capture
+                            if await forcer._manager_address():
+                                break
+                            await asyncio.sleep(0.2)
+                        await forcer.force(res_w, res_h)
+                        await asyncio.sleep(0.4)        # let the engine run its apply
+                    except Exception as e:
+                        logger.opt(exception=e).debug(f"[client_resizing] launch force failed {hwnd:#x}")
+            await self._ensure_border(client, hwnd)    # in-process WndProc hook (resize + frameless)
+            async with self._install_lock(hwnd):
+                if hwnd in self._suspended:
+                    return False
+                # Sizing border so the window is drag-resizable. A borderless window keeps it
+                # only when the WndProc hook is present to hide the frame (WM_NCCALCSIZE);
+                # otherwise drop it so the window is at least visually borderless.
+                if not borderless or self._borders.get(hwnd) is not None:
+                    arm_window(hwnd)
+                elif borderless:
+                    strip_sizing_frame(hwnd)
+                await self._update_border(hwnd)            # push rect + frameless flag before placing
+                try:
+                    set_window_placement(hwnd, x, y, w, h, borderless=borderless)
+                except Exception:
+                    pass
+                self._keep_alive.add(hwnd)             # protect these hooks until the window closes
+            return True
+        except BaseException as activation_error:
+            await await_cleanup_preserving_cancellation(
+                self.teardown_client(hwnd),
+                activation_error,
+                operation=f"client resize activation for {hwnd}",
+            )
+            raise
 
     async def _ensure_border(self, client, hwnd: int):
         # The in-process WndProc hit-test hook that makes the window grab-resizable.
         # Lock-serialized (like _ensure_forcer) so a launch-time apply and the tick
         # loop can't both install the hook for the same client.
-        if WindowResizeBorder is None or hwnd in self._borders:
+        if (
+            WindowResizeBorder is None
+            or hwnd in self._borders
+            or hwnd in self._suspended
+        ):
             return
         async with self._install_lock(hwnd):
-            if hwnd in self._borders:          # re-check after acquiring the lock
+            if hwnd in self._borders or hwnd in self._suspended:
                 return
+            border = WindowResizeBorder(client)
+            self._borders[hwnd] = border
             try:
-                border = WindowResizeBorder(client)
                 await border.install()
-                self._borders[hwnd] = border
                 logger.debug(f"[client_resizing] resize-border hook installed {hwnd:#x}")
-            except Exception as e:
+            except BaseException as e:
+                if not border.installed:
+                    self._borders.pop(hwnd, None)
+                if not isinstance(e, Exception):
+                    raise
                 logger.opt(exception=e).warning(f"[client_resizing] resize-border hook unavailable {hwnd:#x}")
 
     async def _update_border(self, hwnd: int):
@@ -648,28 +712,54 @@ class ClientResizingManager:
                 state.last_size = cur
                 self._pending.pop(hwnd, None)
 
-    async def _teardown(self, hwnd: int):
+    async def _teardown_locked(self, hwnd: int):
+        cleanup_errors = []
         for store in (self._forcers, self._borders):
-            hook = store.pop(hwnd, None)
+            hook = store.get(hwnd)
             if hook is not None:
                 try:
                     await hook.uninstall()
-                except Exception:
-                    pass
+                except Exception as error:
+                    cleanup_errors.append(error)
+                else:
+                    store.pop(hwnd, None)
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation=f"client resize teardown for {hwnd}",
+            )
+            raise primary_error
         disarm_window(hwnd)
         if hwnd in _borderless:
             set_borderless(hwnd, False)     # restore decorations
         _borderless.pop(hwnd, None)         # guard against a leak if window is gone
         self._pending.pop(hwnd, None)
         _native_vert.pop(hwnd, None)
-        # Drop the per-client install lock unless an install is mid-flight holding it.
-        lk = self._install_locks.get(hwnd)
-        if lk is not None and not lk.locked():
+
+    async def _teardown(self, hwnd: int):
+        lock = self._install_lock(hwnd)
+        async with lock:
+            await self._teardown_locked(hwnd)
+        if self._install_locks.get(hwnd) is lock:
             self._install_locks.pop(hwnd, None)
 
     async def _teardown_all(self):
+        cleanup_errors = []
         for hwnd in set(self._forcers) | set(self._borders) | set(_armed) | set(_borderless):
-            await self._teardown(hwnd)
+            try:
+                await self._teardown(hwnd)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation="client resize manager teardown",
+            )
+            raise primary_error
 
     async def teardown_client(self, hwnd: int):
         """Restore every hook for a SINGLE client (e.g. the GUI 'Unhook' button).
@@ -679,8 +769,22 @@ class ClientResizingManager:
         game's code would dangle and crash the game the next time it is hit. Also
         stops protecting a launch-managed handle so the tick loop won't re-arm it.
         """
-        self.drop_keep_alive(hwnd)
+        self.suspend_client(hwnd)
         await self._teardown(hwnd)
+
+    async def forget_terminated_client(self, hwnd: int):
+        """Drop hook ownership only after the target process has terminated."""
+        self.suspend_client(hwnd)
+        lock = self._install_lock(hwnd)
+        async with lock:
+            self._forcers.pop(hwnd, None)
+            self._borders.pop(hwnd, None)
+            disarm_window(hwnd)
+            _borderless.pop(hwnd, None)
+            self._pending.pop(hwnd, None)
+            _native_vert.pop(hwnd, None)
+        if self._install_locks.get(hwnd) is lock:
+            self._install_locks.pop(hwnd, None)
 
     async def shutdown(self):
         """Tear down every hook for good (app close / pre-update relaunch).
