@@ -20,6 +20,10 @@ from typing import Any
 import deimos_native
 
 from wizwalker.memory import DeimosNativeMemoryBackend, MemoryReader
+from wizwalker.generation import (
+    manager_generation_context,
+    release_manager_generation_context,
+)
 from wizwalker.telemetry import _TelemetryReadContext
 
 
@@ -595,6 +599,7 @@ def main() -> int:
     options = arguments()
     output_path = options.output or default_output_path()
     manager: deimos_native.AgentManager | None = None
+    generation_context = None
     session_id: str | None = None
     exit_code = 0
     report: dict[str, Any] = {
@@ -618,6 +623,13 @@ def main() -> int:
             component="address-certification-live",
         )
         report["agent"] = manager.start()
+        identity = report["agent"].get("identity", {})
+        instance_id = identity.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            raise RuntimeError(
+                "agent start did not return a valid helper instance identity"
+            )
+        generation_context = manager_generation_context(manager, instance_id)
         capabilities = set(manager.capabilities())
         report["capabilities"] = sorted(capabilities)
         missing_capabilities = REQUIRED_CAPABILITIES - capabilities
@@ -664,7 +676,13 @@ def main() -> int:
 
         regions = manager.memory_regions(session_id)["regions"]
         backend = DeimosNativeMemoryBackend(
-            manager, session_id, native_module=deimos_native
+            manager,
+            session_id,
+            expected_instance_id=instance_id,
+            native_module=deimos_native,
+            generation_fence=generation_context.fence,
+            generation_token=generation_context.generation_token,
+            generation_context=generation_context,
         )
         memory = MemoryReader(backend)
         signature_cache: dict[bytes, int] = {}
@@ -731,6 +749,8 @@ def main() -> int:
                 cleanup_errors.append(
                     {"operation": "agent.stop", **exception_report(error)}
                 )
+        if manager is not None and generation_context is not None:
+            release_manager_generation_context(manager)
         if cleanup_errors:
             report["cleanup_errors"] = cleanup_errors
             report["passed"] = False

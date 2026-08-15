@@ -11,6 +11,7 @@ from typing import Any
 
 import deimos_native
 import wizlaunch
+from wizwalker.generation import manager_generation_context
 
 
 REQUIRED_CAPABILITIES = {
@@ -168,7 +169,11 @@ def main() -> int:
                 f"{sorted(missing_capabilities)}"
             )
 
-        wizlaunch.configure_runtime(manager)
+        instance_id = report["agent"]["identity"]["instance_id"]
+        wizlaunch.configure_runtime(
+            manager,
+            generation_context=manager_generation_context(manager, instance_id),
+        )
         baseline = set(client_ids())
         report["baseline_client_ids"] = sorted(baseline)
 
