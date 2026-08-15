@@ -42,9 +42,10 @@ use deimos_core::memory::{
     OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
 };
 use deimos_core::process::{
-    ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, SessionRequest,
-    CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY, OP_MODULE_LIST, OP_PROCESS_CLOSE,
-    OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
+    ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessIdentityStatusRequest,
+    SessionRequest, CAPABILITY_PROCESS_MUTATION, CAPABILITY_PROCESS_READ_ONLY, OP_MODULE_LIST,
+    OP_PROCESS_CLOSE, OP_PROCESS_IDENTITY_STATUS, OP_PROCESS_LIST, OP_PROCESS_OPEN,
+    OP_PROCESS_STATUS,
 };
 use deimos_core::rpc::{AuthToken, RpcCall, RpcConfig, RpcError, RpcErrorCode, RpcServer};
 use deimos_core::{ProbeReport, ProbeRequest};
@@ -1099,6 +1100,17 @@ impl<B: MutationBackend> AgentService<B> {
                 let response = sessions.list(&self.backend, &request).map_err(|error| {
                     Box::new(error.into_rpc_error(call.request_id, &call.operation))
                 })?;
+                encode_payload(call, response)
+            }
+            OP_PROCESS_IDENTITY_STATUS => {
+                let request: ProcessIdentityStatusRequest = decode_payload(call)?;
+                let sessions = self.lock_sessions(call)?;
+                let response =
+                    sessions
+                        .identity_status(&self.backend, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
                 encode_payload(call, response)
             }
             OP_PROCESS_OPEN => {

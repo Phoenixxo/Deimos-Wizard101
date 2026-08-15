@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from importlib import import_module
 from typing import Any
 
@@ -143,6 +144,10 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         session_id: str,
         *,
         native_module: Any = None,
+        expected_instance_id: str | None = None,
+        generation_fence: Any = None,
+        generation_token: object = None,
+        generation_context: Any = None,
     ):
         if not session_id:
             raise ValueError("session_id must not be empty")
@@ -151,6 +156,10 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         self.session_id = session_id
         self.process = self
         self._native_module = native_module
+        self.expected_instance_id = expected_instance_id
+        self.generation_fence = generation_fence
+        self.generation_token = generation_token
+        self.generation_context = generation_context
         self.supports_write = hasattr(manager, "write_memory")
         self.supports_feature_hooks = all(
             hasattr(manager, name)
@@ -173,29 +182,93 @@ class DeimosNativeMemoryBackend(MemoryBackend):
             self._native_module = import_module("deimos_native")
         return self._native_module
 
-    def is_running(self) -> bool:
-        try:
-            status = self.manager.process_status(self.session_id)
-        except Exception as error:
-            if self.is_closed_process_error(error):
-                return False
-            raise
+    def _call_manager(
+        self, call, *args, allow_retired_result: bool = False, **kwargs
+    ):
+        if self.generation_fence is None:
+            raise RuntimeError(
+                "Native memory work requires an explicitly bound manager-generation fence."
+            )
+        if not isinstance(self.expected_instance_id, str):
+            raise RuntimeError(
+                "Native memory work cannot verify its owning helper generation."
+            )
+        if self.generation_token is None:
+            raise RuntimeError(
+                "Native memory work requires an explicit host generation token."
+            )
+        return self.generation_fence.call(
+            self.generation_token,
+            call,
+            *args,
+            allow_retired_result=allow_retired_result,
+            **kwargs,
+        )
 
-        return status.get("state") == "open"
+    @contextmanager
+    def _result_operation(self):
+        if self.generation_fence is None or self.generation_token is None:
+            raise RuntimeError(
+                "Native memory work requires an explicitly bound host generation."
+            )
+        with self.generation_fence.operation(self.generation_token):
+            yield
+            self.generation_fence.call(self.generation_token, lambda: None)
+
+    @contextmanager
+    def generation_operation(self):
+        """Lease this host epoch across an async caller's full transaction."""
+        with self._result_operation():
+            yield
+
+    def _call_cleanup_manager(self, call, *args, **kwargs):
+        """Use only native RPCs that atomically check expected helper identity."""
+        if self.generation_context is None:
+            raise RuntimeError(
+                "Native hook cleanup requires manager-scoped cleanup admission."
+            )
+        return self.generation_context.call_cleanup(
+            self.expected_instance_id,
+            call,
+            *args,
+            **kwargs,
+        )
+
+    def require_current(self) -> None:
+        """Reject async delivery of a result from a retired host epoch."""
+        if self.generation_fence is None or self.generation_token is None:
+            raise RuntimeError(
+                "Native memory work requires an explicitly bound host generation."
+            )
+        self.generation_fence.call(self.generation_token, lambda: None)
+
+    def is_running(self) -> bool:
+        with self._result_operation():
+            try:
+                status = self._call_manager(self.manager.process_status, self.session_id)
+            except Exception as error:
+                if self.is_closed_process_error(error):
+                    return False
+                raise
+
+            return status.get("state") == "open"
 
     def read_bytes(self, address: int, size: int) -> bytes:
-        return bytes(
-            self.manager.read_memory(
-                self.session_id,
-                hex(address),
-                size,
+        with self._result_operation():
+            return bytes(
+                self._call_manager(
+                    self.manager.read_memory,
+                    self.session_id,
+                    hex(address),
+                    size,
+                )
             )
-        )
 
     def write_bytes(self, address: int, value: bytes, size: int | None = None) -> None:
         if size is not None and size != len(value):
             raise ValueError("size must match the number of bytes being written")
-        self.manager.write_memory(
+        self._call_manager(
+            self.manager.write_memory,
             self.session_id,
             hex(address),
             bytes(value),
@@ -211,37 +284,94 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         raise UnsupportedMemoryOperation("remote thread creation")
 
     def activate_core_hook(self, hook: str) -> dict[str, Any]:
-        return self.manager.activate_core_hook(self.session_id, hook)
+        return self._call_manager(self.manager.activate_core_hook, self.session_id, hook)
 
     def activate_core_hooks(self) -> dict[str, Any]:
-        return self.manager.activate_core_hooks(self.session_id)
+        return self._call_manager(self.manager.activate_core_hooks, self.session_id)
 
     def deactivate_core_hook(self, hook: str) -> dict[str, Any]:
-        return self.manager.deactivate_core_hook(self.session_id, hook)
+        cleanup = getattr(
+            self.manager,
+            "deactivate_core_hook_for_instance",
+            None,
+        )
+        if not isinstance(self.expected_instance_id, str) or not callable(cleanup):
+            raise RuntimeError(
+                "Native core-hook cleanup cannot verify the owning helper generation."
+            )
+        return self._call_cleanup_manager(
+            cleanup,
+            self.session_id,
+            hook,
+            self.expected_instance_id,
+        )
 
     def deactivate_core_hooks(self) -> dict[str, Any]:
-        return self.manager.deactivate_core_hooks(self.session_id)
+        cleanup = getattr(
+            self.manager,
+            "deactivate_core_hooks_for_instance",
+            None,
+        )
+        if not isinstance(self.expected_instance_id, str) or not callable(cleanup):
+            raise RuntimeError(
+                "Native core-hook cleanup cannot verify the owning helper generation."
+            )
+        return self._call_cleanup_manager(
+            cleanup,
+            self.session_id,
+            self.expected_instance_id,
+        )
 
     def heartbeat_core_hooks(self) -> dict[str, Any]:
-        return self.manager.heartbeat_core_hooks(self.session_id)
+        return self._call_manager(self.manager.heartbeat_core_hooks, self.session_id)
 
     def read_core_hook_base(self, hook: str) -> int:
-        return int(self.manager.read_core_hook_base(self.session_id, hook))
+        with self._result_operation():
+            return int(
+                self._call_manager(
+                    self.manager.read_core_hook_base,
+                    self.session_id,
+                    hook,
+                )
+            )
 
     def activate_feature_hook(self, hook: str) -> dict[str, Any]:
-        return self.manager.activate_feature_hook(self.session_id, hook)
+        return self._call_manager(self.manager.activate_feature_hook, self.session_id, hook)
 
     def deactivate_feature_hook(self, hook: str) -> dict[str, Any]:
-        return self.manager.deactivate_feature_hook(self.session_id, hook)
+        cleanup = getattr(
+            self.manager,
+            "deactivate_feature_hook_for_instance",
+            None,
+        )
+        if not isinstance(self.expected_instance_id, str) or not callable(cleanup):
+            raise RuntimeError(
+                "Native feature-hook cleanup cannot verify the owning helper generation."
+            )
+        return self._call_cleanup_manager(
+            cleanup,
+            self.session_id,
+            hook,
+            self.expected_instance_id,
+        )
 
     def heartbeat_feature_hooks(self) -> dict[str, Any]:
-        return self.manager.heartbeat_feature_hooks(self.session_id)
+        return self._call_manager(self.manager.heartbeat_feature_hooks, self.session_id)
 
     def read_feature_hook_export(self, export: str) -> int:
-        return int(self.manager.read_feature_hook_export(self.session_id, export))
+        with self._result_operation():
+            return int(
+                self._call_manager(
+                    self.manager.read_feature_hook_export,
+                    self.session_id,
+                    export,
+                )
+            )
 
     def set_feature_mouse_position(self, x: int, y: int) -> dict[str, Any]:
-        return self.manager.set_feature_mouse_position(self.session_id, x, y)
+        return self._call_manager(
+            self.manager.set_feature_mouse_position, self.session_id, x, y
+        )
 
     def feature_teleport(
         self,
@@ -253,7 +383,8 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         purge_after_timeout: bool,
         purge_timeout_ms: int,
     ) -> dict[str, Any]:
-        return self.manager.feature_teleport(
+        return self._call_manager(
+            self.manager.feature_teleport,
             self.session_id,
             hex(object_address),
             position,
@@ -264,12 +395,30 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         )
 
     def feature_send_chat(self, message: str, target_gid: int) -> dict[str, Any]:
-        return self.manager.feature_send_chat(self.session_id, message, target_gid)
+        return self._call_manager(
+            self.manager.feature_send_chat, self.session_id, message, target_gid
+        )
 
     def feature_add_buddy(self, target_gid: int) -> dict[str, Any]:
-        return self.manager.feature_add_buddy(self.session_id, target_gid)
+        return self._call_manager(
+            self.manager.feature_add_buddy, self.session_id, target_gid
+        )
 
     def scan(
+        self,
+        signature: str,
+        *,
+        module_name: str | None,
+        return_multiple: bool,
+    ) -> list[int]:
+        with self._result_operation():
+            return self._scan_bound(
+                signature,
+                module_name=module_name,
+                return_multiple=return_multiple,
+            )
+
+    def _scan_bound(
         self,
         signature: str,
         *,
@@ -285,7 +434,8 @@ class DeimosNativeMemoryBackend(MemoryBackend):
             and hasattr(self.manager, "scan_memory")
         ):
             try:
-                response = self.manager.scan_memory(
+                response = self._call_manager(
+                    self.manager.scan_memory,
                     self.session_id,
                     signature,
                     module_name=module_name,
@@ -378,10 +528,11 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         return matches
 
     def module_base(self, module_name: str) -> int | None:
-        module = self._module(module_name)
-        if module is not None:
-            return self._module_bounds(module)[0]
-        return None
+        with self._result_operation():
+            module = self._module(module_name)
+            if module is not None:
+                return self._module_bounds(module)[0]
+            return None
 
     def is_process_error(self, error: BaseException) -> bool:
         return isinstance(error, self._native().ProcessError) or (
@@ -405,7 +556,7 @@ class DeimosNativeMemoryBackend(MemoryBackend):
         return native_error is not None and isinstance(error, native_error)
 
     def _module(self, module_name: str):
-        response = self.manager.list_modules(self.session_id)
+        response = self._call_manager(self.manager.list_modules, self.session_id)
         modules = response.get("modules")
         if not isinstance(modules, list):
             raise IncompleteMemoryScanError(
@@ -431,7 +582,7 @@ class DeimosNativeMemoryBackend(MemoryBackend):
                 raise ValueError(f"{module_name} module not found.")
             module_start, module_end = self._module_bounds(module)
 
-        response = self.manager.memory_regions(self.session_id)
+        response = self._call_manager(self.manager.memory_regions, self.session_id)
         regions = response.get("regions")
         if not isinstance(regions, list):
             raise IncompleteMemoryScanError(

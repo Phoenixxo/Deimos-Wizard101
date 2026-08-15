@@ -32,8 +32,9 @@ use deimos_core::memory::{
     OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
 };
 use deimos_core::process::{
-    ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessSessionId, SessionRequest,
-    OP_MODULE_LIST, OP_PROCESS_CLOSE, OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
+    ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessIdentityStatusRequest,
+    ProcessSessionId, SessionRequest, OP_MODULE_LIST, OP_PROCESS_CLOSE, OP_PROCESS_IDENTITY_STATUS,
+    OP_PROCESS_LIST, OP_PROCESS_OPEN, OP_PROCESS_STATUS,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use deimos_core::rpc::RpcConfig;
@@ -1427,6 +1428,28 @@ impl PyAgentManager {
         self.call_as_python(py, OP_PROCESS_LIST, request)
     }
 
+    fn process_identity_status(
+        &self,
+        py: Python<'_>,
+        pid: u32,
+        expected_identity_json: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let expected_identity = parse_identity(Some(expected_identity_json))
+            .map_err(|error| error.into_pyerr(py))?
+            .ok_or_else(|| PyValueError::new_err("expected process identity is required"))?;
+        if expected_identity.pid != pid {
+            return Err(PyValueError::new_err(
+                "expected process identity PID does not match pid",
+            ));
+        }
+        let request = serialize_request(
+            OP_PROCESS_IDENTITY_STATUS,
+            ProcessIdentityStatusRequest { expected_identity },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python(py, OP_PROCESS_IDENTITY_STATUS, request)
+    }
+
     #[pyo3(signature = (pid, expected_identity_json = None))]
     fn open_process(
         &self,
@@ -1476,6 +1499,28 @@ impl PyAgentManager {
 
     fn close_process(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
         self.session_call_as_python(py, OP_PROCESS_CLOSE, session_id)
+    }
+
+    fn close_process_for_instance(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_PROCESS_CLOSE,
+            SessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        let operation = OP_PROCESS_CLOSE.to_string();
+        let response = self.with_manager(py, OP_PROCESS_CLOSE, move |manager, bottle| {
+            manager
+                .call_for_instance(bottle, &expected_instance_id, &operation, request)
+                .map_err(agent_call_error)
+        })?;
+        json_to_python(py, &response)
     }
 
     fn list_modules(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
@@ -1685,6 +1730,22 @@ impl PyAgentManager {
         self.core_hook_call(py, OP_CORE_HOOK_DEACTIVATE, session_id, hook)
     }
 
+    fn deactivate_core_hook_for_instance(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        self.core_hook_call_for_instance(
+            py,
+            OP_CORE_HOOK_DEACTIVATE,
+            session_id,
+            hook,
+            expected_instance_id,
+        )
+    }
+
     fn deactivate_core_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
         let request = serialize_request(
             OP_CORE_HOOK_DEACTIVATE_ALL,
@@ -1694,6 +1755,27 @@ impl PyAgentManager {
         )
         .map_err(|error| error.into_pyerr(py))?;
         self.call_as_python(py, OP_CORE_HOOK_DEACTIVATE_ALL, request)
+    }
+
+    fn deactivate_core_hooks_for_instance(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_CORE_HOOK_DEACTIVATE_ALL,
+            CoreHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_for_instance(
+            py,
+            OP_CORE_HOOK_DEACTIVATE_ALL,
+            request,
+            expected_instance_id,
+        )
     }
 
     fn heartbeat_core_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
@@ -1741,6 +1823,22 @@ impl PyAgentManager {
         hook: &str,
     ) -> PyResult<Py<PyAny>> {
         self.feature_hook_call(py, OP_FEATURE_HOOK_DEACTIVATE, session_id, hook)
+    }
+
+    fn deactivate_feature_hook_for_instance(
+        &self,
+        py: Python<'_>,
+        session_id: String,
+        hook: &str,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        self.feature_hook_call_for_instance(
+            py,
+            OP_FEATURE_HOOK_DEACTIVATE,
+            session_id,
+            hook,
+            expected_instance_id,
+        )
     }
 
     fn heartbeat_feature_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
@@ -1872,6 +1970,60 @@ impl PyAgentManager {
 }
 
 impl PyAgentManager {
+    fn call_as_python_for_instance(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        request: Value,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let owned_operation = operation.to_string();
+        let response = self.with_manager(py, operation, move |manager, bottle| {
+            manager
+                .call_for_instance(bottle, &expected_instance_id, &owned_operation, request)
+                .map_err(agent_call_error)
+        })?;
+        json_to_python(py, &response)
+    }
+
+    fn core_hook_call_for_instance(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        session_id: String,
+        hook: &str,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            operation,
+            CoreHookRequest {
+                session_id: ProcessSessionId(session_id),
+                hook: parse_core_hook(hook, operation).map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_for_instance(py, operation, request, expected_instance_id)
+    }
+
+    fn feature_hook_call_for_instance(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        session_id: String,
+        hook: &str,
+        expected_instance_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            operation,
+            FeatureHookRequest {
+                session_id: ProcessSessionId(session_id),
+                hook: parse_feature_hook(hook, operation).map_err(|error| error.into_pyerr(py))?,
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_for_instance(py, operation, request, expected_instance_id)
+    }
+
     fn key_event(
         &self,
         py: Python<'_>,

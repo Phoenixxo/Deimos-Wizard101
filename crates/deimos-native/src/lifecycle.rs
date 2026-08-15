@@ -470,6 +470,56 @@ impl<R: AgentRuntime> AgentManager<R> {
         })
     }
 
+    /// Execute an RPC only when the currently managed helper is the session's
+    /// original generation.  This check and the RPC share the manager lock at
+    /// the Python boundary, so recovery cannot replace the helper between
+    /// generation validation and dispatch.
+    pub fn call_for_instance(
+        &mut self,
+        bottle: &BottleId,
+        expected_instance_id: &str,
+        operation: &str,
+        payload: Value,
+    ) -> Result<Value, AgentCallError> {
+        let managed = self.managed.get_mut(bottle).ok_or_else(|| {
+            LifecycleError::new(
+                LifecycleErrorCode::HealthCheckFailed,
+                bottle.as_str(),
+                "no managed agent exists for this bottle; call ensure_agent first",
+            )
+        })?;
+
+        if managed.identity.instance_id != expected_instance_id {
+            return Err(LifecycleError::new(
+                LifecycleErrorCode::IdentityMismatch,
+                bottle.as_str(),
+                "the cleanup session belongs to a different helper generation",
+            )
+            .with_instance(&managed.identity)
+            .with_detail("expected_instance_id", expected_instance_id)
+            .into());
+        }
+
+        if let Some(error) = poll_process_exit(bottle, managed)? {
+            return Err(error.into());
+        }
+
+        let native_context = self.native_context.clone();
+        let result = managed
+            .client
+            .call(operation, payload, Some(native_context.clone()));
+        if result.is_err() {
+            if let Some(error) = poll_process_exit(bottle, managed)? {
+                return Err(error.into());
+            }
+        }
+        result.map_err(|source| AgentCallError::Rpc {
+            operation: operation.to_string(),
+            native_context,
+            source: Box::new(source),
+        })
+    }
+
     pub fn call_with_timeout(
         &mut self,
         bottle: &BottleId,
@@ -1920,6 +1970,41 @@ mod tests {
                 .map(|capability| (*capability).to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn generation_checked_calls_reject_a_replaced_helper_before_rpc() {
+        let runtime = TestRuntime::new("1.2.3");
+        let mut manager = manager(runtime, "1.2.3");
+        let ready = manager
+            .ensure_agent(bottle())
+            .expect("agent should become ready");
+
+        let error = manager
+            .call_for_instance(
+                &bottle(),
+                "different-helper",
+                "test.context",
+                json!({"value": 7}),
+            )
+            .expect_err("a stale generation must be rejected before RPC");
+        assert!(matches!(
+            error,
+            AgentCallError::Lifecycle(LifecycleError {
+                code: LifecycleErrorCode::IdentityMismatch,
+                ..
+            })
+        ));
+
+        let response = manager
+            .call_for_instance(
+                &bottle(),
+                &ready.identity.instance_id,
+                "test.context",
+                json!({"value": 7}),
+            )
+            .expect("the owning generation should be allowed to issue the RPC");
+        assert_eq!(response["payload"], json!({"value": 7}));
     }
 
     #[test]

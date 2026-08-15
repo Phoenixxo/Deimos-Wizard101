@@ -6,6 +6,7 @@ pub const OP_PROCESS_LIST: &str = "process.list";
 pub const OP_PROCESS_OPEN: &str = "process.open";
 pub const OP_PROCESS_CLOSE: &str = "process.close";
 pub const OP_PROCESS_STATUS: &str = "process.status";
+pub const OP_PROCESS_IDENTITY_STATUS: &str = "process.identity_status";
 pub const OP_MODULE_LIST: &str = "module.list";
 
 pub const WIZARD101_EXECUTABLE: &str = "WizardGraphicalClient.exe";
@@ -103,6 +104,24 @@ pub struct OpenProcessRequest {
     /// capabilities. Existing callers remain read-only by default.
     #[serde(default)]
     pub access_mode: ProcessAccessMode,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessIdentityStatusRequest {
+    pub expected_identity: ProcessIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessIdentityState {
+    Matching,
+    Exited,
+    Replaced,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessIdentityStatusResponse {
+    pub state: ProcessIdentityState,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

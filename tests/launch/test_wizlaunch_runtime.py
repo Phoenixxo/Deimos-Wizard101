@@ -1,13 +1,23 @@
 import importlib
+import concurrent.futures
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 
 WIZLAUNCH_SOURCE = Path(__file__).resolve().parents[2] / "libs" / "wizlaunch" / "python"
+WIZWALKER_SOURCE = Path(__file__).resolve().parents[2] / "libs" / "wizwalker"
 sys.path.insert(0, str(WIZLAUNCH_SOURCE))
+sys.path.insert(0, str(WIZWALKER_SOURCE))
 wizlaunch = importlib.import_module("wizlaunch")
+from wizwalker.generation import manager_generation_context  # noqa: E402
+
+
+def configure_runtime(agent, **kwargs):
+    context = manager_generation_context(agent, "helper-a")
+    wizlaunch.configure_runtime(agent, generation_context=context, **kwargs)
 
 
 def client_response(client_id: str, pid: int) -> dict:
@@ -144,7 +154,7 @@ class WizlaunchRuntimeTests(unittest.TestCase):
     def test_single_launch_requires_agent_process_and_window_confirmation(self):
         agent = FakeAgentManager([client_response("client-1", 101)])
         routed = []
-        wizlaunch.configure_runtime(
+        configure_runtime(
             agent,
             login_router=lambda nickname, client: routed.append(
                 (nickname, client["client_id"])
@@ -173,7 +183,7 @@ class WizlaunchRuntimeTests(unittest.TestCase):
                 client_response("client-3", 103),
             ]
         )
-        wizlaunch.configure_runtime(agent)
+        configure_runtime(agent)
 
         result = wizlaunch.launch_instances(
             ["first", "second", "third"],
@@ -189,33 +199,95 @@ class WizlaunchRuntimeTests(unittest.TestCase):
 
     def test_non_timeout_launch_failures_remain_actionable(self):
         agent = FakeAgentManager([coded_error("game_launch_failed")])
-        wizlaunch.configure_runtime(agent)
+        configure_runtime(agent)
 
         with self.assertRaisesRegex(RuntimeError, "game_launch_failed"):
             wizlaunch.launch_instances(["main"], r"C:\Wizard101")
 
     def test_termination_routes_opaque_client_id_to_agent(self):
         agent = FakeAgentManager([client_response("client-1", 101)])
-        wizlaunch.configure_runtime(agent)
+        configure_runtime(agent)
         client_id = wizlaunch.launch_instance("main", r"C:\Wizard101")
 
         self.assertTrue(wizlaunch.kill_instance(client_id))
         self.assertEqual(agent.terminate_calls, [("client-1", 30)])
         self.assertEqual(wizlaunch.get_wizard_handles(), [])
 
+    def test_delayed_a_routes_cannot_execute_against_published_b(self):
+        agent = FakeAgentManager([client_response("reused", 101)])
+        context = manager_generation_context(agent, "helper-a")
+        wizlaunch.configure_runtime(agent, generation_context=context)
+        stale = wizlaunch.capture_runtime()
+
+        context.begin_replacement(context.generation_token)
+        self.assertTrue(context.fence.wait_for_drain(0.1))
+        context.publish("helper-b", previous_replaced=True)
+
+        with self.assertRaisesRegex(RuntimeError, "retired helper generation"):
+            wizlaunch.get_wizard_handles(_runtime_binding=stale)
+        with self.assertRaisesRegex(RuntimeError, "retired helper generation"):
+            wizlaunch.launch_instance(
+                "main",
+                r"C:\Wizard101",
+                _runtime_binding=stale,
+            )
+        with self.assertRaisesRegex(RuntimeError, "retired helper generation"):
+            wizlaunch.kill_instance("reused", _runtime_binding=stale)
+
+        self.assertEqual(agent.launch_calls, [])
+        self.assertEqual(agent.login_calls, [])
+        self.assertEqual(agent.terminate_calls, [])
+
+    def test_client_list_composite_cannot_publish_after_replacement_begins(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingResponse(dict):
+            def get(self, key, default=None):
+                if key == "clients":
+                    entered.set()
+                    release.wait(timeout=2)
+                return super().get(key, default)
+
+        agent = FakeAgentManager()
+        agent.list_clients = lambda: BlockingResponse(
+            clients=[{"client_id": "old-a"}]
+        )
+        context = manager_generation_context(agent, "helper-a")
+        wizlaunch.configure_runtime(agent, generation_context=context)
+        binding = wizlaunch.capture_runtime()
+
+        def replace():
+            context.begin_replacement(context.generation_token)
+            self.assertTrue(context.fence.wait_for_drain(1))
+            context.publish("helper-b", previous_replaced=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            result = executor.submit(
+                wizlaunch.get_wizard_handles,
+                _runtime_binding=binding,
+            )
+            self.assertTrue(entered.wait(timeout=1))
+            replacement = executor.submit(replace)
+            self.assertFalse(replacement.done())
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, "retired helper generation"):
+                result.result(timeout=1)
+            replacement.result(timeout=1)
+
     def test_invalid_agent_and_client_identity_have_structured_errors(self):
         with self.assertRaises(wizlaunch.RuntimeNotConfiguredError) as raised:
             wizlaunch.configure_runtime(object())
         self.assertEqual(raised.exception.code, "runtime_invalid")
 
-        wizlaunch.configure_runtime(FakeAgentManager())
+        configure_runtime(FakeAgentManager())
         with self.assertRaises(wizlaunch.WizlaunchError) as raised:
             wizlaunch.kill_instance(123)
         self.assertEqual(raised.exception.code, "client_identity_invalid")
 
     def test_account_management_routes_to_native_manager_without_secret_api(self):
         agent = FakeAgentManager()
-        wizlaunch.configure_runtime(agent)
+        configure_runtime(agent)
         wizlaunch.prompt_save_account("main")
         wizlaunch.update_player_gid("main", 42)
         self.assertEqual(wizlaunch.list_accounts(), ["main"])
@@ -239,7 +311,7 @@ class WizlaunchRuntimeTests(unittest.TestCase):
 
     def test_automatic_login_receives_only_nickname_and_opaque_client_id(self):
         agent = FakeAgentManager([client_response("client-1", 101)])
-        wizlaunch.configure_runtime(agent)
+        configure_runtime(agent)
 
         result = wizlaunch.launch_instance("main", r"C:\Wizard101", timeout_secs=18)
 

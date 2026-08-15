@@ -201,6 +201,7 @@ mod tests {
                 "move_mouse",
                 "click_mouse",
                 "list_processes",
+                "process_identity_status",
                 "open_process",
                 "process_status",
                 "close_process",

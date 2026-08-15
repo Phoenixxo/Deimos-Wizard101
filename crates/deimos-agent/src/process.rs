@@ -10,7 +10,8 @@ use deimos_core::lifecycle::SessionDiagnostics;
 use deimos_core::memory::{MemoryProtection, MemoryRegionDescriptor};
 use deimos_core::process::{
     ListModulesResponse, ListProcessesRequest, ListProcessesResponse, ModuleDescriptor,
-    OpenProcessRequest, ProcessAccessMode, ProcessDescriptor, ProcessIdentity, ProcessKind,
+    OpenProcessRequest, ProcessAccessMode, ProcessDescriptor, ProcessIdentity,
+    ProcessIdentityState, ProcessIdentityStatusRequest, ProcessIdentityStatusResponse, ProcessKind,
     ProcessSessionId, ProcessSessionResponse, ProcessSessionState,
 };
 use deimos_core::rpc::{RpcError, RpcErrorCode};
@@ -879,6 +880,56 @@ impl<H> ProcessSessionRegistry<H> {
         Ok(ListProcessesResponse { processes })
     }
 
+    pub fn identity_status<B: ProcessBackend<Handle = H>>(
+        &self,
+        backend: &B,
+        request: &ProcessIdentityStatusRequest,
+    ) -> Result<ProcessIdentityStatusResponse, ProcessApiError> {
+        let expected = &request.expected_identity;
+        let opened = match backend.open_process(expected.pid) {
+            Ok(opened) => opened,
+            Err(error)
+                if matches!(
+                    error.kind,
+                    ProcessBackendErrorKind::NotFound | ProcessBackendErrorKind::Exited
+                ) =>
+            {
+                return Ok(ProcessIdentityStatusResponse {
+                    state: ProcessIdentityState::Exited,
+                });
+            }
+            Err(error) if error.kind == ProcessBackendErrorKind::IdentityMismatch => {
+                return Ok(ProcessIdentityStatusResponse {
+                    state: ProcessIdentityState::Replaced,
+                });
+            }
+            Err(error) => {
+                return Err(ProcessApiError::from_backend(
+                    error,
+                    Some(expected.pid),
+                    None,
+                ));
+            }
+        };
+        let actual = opened.process.identity.as_ref().ok_or_else(|| {
+            ProcessApiError::from_backend(
+                ProcessBackendError::new(
+                    ProcessBackendErrorKind::Native,
+                    "opened process did not provide a stable identity",
+                ),
+                Some(expected.pid),
+                None,
+            )
+        })?;
+        Ok(ProcessIdentityStatusResponse {
+            state: if same_process_identity(expected, actual) {
+                ProcessIdentityState::Matching
+            } else {
+                ProcessIdentityState::Replaced
+            },
+        })
+    }
+
     pub fn refresh_and_diagnose<B: ProcessBackend<Handle = H>>(
         &mut self,
         backend: &B,
@@ -1398,8 +1449,8 @@ mod tests {
 
     use deimos_core::process::{
         classify_process, ListProcessesRequest, ModuleDescriptor, OpenProcessRequest,
-        ProcessDescriptor, ProcessIdentity, ProcessSessionState, MEMORY_FIXTURE_EXECUTABLE,
-        WIZARD101_EXECUTABLE,
+        ProcessDescriptor, ProcessIdentity, ProcessIdentityState, ProcessIdentityStatusRequest,
+        ProcessSessionState, MEMORY_FIXTURE_EXECUTABLE, WIZARD101_EXECUTABLE,
     };
     use deimos_core::rpc::RpcErrorCode;
 
@@ -1724,6 +1775,61 @@ mod tests {
         }]);
         let reused = registry.list(&backend).expect("reused window should list");
         assert_ne!(first.clients[0].client_id, reused.clients[0].client_id);
+    }
+
+    #[test]
+    fn identity_status_is_authoritative_when_the_client_window_disappears() {
+        let backend = MockBackend::new();
+        let registry = ProcessSessionRegistry::new();
+        let expected = backend.identity(336);
+        backend.set_windows(Vec::new());
+
+        assert_eq!(
+            registry
+                .identity_status(
+                    &backend,
+                    &ProcessIdentityStatusRequest {
+                        expected_identity: expected.clone(),
+                    },
+                )
+                .expect("window-independent identity probe should work")
+                .state,
+            ProcessIdentityState::Matching
+        );
+
+        backend.replace_identity(336);
+        assert_eq!(
+            registry
+                .identity_status(
+                    &backend,
+                    &ProcessIdentityStatusRequest {
+                        expected_identity: expected.clone(),
+                    },
+                )
+                .expect("PID reuse should be classified")
+                .state,
+            ProcessIdentityState::Replaced
+        );
+
+        backend
+            .state
+            .lock()
+            .expect("mock state should lock")
+            .get_mut(&336)
+            .expect("mock process should exist")
+            .alive = false;
+        assert_eq!(
+            registry
+                .identity_status(
+                    &backend,
+                    &ProcessIdentityStatusRequest {
+                        expected_identity: expected,
+                    },
+                )
+                .expect("process exit should be classified")
+                .state,
+            ProcessIdentityState::Exited
+        );
     }
 
     #[test]

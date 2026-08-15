@@ -31,6 +31,7 @@ from wizwalker import (  # noqa: E402
     UnsupportedMemoryOperation,
 )
 from wizwalker.memory.backends import PymemMemoryBackend  # noqa: E402
+from wizwalker.generation import manager_generation_context  # noqa: E402
 from wizwalker.memory.memory_reader import _legacy_pattern_to_signature  # noqa: E402
 
 
@@ -437,10 +438,15 @@ class PymemCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 class DeimosNativeBackendTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.manager = FakeAgentManager()
+        context = manager_generation_context(self.manager, "test-helper")
         self.backend = DeimosNativeMemoryBackend(
             self.manager,
             "session-1",
             native_module=FAKE_NATIVE,
+            expected_instance_id="test-helper",
+            generation_fence=context.fence,
+            generation_token=context.generation_token,
+            generation_context=context,
         )
         self.reader = MemoryReader(self.backend)
 
@@ -908,6 +914,10 @@ class ImportIsolationTests(unittest.TestCase):
         self.assertTrue(issubclass(native.ProcessError, native.DeimosNativeError))
         self.assertTrue(issubclass(native.MemoryError, native.DeimosNativeError))
         for method_name in (
+            "close_process_for_instance",
+            "deactivate_core_hook_for_instance",
+            "deactivate_core_hooks_for_instance",
+            "deactivate_feature_hook_for_instance",
             "list_clients",
             "list_modules",
             "memory_regions",
