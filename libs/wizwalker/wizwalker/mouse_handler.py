@@ -19,6 +19,11 @@ class MouseHandler:
         # Make our app dpi aware so scaling works for free
         legacy_windows.set_process_dpi_awareness()
 
+    def _require_active_client(self):
+        require_active = getattr(self.client, "_require_active", None)
+        if callable(require_active):
+            require_active()
+
     async def __aenter__(self):
         if self._ref_lock is None:
             self._ref_lock = asyncio.Lock()
@@ -38,6 +43,7 @@ class MouseHandler:
                 await self._deactivate_mouseless()
     
     async def _activate_mouseless(self):
+        self._require_active_client()
         await self.client.hook_handler.activate_mouseless_cursor_hook()
 
     async def _deactivate_mouseless(self):
@@ -131,6 +137,7 @@ class MouseHandler:
             sleep_duration: How long to sleep between messages
             use_post: If PostMessage should be used instead of SendMessage
         """
+        self._require_active_client()
         # We don't have to check if the hook is active since it will just error
         if right_click:
             button_down_message = 0x204
@@ -185,6 +192,7 @@ class MouseHandler:
             convert_from_client: If the position should be converted from client to screen
             use_post: If PostMessage should be used instead of SendMessage
         """
+        self._require_active_client()
         if convert_from_client:
             x, y = legacy_windows.client_to_screen(self.client.window_handle, x, y)
 

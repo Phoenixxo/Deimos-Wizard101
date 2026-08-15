@@ -29,6 +29,7 @@ from wizwalker import (  # noqa: E402
     PatternFailed,
     ReadOnlyTelemetryReader,
 )
+from wizwalker.generation import manager_generation_context  # noqa: E402
 from wizwalker.telemetry import (  # noqa: E402
     CURRENT_ROOT_CLIENT_OBJECT_OFFSET_PATTERN,
     DUEL_MANAGER_PATTERN,
@@ -345,6 +346,8 @@ FAKE_NATIVE = SimpleNamespace(
 
 
 class FakeNativeManager:
+    cleanup_instance_id = "test-helper"
+
     def __init__(self, memory: SparseMemory):
         self.memory = memory
         self.read_error: BaseException | None = None
@@ -371,6 +374,15 @@ class FakeNativeManager:
     def close_process(self, session_id: str) -> dict[str, str]:
         self.closed_sessions.append(session_id)
         return {"session_id": session_id, "state": "closed"}
+
+    def close_process_for_instance(
+        self,
+        session_id: str,
+        instance_id: str,
+    ) -> dict[str, str]:
+        if instance_id != self.cleanup_instance_id:
+            raise FakeProcessError("helper changed", code="identity_mismatch")
+        return self.close_process(session_id)
 
 
 class BlockingOpenNativeManager(FakeNativeManager):
@@ -413,10 +425,15 @@ def telemetry_reader(
         owner = process
     else:
         manager = FakeNativeManager(fixture.memory)
+        context = manager_generation_context(manager, manager.cleanup_instance_id)
         native_backend = DeimosNativeMemoryBackend(
             manager,
             "session-1",
             native_module=FAKE_NATIVE,
+            expected_instance_id=manager.cleanup_instance_id,
+            generation_fence=context.fence,
+            generation_token=context.generation_token,
+            generation_context=context,
         )
         memory_reader = MemoryReader(native_backend)
         owner = manager
@@ -443,6 +460,15 @@ def descriptor(client_id: str, pid: int) -> dict[str, Any]:
         "is_foreground": False,
         "screen_order": 0,
     }
+
+
+def bound_client(manager, client_descriptor):
+    context = manager_generation_context(manager, manager.cleanup_instance_id)
+    return DiscoveredClient(
+        manager,
+        client_descriptor,
+        generation_context=context,
+    )
 
 
 class ReadOnlyTelemetryParityTests(unittest.IsolatedAsyncioTestCase):
@@ -635,9 +661,109 @@ class ReadOnlyTelemetryParityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_blocking_session_cleanup_preserves_every_key_failure(self):
+        manager = FakeNativeManager(SparseMemory())
+        client = bound_client(manager, descriptor("client-a", 448))
+        first_key = ("shared-session", "helper-a")
+        second_key = ("shared-session", "helper-b")
+        client._pending_session_cleanups = {
+            first_key: "telemetry",
+            second_key: "hook",
+        }
+        client._pending_session_cleanup_ids = {"shared-session"}
+        first_error = RuntimeError("first generation cleanup failed")
+        second_error = RuntimeError("second generation cleanup failed")
+
+        def fail_key(key):
+            raise {first_key: first_error, second_key: second_error}[key]
+
+        with patch.object(client, "_close_session_key_blocking", side_effect=fail_key):
+            with self.assertRaisesRegex(
+                RuntimeError, "first generation cleanup failed"
+            ) as caught:
+                client._close_session_blocking("shared-session")
+
+        self.assertIs(caught.exception, first_error)
+        self.assertEqual(caught.exception.cleanup_errors, (second_error,))
+        self.assertEqual(
+            client._pending_session_cleanups,
+            {first_key: "telemetry", second_key: "hook"},
+        )
+        self.assertEqual(client._pending_session_cleanup_ids, {"shared-session"})
+
+    async def test_await_session_cleanup_preserves_every_session_failure(self):
+        manager = FakeNativeManager(SparseMemory())
+        client = bound_client(manager, descriptor("client-a", 448))
+        client._pending_session_cleanup_ids = {"session-a", "session-b"}
+        session_order = tuple(client._pending_session_cleanup_ids)
+        errors = {
+            session_order[0]: RuntimeError("first session cleanup failed"),
+            session_order[1]: RuntimeError("second session cleanup failed"),
+        }
+
+        async def fail_session(session_id):
+            raise errors[session_id]
+
+        with patch.object(client, "_close_session", side_effect=fail_session):
+            with self.assertRaisesRegex(
+                RuntimeError, "first session cleanup failed"
+            ) as caught:
+                await client._await_session_cleanup()
+
+        self.assertIs(caught.exception, errors[session_order[0]])
+        self.assertEqual(
+            caught.exception.cleanup_errors,
+            (errors[session_order[1]],),
+        )
+        self.assertEqual(
+            client._pending_session_cleanup_ids,
+            {"session-a", "session-b"},
+        )
+
+    async def test_session_cleanup_cancellation_outranks_prior_ordinary_error(self):
+        manager = FakeNativeManager(SparseMemory())
+        client = bound_client(manager, descriptor("client-a", 448))
+        client._pending_session_cleanup_ids = ["session-a", "session-b"]
+        ordinary_error = RuntimeError("first session cleanup failed")
+        cancellation = asyncio.CancelledError("session cleanup cancelled")
+
+        async def fail_session(session_id):
+            if session_id == "session-a":
+                raise ordinary_error
+            raise cancellation
+
+        with patch.object(client, "_close_session", side_effect=fail_session):
+            with self.assertRaises(asyncio.CancelledError) as caught:
+                await client._await_session_cleanup()
+
+        self.assertIs(caught.exception, cancellation)
+        self.assertIs(caught.exception.interrupted_error, ordinary_error)
+        self.assertIs(caught.exception.__cause__, ordinary_error)
+        self.assertEqual(
+            client._pending_session_cleanup_ids,
+            ["session-a", "session-b"],
+        )
+
+    async def test_session_cleanup_cancellation_survives_cleared_ownership(self):
+        manager = FakeNativeManager(SparseMemory())
+        client = bound_client(manager, descriptor("client-a", 448))
+        client._pending_session_cleanup_ids = ["session-a"]
+        cancellation = asyncio.CancelledError("session cleanup cancelled")
+
+        async def cancel_after_close(_session_id):
+            client._pending_session_cleanup_ids.clear()
+            raise cancellation
+
+        with patch.object(client, "_close_session", side_effect=cancel_after_close):
+            with self.assertRaises(asyncio.CancelledError) as caught:
+                await client._await_session_cleanup()
+
+        self.assertIs(caught.exception, cancellation)
+        self.assertEqual(client._pending_session_cleanup_ids, [])
+
     async def test_identity_checked_session_is_reused_and_closed(self):
         manager = FakeNativeManager(SparseMemory())
-        client = DiscoveredClient(manager, descriptor("client-a", 448))
+        client = bound_client(manager, descriptor("client-a", 448))
 
         first = await client.attach_telemetry()
         second = await client.attach_telemetry()
@@ -651,9 +777,84 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await client.close()
         self.assertEqual(manager.closed_sessions, ["session-448"])
 
+    async def test_open_failure_does_not_publish_a_partial_telemetry_session(self):
+        manager = FakeNativeManager(SparseMemory())
+        original_open = manager.open_process
+        manager.open_process = lambda *args, **kwargs: (_ for _ in ()).throw(
+            FakeProcessError("handshake failed", code="handshake_failed")
+        )
+        client = bound_client(manager, descriptor("client-a", 448))
+
+        with self.assertRaisesRegex(FakeProcessError, "handshake failed"):
+            await client.attach_telemetry()
+
+        self.assertIsNone(client._session_id)
+        self.assertIsNone(client._telemetry_reader)
+        manager.open_process = original_open
+        reader = await client.attach_telemetry()
+        self.assertIs(reader, client._telemetry_reader)
+        self.assertEqual(client._session_id, "session-448")
+
+    async def test_reader_construction_failure_closes_unpublished_session(self):
+        manager = FakeNativeManager(SparseMemory())
+        client = bound_client(manager, descriptor("client-a", 448))
+
+        with patch(
+            "wizwalker.discovered_client.ReadOnlyTelemetryReader",
+            side_effect=RuntimeError("telemetry reader construction failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "construction failed"):
+                await client.attach_telemetry()
+
+        self.assertIsNone(client._session_id)
+        self.assertIsNone(client._telemetry_reader)
+        self.assertEqual(manager.closed_sessions, ["session-448"])
+        self.assertEqual(client._pending_session_cleanup_ids, set())
+
+    async def test_failed_reader_construction_cleanup_retains_exact_session(self):
+        class RetryManager(FakeNativeManager):
+            def __init__(self):
+                super().__init__(SparseMemory())
+                self.fail_close = True
+
+            def close_process(self, session_id):
+                if self.fail_close:
+                    raise FakeProcessError(
+                        "reader cleanup failed", code="transport_error"
+                    )
+                return super().close_process(session_id)
+
+        manager = RetryManager()
+        client = bound_client(manager, descriptor("client-a", 448))
+
+        with patch(
+            "wizwalker.discovered_client.ReadOnlyTelemetryReader",
+            side_effect=RuntimeError("telemetry reader construction failed"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "telemetry reader construction failed"
+            ) as caught:
+                await client.attach_telemetry()
+
+        self.assertEqual(
+            [str(error) for error in caught.exception.cleanup_errors],
+            ["reader cleanup failed"],
+        )
+
+        self.assertIsNone(client._session_id)
+        self.assertIsNone(client._telemetry_reader)
+        self.assertEqual(
+            client._pending_session_cleanup_ids, {"session-448"}
+        )
+
+        manager.fail_close = False
+        await client._await_session_cleanup()
+        self.assertEqual(client._pending_session_cleanup_ids, set())
+        self.assertEqual(manager.closed_sessions, ["session-448"])
+
     async def test_closed_client_rejects_new_session(self):
         manager = FakeNativeManager(SparseMemory())
-        client = DiscoveredClient(manager, descriptor("client-a", 448))
+        client = bound_client(manager, descriptor("client-a", 448))
         await client.attach_telemetry()
         client._mark_closed()
 
@@ -664,7 +865,7 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_identity_change_discards_the_existing_session(self):
         manager = BlockingCloseNativeManager(SparseMemory())
-        client = DiscoveredClient(manager, descriptor("client-a", 448))
+        client = bound_client(manager, descriptor("client-a", 448))
         await client.attach_telemetry()
 
         changed = descriptor("client-a", 448)
@@ -687,15 +888,14 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
         manager = FakeNativeManager(SparseMemory())
         invalid = descriptor("client-a", 448)
         invalid["process"]["identity"]["pid"] = 544
-        client = DiscoveredClient(manager, invalid)
 
         with self.assertRaisesRegex(ValueError, "matching process identity"):
-            await client.attach_telemetry()
+            DiscoveredClient(manager, invalid)
         self.assertEqual(manager.open_calls, [])
 
     async def test_close_during_attach_closes_the_late_opened_session(self):
         manager = BlockingOpenNativeManager(SparseMemory())
-        client = DiscoveredClient(manager, descriptor("client-a", 448))
+        client = bound_client(manager, descriptor("client-a", 448))
         attaching = asyncio.create_task(client.attach_telemetry())
 
         self.assertTrue(
@@ -707,6 +907,60 @@ class DiscoveredClientTelemetryLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "closed while"):
             await attaching
+        self.assertEqual(manager.closed_sessions, ["session-448"])
+
+    async def test_retirement_race_retains_a_late_session_when_close_fails(self):
+        current = descriptor("client-a", 448)
+
+        class RacingManager(BlockingOpenNativeManager):
+            def __init__(self):
+                super().__init__(SparseMemory())
+                self.snapshots = iter(([current], [current]))
+                self.fail_close = True
+
+            def list_clients(self):
+                return {"clients": next(self.snapshots)}
+
+            def close_process(self, session_id):
+                if self.fail_close:
+                    raise FakeProcessError(
+                        "cleanup transport failed",
+                        code="transport_error",
+                    )
+                return super().close_process(session_id)
+
+        manager = RacingManager()
+        handler = ClientHandler(agent_manager=manager)
+        previous = handler.get_new_clients()[0]
+        attaching = asyncio.create_task(previous.attach_telemetry())
+        self.assertTrue(
+            await asyncio.to_thread(manager.open_started.wait, 1),
+            "the native open_process call did not start",
+        )
+
+        handler.retire_native_clients()
+        replacement = handler.get_new_clients()[0]
+        manager.allow_open.set()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "closed while its read-only telemetry session was opening"
+        ) as caught:
+            await attaching
+        self.assertEqual(
+            [str(error) for error in caught.exception.cleanup_errors],
+            ["cleanup transport failed"],
+        )
+        self.assertEqual(handler.clients, [replacement])
+        self.assertNotIn(previous, handler.clients)
+        self.assertIn(previous, handler._retired_clients)
+        self.assertEqual(
+            previous._pending_session_cleanup_ids,
+            {"session-448"},
+        )
+
+        manager.fail_close = False
+        await previous.close()
+        self.assertEqual(previous._pending_session_cleanup_ids, set())
         self.assertEqual(manager.closed_sessions, ["session-448"])
 
     async def test_handler_waits_for_retired_client_session_cleanup(self):

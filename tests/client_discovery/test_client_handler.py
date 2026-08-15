@@ -18,6 +18,7 @@ if str(WIZWALKER_ROOT) not in sys.path:
 
 from wizwalker import ClientHandler, DiscoveredClient  # noqa: E402
 from wizwalker.discovered_client import NativeMouseHandler  # noqa: E402
+from wizwalker.generation import manager_generation_context  # noqa: E402
 
 
 def descriptor(
@@ -47,7 +48,19 @@ def descriptor(
     }
 
 
+def bound_client(manager, client_descriptor):
+    instance_id = getattr(manager, "cleanup_instance_id", "test-helper")
+    context = manager_generation_context(manager, instance_id)
+    return DiscoveredClient(
+        manager,
+        client_descriptor,
+        generation_context=context,
+    )
+
+
 class FakeAgentManager:
+    cleanup_instance_id = "test-helper"
+
     def __init__(self, snapshots: list[list[dict]]):
         self.snapshots = iter(snapshots)
         self.calls = []
@@ -87,6 +100,14 @@ class FakeAgentManager:
     def process_status(self, session_id):
         self.calls.append(("process_status", session_id))
         return {"session_id": session_id, "state": "open"}
+
+    def close_process(self, session_id):
+        self.calls.append(("close_process", session_id))
+
+    def close_process_for_instance(self, session_id, instance_id):
+        if instance_id != self.cleanup_instance_id:
+            raise NativeWindowError("identity_mismatch")
+        self.close_process(session_id)
 
 
 class FakeLegacyClient:
@@ -202,7 +223,7 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
 
     def test_foreground_state_survives_a_live_window_gap_and_recovers(self):
         manager = FakeAgentManager([])
-        client = DiscoveredClient(
+        client = bound_client(
             manager,
             descriptor("client-stable", 448, foreground=True),
         )
@@ -220,7 +241,7 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
 
     def test_foreground_window_gap_fails_when_process_has_exited(self):
         manager = FakeAgentManager([])
-        client = DiscoveredClient(
+        client = bound_client(
             manager,
             descriptor("client-stable", 448, foreground=True),
         )
@@ -272,9 +293,29 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid client discovery descriptor"):
             duplicated.get_new_clients()
 
+    def test_invalid_reconnect_descriptor_does_not_mutate_the_current_generation(self):
+        original = descriptor("client-a", 448)
+        malformed = descriptor("client-a", 448)
+        malformed["process"]["identity"]["creation_time_100ns"] = ""
+        manager = FakeAgentManager([[original], [malformed]])
+        handler = ClientHandler(agent_manager=manager)
+        client = handler.get_new_clients()[0]
+        hook_marker = object()
+        client.hook_handler = hook_marker
+        client.body = hook_marker
+
+        with self.assertRaisesRegex(ValueError, "matching process identity"):
+            handler.get_new_clients()
+
+        self.assertEqual(handler.clients, [client])
+        self.assertEqual(handler.managed_identities, ("client-a",))
+        self.assertTrue(client.is_running())
+        self.assertIs(client.hook_handler, hook_marker)
+        self.assertIs(client.body, hook_marker)
+
     def test_native_client_uses_agent_owned_window_and_keyboard_operations(self):
         manager = FakeAgentManager([])
-        client = DiscoveredClient(manager, descriptor("client-a", 448))
+        client = bound_client(manager, descriptor("client-a", 448))
 
         self.assertEqual(client.title, "Wizard101")
         self.assertEqual(tuple(client.window_rectangle), (810, 10, 20, 620))
@@ -325,6 +366,7 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
             def __init__(self):
                 self.hook_handler = FailingHookHandler()
                 self.closed_sessions = []
+                self._hook_lifecycle_lock = asyncio.Lock()
 
             async def _ensure_hook_handler(self):
                 return self.hook_handler, True
@@ -336,6 +378,11 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
             async def _close_session(self, session_id):
                 self.closed_sessions.append(session_id)
 
+            async def _close_hook_session_locked(self):
+                session_id = self._detach_hook_session()
+                if session_id is not None:
+                    await self._close_session(session_id)
+
         client = HookClient()
         mouse = NativeMouseHandler(client)
         with self.assertRaisesRegex(RuntimeError, "activation failed"):
@@ -343,6 +390,188 @@ class ClientHandlerCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(client.closed_sessions, ["hook-session"])
         self.assertIsNone(client.hook_handler)
+
+
+class NativeReconnectTransactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_mark_closed_schedules_one_cleanup_transaction(self):
+        manager = FakeAgentManager([])
+        client = bound_client(manager, descriptor("client-a", 448))
+        cleanup_started = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+
+        class HookHandler:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+                cleanup_started.set()
+                await allow_cleanup.wait()
+
+            def cancel_core_hook_heartbeat(self):
+                return None
+
+        hook_handler = HookHandler()
+        client.hook_handler = hook_handler
+        client._hook_session_id = "hooks-old"
+
+        client._mark_closed()
+        client._mark_closed()
+        await cleanup_started.wait()
+        self.assertEqual(len(client._lifecycle_cleanup_tasks), 1)
+        self.assertEqual(hook_handler.close_calls, 1)
+
+        allow_cleanup.set()
+        await client.close()
+        self.assertEqual(hook_handler.close_calls, 1)
+        self.assertEqual(manager.calls.count(("close_process", "hooks-old")), 1)
+
+    async def test_in_progress_detach_cannot_be_resurrected_by_discovery(self):
+        current = descriptor("client-a", 448)
+        manager = FakeAgentManager([[current], [current], [current]])
+        handler = ClientHandler(agent_manager=manager)
+        detaching = handler.get_new_clients()[0]
+
+        detaching.begin_detach()
+        self.assertEqual(handler.get_new_clients(), [])
+        self.assertFalse(detaching.is_running())
+        self.assertTrue(detaching._detach_started)
+
+        await detaching.close()
+        handler.release_client(detaching)
+        replacement = handler.get_new_clients()[0]
+        self.assertIsNot(replacement, detaching)
+        self.assertTrue(replacement.is_running())
+
+    async def test_hidden_failed_detach_remains_in_cleanup_ownership(self):
+        current = descriptor("client-a", 448)
+        manager = FakeAgentManager([[current], [current]])
+        handler = ClientHandler(agent_manager=manager)
+        client = handler.get_new_clients()[0]
+
+        client.begin_detach()
+        self.assertEqual(handler.remove_dead_clients(), [client])
+        self.assertNotIn(client, handler.clients)
+        self.assertIn(client, handler._retired_clients)
+        self.assertIn(client, handler.cleanup_clients)
+
+        await client.close()
+        handler.release_client(client)
+        self.assertNotIn(client, handler.cleanup_clients)
+
+    async def test_retirement_hides_stale_sessions_and_owns_cleanup(self):
+        current = descriptor("client-a", 448)
+        manager = FakeAgentManager([[current], [current]])
+        handler = ClientHandler(agent_manager=manager)
+        previous = handler.get_new_clients()[0]
+
+        class HookHandler:
+            def __init__(self):
+                self.cancelled = False
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+            def cancel_core_hook_heartbeat(self):
+                self.cancelled = True
+
+        hook_handler = HookHandler()
+        previous._session_id = "telemetry-old"
+        previous._telemetry_reader = object()
+        previous._hook_session_id = "hooks-old"
+        previous.hook_handler = hook_handler
+        previous.body = object()
+        previous._world_view_window = object()
+        previous._character_registry_addr = 0x1234
+        previous._quest_client_manager_addr = 0x5678
+        previous._je_instruction_forward_backwards = 0x9ABC
+
+        retired = handler.retire_native_clients()
+
+        self.assertEqual(retired, (previous,))
+        self.assertEqual(handler.clients, [])
+        self.assertEqual(handler.managed_identities, ())
+        self.assertFalse(previous.is_running())
+        self.assertIsNone(previous._session_id)
+        self.assertIsNone(previous._telemetry_reader)
+        # Hook ownership remains attached until the asynchronous unhook is
+        # confirmed; the retired object is hidden from discovery immediately.
+        self.assertEqual(previous._hook_session_id, "hooks-old")
+        self.assertIs(previous.hook_handler, hook_handler)
+        self.assertIn(previous, handler._retired_clients)
+
+        # The same live process is quarantined while its prior hooks remain
+        # owned; publishing a second object here could activate duplicates.
+        self.assertEqual(handler.get_new_clients(), [])
+        await previous.close()
+        await handler.retry_retired_cleanup(force=True)
+        manager.snapshots = iter([[current]])
+        replacement = handler.get_new_clients()[0]
+        self.assertIsNot(replacement, previous)
+        self.assertEqual(replacement.client_id, previous.client_id)
+        self.assertIsNone(previous._hook_session_id)
+        self.assertIsNone(previous.hook_handler)
+        self.assertFalse(hasattr(previous, "body"))
+        self.assertIsNone(previous._world_view_window)
+        self.assertIsNone(previous._character_registry_addr)
+        self.assertIsNone(previous._quest_client_manager_addr)
+        self.assertIsNone(previous._je_instruction_forward_backwards)
+        self.assertTrue(hook_handler.closed)
+        self.assertTrue(hook_handler.cancelled)
+        self.assertIn(("close_process", "telemetry-old"), manager.calls)
+        self.assertIn(("close_process", "hooks-old"), manager.calls)
+
+    async def test_cleanup_failure_stays_owned_without_exposing_old_client(self):
+        current = descriptor("client-a", 448)
+        manager = FakeAgentManager([[current], [current]])
+
+        def fail_close(session_id):
+            manager.calls.append(("close_process", session_id))
+            raise NativeWindowError("transport_error")
+
+        manager.close_process = fail_close
+        handler = ClientHandler(agent_manager=manager)
+        previous = handler.get_new_clients()[0]
+        previous._session_id = "telemetry-old"
+
+        handler.retire_native_clients()
+        replacement = handler.get_new_clients()[0]
+        await asyncio.gather(
+            *tuple(previous._session_cleanup_tasks),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(handler.clients, [replacement])
+        self.assertNotIn(previous, handler.clients)
+        self.assertIn(previous, handler._retired_clients)
+        self.assertIsNotNone(previous._last_session_cleanup_error)
+        with self.assertRaisesRegex(NativeWindowError, "transport_error"):
+            await handler.close()
+        self.assertIn(previous, handler._retired_clients)
+
+    async def test_retired_reference_cannot_target_a_reused_client_id(self):
+        current = descriptor("client-a", 448)
+        manager = FakeAgentManager([[current], [current]])
+        handler = ClientHandler(agent_manager=manager)
+        previous = handler.get_new_clients()[0]
+        handler.retire_native_clients()
+        replacement = handler.get_new_clients()[0]
+        self.assertEqual(replacement.client_id, previous.client_id)
+        calls_before = list(manager.calls)
+
+        for operation in (
+            lambda: previous.title,
+            lambda: setattr(previous, "title", "stale"),
+            lambda: setattr(previous, "is_foreground", True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retired native session"):
+                operation()
+        with self.assertRaisesRegex(RuntimeError, "retired native session"):
+            await previous.send_key(SimpleNamespace(value=0x57), 0.1)
+
+        self.assertEqual(manager.calls, calls_before)
 
 
 @unittest.skipIf(sys.platform == "win32", "macOS/Linux import isolation only")

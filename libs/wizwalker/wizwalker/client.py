@@ -1,7 +1,7 @@
 import asyncio
 import struct
 import warnings
-from functools import cached_property, partial
+from functools import cached_property, partial, wraps
 from importlib import import_module
 from typing import Callable, List, Optional
 
@@ -60,10 +60,12 @@ class Client:
 
     def __init__(self, window_handle: int):
         self.window_handle = window_handle
+        self._detach_started = False
+        self._hook_lifecycle_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
 
         pymem = import_module("pymem")
         self._pymem = pymem.Pymem()
-        self._pymem.open_process_from_id(self.process_id)
         self.hook_handler = HookHandler(self._pymem, self)
 
         self.cache_handler = CacheHandler()
@@ -95,6 +97,12 @@ class Client:
         # for teleport
         self._je_instruction_forward_backwards = None
 
+        # No constructor after this point may fail: opening the Windows process
+        # handle is deliberately the final initialization step so a failure in
+        # a handler or memory-object constructor cannot leak an unpublished
+        # Pymem resource.
+        self._pymem.open_process_from_id(self.process_id)
+
     def __repr__(self):
         return f"<Client {self.window_handle=} {self.process_id=}>"
 
@@ -103,10 +111,12 @@ class Client:
         """
         Get or set this window's title
         """
+        self._require_active()
         return get_window_title(self.window_handle)
 
     @title.setter
     def title(self, window_title: str):
+        self._require_active()
         set_window_title(self.window_handle, window_title)
 
     @property
@@ -116,6 +126,7 @@ class Client:
 
         Set this to True to bring it to the foreground
         """
+        self._require_active()
         return utils.get_foreground_window() == self.window_handle
 
     @is_foreground.setter
@@ -123,6 +134,7 @@ class Client:
         if value is False:
             return
 
+        self._require_active()
         utils.set_foreground_window(self.window_handle)
 
     @property
@@ -130,6 +142,7 @@ class Client:
         """
         Get this client's window rectangle
         """
+        self._require_active()
         return get_window_rectangle(self.window_handle)
 
     @cached_property
@@ -139,11 +152,23 @@ class Client:
         """
         return utils.get_pid_from_handle(self.window_handle)
 
+    def _process_is_running(self) -> bool:
+        return check_if_process_running(self._pymem.process_handle)
+
     def is_running(self):
         """
         If this client is still running
         """
-        return check_if_process_running(self._pymem.process_handle)
+        return not self._detach_started and self._process_is_running()
+
+    def _require_active(self) -> None:
+        if self._detach_started:
+            raise RuntimeError(
+                "This Wizard101 client is detaching. Rediscover it before issuing operations."
+            )
+
+    def begin_detach(self) -> None:
+        self._detach_started = True
 
     async def zone_name(self) -> Optional[str]:
         """
@@ -259,20 +284,26 @@ class Client:
             wait_for_ready: If this should wait for hooks to be ready to use (duel exempt)
             timeout: How long to wait for hook values to be witten (None for no timeout)
         """
-        await self.hook_handler.activate_all_hooks(
-            wait_for_ready=wait_for_ready, timeout=timeout
-        )
+        self._require_active()
+        async with self._hook_lifecycle_lock:
+            self._require_active()
+            await self.hook_handler.activate_all_hooks(
+                wait_for_ready=wait_for_ready, timeout=timeout
+            )
 
     async def close(self):
         """
         Closes this client; unhooking all active hooks
         """
-        # if the client isn't running there isn't anything to unhook
-        if not self.is_running():
-            return
-
-        await self._unpatch_movement_update()
-        await self.hook_handler.close()
+        self.begin_detach()
+        async with self._close_lock:
+            async with self._hook_lifecycle_lock:
+                # Once the process has exited, all in-process hooks and patches
+                # are terminally gone and no memory teardown is applicable.
+                if not self._process_is_running():
+                    return
+                await self._unpatch_movement_update()
+                await self.hook_handler.close()
 
     async def telemetry_snapshot(self):
         """Capture hook-free telemetry through the shared read-only contract."""
@@ -510,6 +541,7 @@ class Client:
             username: The username to login with
             password: The password to login with
         """
+        self._require_active()
         utils.instance_login(self.window_handle, username, password)
 
     async def send_key(self, key: Keycode, seconds: float = 0):
@@ -520,6 +552,7 @@ class Client:
             key: The Keycode to send
             seconds: How long to send it for
         """
+        self._require_active()
         await utils.timed_send_key(self.window_handle, key, seconds)
 
     async def send_hotkey(self, modifers: List[Keycode], key: Keycode):
@@ -530,6 +563,7 @@ class Client:
             modifers: The key modifers i.e CTRL, ALT
             key: The key being modified
         """
+        self._require_active()
         await utils.send_hotkey(self.window_handle, modifers, key)
 
     async def goto(self, x: float, y: float):
@@ -691,7 +725,6 @@ class Client:
         )
 
         return self._je_instruction_forward_backwards
-
     async def camera_swap(self, seamless_freecam=True):
         """
         Swaps the current camera controller
@@ -845,3 +878,37 @@ class Client:
         await self.hook_handler.start_thread(shell_ptr)
         # we can free here because start_thread waits for the thread to return
         await self.hook_handler.free(shell_ptr)
+
+
+def _gate_public_client_operation(method):
+    @wraps(method)
+    async def gated(self, *args, **kwargs):
+        require_active = getattr(self, "_require_active", None)
+        if callable(require_active):
+            require_active()
+        else:
+            # DiscoveredClient delegates these compatibility methods while
+            # retaining its native generation guard.
+            require_running = getattr(self, "_require_running", None)
+            if callable(require_running):
+                require_running()
+        return await method(self, *args, **kwargs)
+
+    return gated
+
+
+# Fresh public operations must not enter once detach starts. Private helpers are
+# intentionally left available because close() needs them to finish teardown;
+# already-captured memory-object references are handled by the later L09 scope.
+for _client_method_name, _client_method in tuple(vars(Client).items()):
+    if (
+        _client_method_name == "close"
+        or _client_method_name.startswith("_")
+        or not asyncio.iscoroutinefunction(_client_method)
+    ):
+        continue
+    setattr(
+        Client,
+        _client_method_name,
+        _gate_public_client_operation(_client_method),
+    )
