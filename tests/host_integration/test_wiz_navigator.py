@@ -21,6 +21,24 @@ from wizwalker.extensions.wizsprinter import wiz_navigator  # noqa: E402
 
 
 class ZoneNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unbound_client_method_preserves_duck_typed_compatibility(self):
+        client = SimpleNamespace(
+            zone_name=AsyncMock(
+                side_effect=("WizardCity/Old", "WizardCity/New", "WizardCity/New")
+            ),
+            is_loading=AsyncMock(return_value=False),
+        )
+
+        result = await Client.wait_for_zone_change(
+            client,
+            sleep_time=0,
+            timeout=1,
+        )
+
+        self.assertEqual(result, "WizardCity/New")
+        self.assertFalse(hasattr(client, "_require_active"))
+        self.assertFalse(hasattr(client, "_require_running"))
+
     async def test_zone_change_wait_retries_transient_memory_gaps(self):
         client = SimpleNamespace(
             zone_name=AsyncMock(

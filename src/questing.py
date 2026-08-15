@@ -280,8 +280,21 @@ class Quester():
 
                     # loop until we have confirmed that we are no longer in a solo zone
                     while len(clients_in_solo_zone) > 0 and solo_zone is not None:
-                        solo_zone_task = asyncio.create_task(solo_zone_questing_loop(clients_in_solo=clients_in_solo_zone, zone=solo_zone))
-                        await asyncio.wait([solo_zone_task])
+                        solo_zone_task = asyncio.create_task(
+                            solo_zone_questing_loop(
+                                clients_in_solo=clients_in_solo_zone,
+                                zone=solo_zone,
+                            )
+                        )
+                        try:
+                            await solo_zone_task
+                        finally:
+                            if not solo_zone_task.done():
+                                solo_zone_task.cancel()
+                            await asyncio.gather(
+                                solo_zone_task,
+                                return_exceptions=True,
+                            )
 
                         logger.debug('Clients may have left the solo zone - attempting to teleport to leader.')
                         clients_in_solo_zone, solo_zone = await self.friend_teleport(maybe_solo_zone=True)

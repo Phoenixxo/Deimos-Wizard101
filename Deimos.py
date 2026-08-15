@@ -29,6 +29,7 @@ from loguru import logger
 from pypresence import AioPresence
 from wizwalker import XYZ, HotkeyListener, Keycode, ModifierKeys, Orient, utils
 from wizwalker.client_handler import Client, ClientHandler
+from wizwalker.generation import release_manager_generation_context
 from wizwalker.extensions.scripting import teleport_to_friend_from_list
 from wizwalker.extensions.wizsprinter.sprinty_combat import SprintyCombat
 from wizwalker.extensions.wizsprinter.wiz_navigator import toZone, toZoneDisplayName
@@ -53,7 +54,19 @@ else:
         def drop_keep_alive(self, *_args, **_kwargs):
             return None
 
+        def suspend_client(self, *_args, **_kwargs):
+            return None
+
+        def resume_client(self, *_args, **_kwargs):
+            return None
+
+        def owned_client_identities(self):
+            return ()
+
         async def teardown_client(self, *_args, **_kwargs):
+            return None
+
+        async def forget_terminated_client(self, *_args, **_kwargs):
             return None
 
         async def tick(self, *_args, **_kwargs):
@@ -79,17 +92,28 @@ from src.logging_paths import application_log_directory
 from src.platform_adapter import host_platform
 from src.runtime_recovery import (
     AgentRuntimeRecovery,
+    await_generation_control_dispatch,
+    AgentRecoveryCoordinator,
+    AgentRecoveryRetryDriver,
     AutoHookClientNotReady,
     AutoHookRetryPolicy,
     ClientTelemetryTransition,
+    GenerationTaggedQueue,
+    cancel_and_drain_tasks,
+    classify_hook_heartbeat_failure,
     client_supports_operations,
     format_error_diagnostics,
+    generation_command_is_current,
     is_recoverable_agent_error,
     require_agent_capabilities,
     require_auto_hook_character_ready,
     read_consistent_hook_snapshot,
+    rollback_failed_manual_activation,
+    reset_generation_runtime_state,
+    restart_resilient_task,
     run_guarded_feature,
     task_is_active,
+    try_drain_tasks,
 )
 from src.sigil import Sigil
 from src.sprinty_client import SprintyClient
@@ -150,8 +174,10 @@ def _write_lifecycle_event(event: str) -> None:
 sys.excepthook = _write_startup_exception
 
 
-def get_all_wizard_handles():
-    return wizlaunch.get_wizard_handles()
+def get_all_wizard_handles(runtime_binding=None):
+    if runtime_binding is None:
+        return wizlaunch.get_wizard_handles()
+    return wizlaunch.get_wizard_handles(_runtime_binding=runtime_binding)
 
 tool_version: str = "3.14.0"
 tool_name: str = "Deimos"
@@ -360,8 +386,8 @@ highlight_task: asyncio.Task = None
 entity_stream_task: asyncio.Task = None
 
 gui_send_queue = queue.Queue()
-recv_queue = queue.Queue()
-control_queue = queue.Queue()
+recv_queue = GenerationTaggedQueue()
+control_queue = GenerationTaggedQueue()
 shutdown_event = threading.Event()
 
 
@@ -380,15 +406,18 @@ def generate_timestamp() -> str:
     return time_stamp
 
 
-def build_account_list_payload() -> list[dict]:
+def build_account_list_payload(runtime_binding=None) -> list[dict]:
     """Enrich the saved-account list with per-account validation state for the
     launcher GUI. Each entry: {'nick', 'error' (None if valid), 'steam'}."""
     payload = []
-    for nick in wizlaunch.list_accounts():
+    for nick in wizlaunch.list_accounts(_runtime_binding=runtime_binding):
         payload.append({
             "nick": nick,
             "error": wizlaunch.validate_account(nick),
-            "steam": wizlaunch.get_account_steam(nick),
+            "steam": wizlaunch.get_account_steam(
+                nick,
+                _runtime_binding=runtime_binding,
+            ),
         })
     return payload
 
@@ -512,7 +541,19 @@ async def _do_apply_update():
     try:
         await tool_finish()
     except Exception as e:
-        logger.warning(f"Error during pre-update shutdown: {e}")
+        logger.opt(exception=e).error(
+            "Update cancelled because client hook cleanup did not finish."
+        )
+        gui_send_queue.put(
+            deimosgui.GUICommand(
+                deimosgui.GUICommandType.UpdateProgress,
+                (
+                    "error",
+                    "Could not safely unhook every client. Retry after the cleanup error is resolved.",
+                ),
+            )
+        )
+        return
 
     if not updater.apply_and_relaunch(path):
         gui_send_queue.put(
@@ -674,17 +715,23 @@ async def kill_tool(debug: bool):
 
 
 async def tool_finish():
+    global tool_status
     # Restore the in-process resolution/resize asm hooks BEFORE closing clients.
     # They patch the game's own code and aren't tracked by the client's hook_handler,
     # so client.close() won't undo them — they must be uninstalled while the clients
     # (and their hook handlers) are still alive, or the game is left running with
     # jumps into a freed codecave. Runs on every close path (graceful + pre-update).
+    resize_cleanup_error = None
     try:
         await client_resizing_manager.shutdown()
     except Exception as e:
-        logger.opt(exception=e).debug("client_resizing shutdown error")
+        resize_cleanup_error = e
+        logger.opt(exception=e).error("client_resizing shutdown error")
 
-    if not walker or len(walker.clients) == 0:
+    if not walker:
+        if resize_cleanup_error is not None:
+            raise resize_cleanup_error
+        tool_status = False
         return
 
     alive_clients = [p for p in walker.clients if p.is_running()]
@@ -713,23 +760,40 @@ async def tool_finish():
         except Exception:
             pass
     await listener.clear()
-    for p in walker.clients:
+    if resize_cleanup_error is not None:
+        logger.error(
+            "Skipping client close because resize hooks could not be fully removed; "
+            "the live hook sessions are being left intact to preserve the shared codecave."
+        )
+        raise resize_cleanup_error
+
+    close_errors = []
+    retired_clients = tuple(getattr(walker, "_retired_clients", ()))
+    owned_clients = tuple(dict.fromkeys((*walker.clients, *retired_clients)))
+    for p in owned_clients:
         try:
             await asyncio.wait_for(p.close(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning(f"Timed out closing client '{p.title}', skipping.")
-        except:
-            pass
+        except asyncio.TimeoutError as error:
+            logger.warning(f"Timed out closing client {p!r}; cleanup remains owned.")
+            close_errors.append(error)
+        except Exception as error:
+            logger.opt(exception=error).error(
+                f"Could not fully close client {p!r}; cleanup remains owned."
+            )
+            close_errors.append(error)
+        else:
+            if p in getattr(walker, "_retired_clients", ()):
+                walker._retired_clients.remove(p)
+    if close_errors:
+        raise close_errors[0]
     # await walker.close()
     await asyncio.sleep(0)
-    global tool_status
     tool_status = False
 
 
 @logger.catch()
 async def main(agent_manager: Any = None):
-    if agent_manager is not None:
-        wizlaunch.configure_runtime(agent_manager)
+    global walker
     runtime_recovery = AgentRuntimeRecovery(agent_manager)
     if agent_manager is not None:
         try:
@@ -739,6 +803,15 @@ async def main(agent_manager: Any = None):
                 "Could not capture the initial helper-agent identity: "
                 f"{format_error_diagnostics(error)}"
             )
+    walker = ClientHandler(
+        agent_manager=agent_manager,
+        agent_instance_id=runtime_recovery.instance_id,
+    )
+    if agent_manager is not None:
+        wizlaunch.configure_runtime(
+            agent_manager,
+            generation_context=walker.generation_context,
+        )
     global tool_status
     global original_client_locations
     global listener
@@ -748,6 +821,16 @@ async def main(agent_manager: Any = None):
     listener = HotkeyListener()
     foreground_client: Client = None
     background_clients = []
+    all_tasks = {}
+    _client_generation_tasks: set[asyncio.Task] = set()
+    _client_runtime_epoch = 0
+    _recovery_coordinator = AgentRecoveryCoordinator()
+    _recovery_retry_driver = AgentRecoveryRetryDriver(
+        _recovery_coordinator,
+        shutdown_requested=shutdown_event.is_set,
+    )
+    recv_queue.set_generation(walker.agent_generation_token)
+    control_queue.set_generation(walker.agent_generation_token)
     _automation_capabilities = (
         "memory.mutation.v1",
         "memory.core_hook.v1",
@@ -1796,6 +1879,12 @@ async def main(agent_manager: Any = None):
     # loop or the other clients' hooking. Cancelled if its window closes first.
     _hooking_tasks: dict[int | str, "asyncio.Task"] = {}
     _failed_hook_handles: set[int | str] = set()
+    _terminal_hook_failure_handles: set[int | str] = set()
+    _failed_manual_hook_handles: set[int | str] = set()
+    _pending_hook_failure_tasks: dict[
+        int | str, tuple[asyncio.Task, ...]
+    ] = {}
+    _pending_hook_snapshot_restarts: set[int | str] = set()
     _auto_hook_retries = AutoHookRetryPolicy()
     # Nickname -> pre-spawn launch stage ("verifying"/"patching"/"launching") for the
     # client-manager placeholder rows shown before a window handle exists. Owned by the
@@ -1835,6 +1924,12 @@ async def main(agent_manager: Any = None):
         finish_command=None,
         required_capabilities: tuple[str, ...] = (),
     ):
+        feature_runtime = (
+            walker.bind_agent_manager(walker.agent_generation_token)
+            if agent_manager is not None
+            else None
+        )
+
         if not required_capabilities:
             required_capabilities = {
                 "Combat": _automation_capabilities,
@@ -1911,7 +2006,7 @@ async def main(agent_manager: Any = None):
         async def gated_operation():
             try:
                 require_agent_capabilities(
-                    agent_manager, name, *required_capabilities
+                    feature_runtime, name, *required_capabilities
                 )
             except Exception:
                 close_operation = getattr(operation, "close", None)
@@ -1920,17 +2015,284 @@ async def main(agent_manager: Any = None):
                 raise
             await operation
 
-        return asyncio.create_task(
+        task = asyncio.create_task(
             run_guarded_feature(
                 gated_operation(), on_failure=report_failure, on_finish=finish
             )
         )
+        _client_generation_tasks.add(task)
+        task.add_done_callback(_client_generation_tasks.discard)
+        return task
+
+    def _start_client_generation_task(operation):
+        task = asyncio.create_task(operation)
+        _client_generation_tasks.add(task)
+        task.add_done_callback(_client_generation_tasks.discard)
+        return task
 
     async def _recover_agent_runtime(operation: str, error: BaseException) -> bool:
         global walker
+        global bot_task, flythrough_task, highlight_task, entity_stream_task
+        global combat_task, dialogue_task, sigil_task, questing_task
+        global speed_task, auto_pet_task
         nonlocal foreground_client, background_clients
 
         _log_native_failure(f"Native helper failed during {operation}", error)
+        if not is_recoverable_agent_error(error):
+            return False
+
+        recovered = await _recovery_coordinator.run(
+            lambda: _run_agent_recovery_transaction(error)
+        )
+        if not recovered and tool_status and not shutdown_event.is_set():
+            _schedule_agent_recovery_retry(error)
+        return recovered
+
+    def _schedule_agent_recovery_retry(error: BaseException) -> None:
+        def report_retry(_attempt: int, delay_seconds: float) -> None:
+            logger.warning(
+                "Native helper recovery remains fail-closed; retrying retained "
+                "cleanup in {:.1f} seconds.",
+                delay_seconds,
+            )
+
+        all_tasks["agent_recovery_retry"] = _recovery_retry_driver.schedule(
+            lambda: _run_agent_recovery_transaction(error),
+            on_retry=report_retry,
+            on_error=lambda retry_error: _log_native_failure(
+                "Retained helper cleanup retry failed",
+                retry_error,
+            ),
+        )
+
+    async def _run_agent_recovery_transaction(error: BaseException) -> bool:
+        global walker
+        global bot_task, flythrough_task, highlight_task, entity_stream_task
+        global combat_task, dialogue_task, sigil_task, questing_task
+        global speed_task, auto_pet_task
+        global sigil_leader_pid, questing_leader_pid, freecam_status
+        global questing_status, questing_restarting, questing_generation
+        global auto_pet_status, sigil_status, auto_potion_status
+        global speed_status, combat_status, dialogue_status, drops_disabled_status
+        nonlocal foreground_client, background_clients
+        nonlocal _client_runtime_epoch
+
+        recovery_task_names: set[str] = set()
+        resize_cleanup_error = None
+        try:
+            cleanup_clients = walker.cleanup_clients
+            # Resolution/resize hooks patch process code outside HookHandler.
+            # Suspend servicing and restore those jumps before retirement can
+            # close the client's shared codecave/session.  This is a no-op for
+            # today's macOS manager, but preserves the ordering if native
+            # resizing becomes available on the agent route later.
+            retained_resize_ids = client_resizing_manager.owned_client_identities()
+            retiring_resize_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *(
+                            _client_identity(client)
+                            for client in walker.clients
+                        ),
+                        *retained_resize_ids,
+                    )
+                )
+            )
+            for identity in retiring_resize_ids:
+                client_resizing_manager.suspend_client(identity)
+            for identity in retiring_resize_ids:
+                try:
+                    if identity in _terminal_hook_failure_handles:
+                        await client_resizing_manager.forget_terminated_client(
+                            identity
+                        )
+                    else:
+                        await client_resizing_manager.teardown_client(identity)
+                except Exception as cleanup_error:
+                    if resize_cleanup_error is None:
+                        resize_cleanup_error = cleanup_error
+            # If an external resize jump could not be restored, hide and fence
+            # every client but deliberately retain the hook/session owner. A
+            # session close could free the codecave while that jump is live.
+            schedule_client_cleanup = resize_cleanup_error is None
+            for cleanup_client in cleanup_clients:
+                if schedule_client_cleanup:
+                    cleanup_client.release_cleanup_blocker("resize_hook")
+                else:
+                    cleanup_client.retain_cleanup_blocker("resize_hook")
+            walker.retire_native_clients(
+                schedule_cleanup=schedule_client_cleanup,
+                cleanup_blocker=(
+                    None if schedule_client_cleanup else "resize_hook"
+                ),
+            )
+            if not schedule_client_cleanup:
+                # Include a client published after the preflight snapshot but
+                # before retirement closed generation admission.
+                for cleanup_client in walker.cleanup_clients:
+                    cleanup_client.retain_cleanup_blocker("resize_hook")
+            # Closing the generation fence is synchronous; awaiting it drains
+            # native calls already dispatched to the old helper before start()
+            # is allowed to replace the manager connection.
+            await walker.begin_agent_replacement(
+                schedule_client_cleanup=schedule_client_cleanup,
+                cleanup_blocker=(
+                    None if schedule_client_cleanup else "resize_hook"
+                ),
+            )
+            foreground_client = None
+            background_clients = []
+            launched_account_map.clear()
+            released_handles.clear()
+            _hooking_in_progress.clear()
+            always_on_names = (
+                "foreground_client_switching",
+                "assign_foreground_clients",
+                "anti_afk_loop",
+                "is_client_in_combat_loop",
+                "entity_detect_combat_loop",
+                "potion_usage_loop",
+                "rpc_loop",
+                "drop_logging_loop",
+                "client_resizing_loop",
+                "zone_check_loop",
+                "anti_afk_questing_loop",
+            )
+            recovery_task_names = {
+                name
+                for name in always_on_names
+                if name in all_tasks
+            }
+            generation_tasks = [
+                *_hooking_tasks.values(),
+                *_client_generation_tasks,
+                combat_task,
+                dialogue_task,
+                sigil_task,
+                questing_task,
+                speed_task,
+                auto_pet_task,
+                bot_task,
+                flythrough_task,
+                highlight_task,
+                entity_stream_task,
+            ]
+            generation_tasks.extend(all_tasks.get(name) for name in always_on_names)
+            generation_tasks.extend(
+                task
+                for pending_tasks in _pending_hook_failure_tasks.values()
+                for task in pending_tasks
+            )
+            listener.suspend_callbacks()
+            await cancel_and_drain_tasks(generation_tasks)
+            await listener.cancel_pending_callbacks()
+            _client_runtime_epoch += 1
+            _hooking_tasks.clear()
+            _client_generation_tasks.clear()
+            pending_hook_failure_ids = set(_pending_hook_failure_tasks)
+            for cleanup_client in walker.cleanup_clients:
+                if _client_identity(cleanup_client) in pending_hook_failure_ids:
+                    cleanup_client.release_cleanup_blocker("hook_task_drain")
+            _pending_hook_failure_tasks.clear()
+            # The corresponding snapshot tasks are part of always_on_names and
+            # remain in all_tasks. A successful replacement recreates them once;
+            # a failed replacement deliberately leaves them stopped.
+            _pending_hook_snapshot_restarts.clear()
+            combat_task = dialogue_task = sigil_task = None
+            questing_task = speed_task = auto_pet_task = None
+            bot_task = flythrough_task = None
+            highlight_task = entity_stream_task = None
+            _failed_hook_handles.clear()
+            _terminal_hook_failure_handles.clear()
+            _failed_manual_hook_handles.clear()
+            _auto_hook_retries.clear_all()
+            if "client_speeds" in globals():
+                client_speeds.clear()
+            _last_client_titles.clear()
+            original_client_locations.clear()
+            generation_state = reset_generation_runtime_state(
+                window_config_applied,
+                launching_status,
+                _client_runtime_epoch,
+            )
+            sigil_leader_pid = generation_state.sigil_leader_pid
+            questing_leader_pid = generation_state.questing_leader_pid
+            freecam_status = generation_state.freecam_status
+            questing_status = False
+            questing_restarting = False
+            questing_generation += 1
+            auto_pet_status = False
+            sigil_status = False
+            auto_potion_status = False
+            speed_status = False
+            combat_status = False
+            dialogue_status = False
+            drops_disabled_status = False
+            gui_send_queue.put(
+                deimosgui.GUICommand(
+                    deimosgui.GUICommandType.UpdateHookedClients,
+                    {
+                        "hooked": [],
+                        "unmanaged": [],
+                        "managed_accounts": [],
+                        "hooking": [],
+                    },
+                )
+            )
+            for tag, value in (
+                ("Title", "Client: None"),
+                ("Zone", "Zone: "),
+                ("xyz", "Position (XYZ): "),
+                ("pry", "Orientation (PRY): "),
+                ("FreecamStatus", "Disabled"),
+                ("CombatStatus", "Disabled"),
+                ("DialogueStatus", "Disabled"),
+                ("SigilStatus", "Disabled"),
+                ("QuestingStatus", "Disabled"),
+                ("Auto PetStatus", "Disabled"),
+                ("Auto PotionStatus", "Disabled"),
+                ("SpeedhackStatus", "Disabled"),
+                ("FlythroughStatus", "Disabled"),
+                ("No DropsStatus", "Disabled"),
+            ):
+                gui_send_queue.put(
+                    deimosgui.GUICommand(
+                        deimosgui.GUICommandType.UpdateWindow,
+                        (tag, value),
+                    )
+                )
+            gui_send_queue.put(
+                deimosgui.GUICommand(
+                    deimosgui.GUICommandType.UpdateEntityListData,
+                    [],
+                )
+            )
+            gui_send_queue.put(
+                deimosgui.GUICommand(
+                    deimosgui.GUICommandType.UpdateHighlightBox,
+                    None,
+                )
+            )
+            if resize_cleanup_error is not None:
+                _log_native_failure(
+                    "Helper recovery stopped because resize-hook cleanup did not finish; "
+                    "clients are fenced and cleanup ownership is retained",
+                    resize_cleanup_error,
+                )
+            else:
+                logger.warning(
+                    "The helper-agent connection failed. Existing client sessions "
+                    "were retired before reconnecting."
+                )
+        except Exception as fencing_error:
+            _log_native_failure("Could not fence the failed helper generation", fencing_error)
+            _schedule_agent_recovery_retry(error)
+            return False
+
+        if resize_cleanup_error is not None:
+            _schedule_agent_recovery_retry(error)
+            return False
+
         outcome = await runtime_recovery.recover(error)
         if not outcome.recovered:
             if outcome.error is not None:
@@ -1940,6 +2302,7 @@ async def main(agent_manager: Any = None):
                 "error is not recoverable",
             ):
                 logger.error(f"Helper-agent recovery stopped: {outcome.reason}.")
+            _schedule_agent_recovery_retry(error)
             return False
 
         identity = (outcome.response or {}).get("identity", {})
@@ -1952,47 +2315,75 @@ async def main(agent_manager: Any = None):
             )
         )
         if outcome.instance_changed:
-            for client in walker.clients:
-                mark_closed = getattr(client, "_mark_closed", None)
-                if callable(mark_closed):
-                    mark_closed()
-            walker = ClientHandler(agent_manager=agent_manager)
-            foreground_client = None
-            background_clients = []
-            launched_account_map.clear()
-            released_handles.clear()
-            _hooking_in_progress.clear()
-            for task in _hooking_tasks.values():
-                task.cancel()
-            _hooking_tasks.clear()
-            _failed_hook_handles.clear()
-            _auto_hook_retries.clear_all()
-            if "client_speeds" in globals():
-                client_speeds.clear()
-            gui_send_queue.put(
-                deimosgui.GUICommand(
-                    deimosgui.GUICommandType.UpdateHookedClients,
-                    {
-                        "hooked": [],
-                        "unmanaged": [],
-                        "managed_accounts": [],
-                        "hooking": [],
-                    },
-                )
-            )
             logger.warning(
-                "The helper-agent instance changed. Existing client sessions were "
-                "discarded; running clients will be rediscovered."
+                "The helper-agent instance changed; running clients will be "
+                "rediscovered into a new session generation."
             )
+        current_instance = (outcome.response or {}).get("identity", {}).get(
+            "instance_id"
+        )
+        if isinstance(current_instance, str) and current_instance:
+            walker.note_agent_instance(
+                current_instance,
+                previous_replaced=outcome.instance_changed,
+            )
+            recv_queue.set_generation(walker.agent_generation_token)
+            control_queue.set_generation(walker.agent_generation_token)
+            listener.resume_callbacks()
+        else:
+            _schedule_agent_recovery_retry(error)
+            return False
+        if recovery_task_names:
+            # Generation-bound always-on loops were drained above. Recreate
+            # them only after the replacement identity has been validated and
+            # published; they will observe an empty client list until fresh
+            # discovery objects are created.
+            recovery_task_funcs = {
+                "foreground_client_switching": foreground_client_switching,
+                "assign_foreground_clients": assign_foreground_clients,
+                "anti_afk_loop": anti_afk_loop,
+                "is_client_in_combat_loop": is_client_in_combat_loop,
+                "entity_detect_combat_loop": entity_detect_combat_loop,
+                "potion_usage_loop": potion_usage_loop,
+                "rpc_loop": rpc_loop,
+                "drop_logging_loop": drop_logging_loop,
+                "client_resizing_loop": client_resizing_loop,
+                "zone_check_loop": zone_check_loop,
+                "anti_afk_questing_loop": anti_afk_questing_loop,
+            }
+            for task_name in recovery_task_names:
+                all_tasks[task_name] = asyncio.create_task(
+                    recovery_task_funcs[task_name]()
+                )
         return True
 
     async def _get_all_wizard_handles(operation: str):
         for attempt in range(2):
             try:
-                handles = set(await asyncio.to_thread(get_all_wizard_handles))
+                runtime_binding = (
+                    walker.bind_agent_manager(walker.agent_generation_token)
+                    if agent_manager is not None
+                    else None
+                )
+                handles = set(
+                    await asyncio.to_thread(
+                        get_all_wizard_handles,
+                        runtime_binding,
+                    )
+                )
+                if runtime_binding is not None:
+                    runtime_binding.require_current()
                 runtime_recovery.confirm_healthy()
                 return handles
             except Exception as error:
+                if (
+                    runtime_binding is not None
+                    and runtime_binding.generation_token
+                    != walker.agent_generation_token
+                ):
+                    if attempt == 0:
+                        continue
+                    return None
                 if attempt == 0 and await _recover_agent_runtime(operation, error):
                     continue
                 if attempt > 0:
@@ -2009,18 +2400,41 @@ async def main(agent_manager: Any = None):
         s = str(uid)
         return "****" if len(s) <= 4 else "*" * (len(s) - 4) + s[-4:]
 
-    def _kill_process_by_handle(handle):
+    def _kill_process_by_handle(handle, runtime_binding=None) -> bool:
         """Terminate the OS process behind a window handle."""
         try:
-            wizlaunch.kill_instance(handle)
+            return bool(
+                wizlaunch.kill_instance(
+                    handle,
+                    _runtime_binding=runtime_binding,
+                )
+            )
         except Exception as e:
             logger.error(f"Failed to kill process for handle {handle}: {e}")
+            return False
+
+    def _command_generation_still_current(generation: object) -> bool:
+        if agent_manager is None:
+            return True
+        try:
+            walker.require_agent_generation(generation)
+        except Exception:
+            logger.warning(
+                "Discarded a GUI command continuation from a retired helper generation."
+            )
+            return False
+        return True
 
     def _build_hooked_clients_info():
+        runtime_binding = (
+            walker.bind_agent_manager(walker.agent_generation_token)
+            if agent_manager is not None
+            else None
+        )
         # Prune stale entries for handles whose windows no longer exist
         listing_available = True
         try:
-            all_handles = set(get_all_wizard_handles())
+            all_handles = set(get_all_wizard_handles(runtime_binding))
         except Exception as error:
             listing_available = False
             _log_native_failure(
@@ -2065,7 +2479,10 @@ async def main(agent_manager: Any = None):
             if not nick:
                 gid = getattr(c, "player_gid", None)
                 if gid:
-                    vault_nick = wizlaunch.get_nickname_by_gid(gid)
+                    vault_nick = wizlaunch.get_nickname_by_gid(
+                        gid,
+                        _runtime_binding=runtime_binding,
+                    )
                     if vault_nick:
                         managed_accounts.add(vault_nick)
         # Unmanaged = running wizard handles not currently managed
@@ -2093,8 +2510,196 @@ async def main(agent_manager: Any = None):
             )
         )
 
+    async def _handle_hook_heartbeat_failure(client, failure):
+        """Fail closed on one native hook lease without starting retry storms."""
+        global bot_task, flythrough_task, highlight_task, entity_stream_task
+        global combat_task, dialogue_task, sigil_task, questing_task
+        global speed_task, auto_pet_task
+        global questing_status, questing_restarting, questing_generation
+        global auto_pet_status, sigil_status, auto_potion_status
+        global speed_status, combat_status, dialogue_status, drops_disabled_status
+        global freecam_status
+        nonlocal foreground_client, background_clients, _client_runtime_epoch
+
+        if agent_manager is None or not tool_status:
+            return
+        disposition = classify_hook_heartbeat_failure(failure)
+        scope = getattr(failure, "scope", "native")
+        if disposition == "helper":
+            await _recover_agent_runtime(f"{scope} hook heartbeat", failure.cause)
+            return
+
+        try:
+            identity = _client_identity(client)
+        except Exception:
+            identity = getattr(client, "client_id", getattr(client, "process_id", "unknown"))
+        if client not in walker.cleanup_clients:
+            return
+
+        title = _safe_client_title(client, live=False)
+        logger.warning(
+            f"Retiring client {title!r} ({identity}) after a {scope} hook "
+            f"heartbeat failure ({disposition}): {format_error_diagnostics(failure)}"
+        )
+        _failed_hook_handles.add(identity)
+        if disposition == "process_terminal":
+            _terminal_hook_failure_handles.add(identity)
+        # Hide the failed object immediately. release_client retains it as a
+        # cleanup owner and quarantines its exact process identity.
+        client.retain_cleanup_blocker("hook_task_drain")
+        walker.release_client(client)
+        pending_hook = _hooking_tasks.pop(identity, None)
+        snapshot_task_names = (
+            "anti_afk_loop",
+            "is_client_in_combat_loop",
+            "entity_detect_combat_loop",
+            "potion_usage_loop",
+            "drop_logging_loop",
+            "zone_check_loop",
+            "anti_afk_questing_loop",
+        )
+        snapshot_tasks = [
+            all_tasks.get(name)
+            for name in snapshot_task_names
+            if task_is_active(all_tasks.get(name))
+        ]
+        hook_dependent_tasks = [
+            pending_hook,
+            *_client_generation_tasks,
+            combat_task,
+            dialogue_task,
+            sigil_task,
+            questing_task,
+            speed_task,
+            auto_pet_task,
+            bot_task,
+            flythrough_task,
+            highlight_task,
+            entity_stream_task,
+        ]
+        owned_tasks = tuple(
+            dict.fromkeys(
+                task
+                for task in (
+                    *hook_dependent_tasks,
+                    *snapshot_tasks,
+                    *(
+                        retained_task
+                        for pending_tasks in _pending_hook_failure_tasks.values()
+                        for retained_task in pending_tasks
+                    ),
+                )
+                if task is not None
+            )
+        )
+        _pending_hook_failure_tasks[identity] = owned_tasks
+        if snapshot_tasks:
+            _pending_hook_snapshot_restarts.add(identity)
+        drained = await try_drain_tasks(owned_tasks)
+        _client_generation_tasks.clear()
+        combat_task = dialogue_task = sigil_task = questing_task = None
+        speed_task = auto_pet_task = bot_task = flythrough_task = None
+        highlight_task = entity_stream_task = None
+        questing_status = False
+        questing_restarting = False
+        questing_generation += 1
+        auto_pet_status = sigil_status = auto_potion_status = False
+        drops_disabled_status = False
+        speed_status = False
+        combat_status = dialogue_status = freecam_status = False
+        _client_runtime_epoch += 1
+
+        retired_foreground = foreground_client is client
+        if retired_foreground:
+            foreground_client = None
+        background_clients = [
+            candidate for candidate in background_clients if candidate is not client
+        ]
+        _hooking_in_progress.discard(identity)
+
+        if drained:
+            _pending_hook_failure_tasks.pop(identity, None)
+            client.release_cleanup_blocker("hook_task_drain")
+            if _pending_hook_snapshot_restarts:
+                _pending_hook_snapshot_restarts.clear()
+                _restart_always_on_tasks()
+            try:
+                if disposition == "process_terminal":
+                    await client_resizing_manager.forget_terminated_client(identity)
+                    await client.close()
+                    walker.release_client(client)
+                else:
+                    await rollback_failed_manual_activation(
+                        walker,
+                        client_resizing_manager,
+                        client,
+                        identity,
+                    )
+            except Exception as cleanup_error:
+                _log_native_failure(
+                    f"Hook-heartbeat cleanup remains quarantined for client {identity}",
+                    cleanup_error,
+                )
+            else:
+                _failed_hook_handles.discard(identity)
+                _terminal_hook_failure_handles.discard(identity)
+        else:
+            logger.error(
+                "Hook-heartbeat cleanup for client {} is waiting for canceled "
+                "hook-dependent work to exit; native hook/session ownership remains "
+                "quarantined.",
+                identity,
+            )
+
+        ui_resets = [
+            ("FreecamStatus", "Disabled"),
+            ("CombatStatus", "Disabled"),
+            ("DialogueStatus", "Disabled"),
+            ("SigilStatus", "Disabled"),
+            ("QuestingStatus", "Disabled"),
+            ("Auto PetStatus", "Disabled"),
+            ("Auto PotionStatus", "Disabled"),
+            ("SpeedhackStatus", "Disabled"),
+            ("FlythroughStatus", "Disabled"),
+            ("No DropsStatus", "Disabled"),
+        ]
+        if retired_foreground:
+            ui_resets[:0] = [
+                ("Title", "Client: None"),
+                ("Zone", "Zone: "),
+                ("xyz", "Position (XYZ): "),
+                ("pry", "Orientation (PRY): "),
+            ]
+        for tag, value in ui_resets:
+            gui_send_queue.put(
+                deimosgui.GUICommand(
+                    deimosgui.GUICommandType.UpdateWindow,
+                    (tag, value),
+                )
+            )
+        gui_send_queue.put(
+            deimosgui.GUICommand(
+                deimosgui.GUICommandType.UpdateEntityListData,
+                [],
+            )
+        )
+        gui_send_queue.put(
+            deimosgui.GUICommand(
+                deimosgui.GUICommandType.UpdateHighlightBox,
+                None,
+            )
+        )
+        _send_hooked_clients_update()
+
+    walker.set_hook_heartbeat_failure_handler(_handle_hook_heartbeat_failure)
+
     async def _init_client_attrs(client):
         """Initialize all per-client attributes. Called once per client after hooking."""
+        runtime_binding = (
+            walker.bind_agent_manager(walker.agent_generation_token)
+            if agent_manager is not None
+            else None
+        )
         _safe_client_title(client)
         client_speeds[client.process_id] = await client.client_object.speed_multiplier()
         client.combat_status = False
@@ -2132,13 +2737,20 @@ async def main(agent_manager: Any = None):
             )
             if uid and uid != 0:
                 client.player_gid = uid
-                vault_nick = wizlaunch.get_nickname_by_gid(uid)
+                vault_nick = wizlaunch.get_nickname_by_gid(
+                    uid,
+                    _runtime_binding=runtime_binding,
+                )
                 identity = _client_identity(client)
                 if vault_nick and identity not in launched_account_map:
                     launched_account_map[identity] = vault_nick
                 nick = launched_account_map.get(identity)
                 if nick:
-                    wizlaunch.update_player_gid(nick, uid)
+                    wizlaunch.update_player_gid(
+                        nick,
+                        uid,
+                        _runtime_binding=runtime_binding,
+                    )
                     logger.debug(
                         f"[GID] Saved user_id {_mask_uid(uid)} for vault account '{nick}'"
                     )
@@ -2159,19 +2771,31 @@ async def main(agent_manager: Any = None):
             global questing_leader_pid
             questing_leader_pid = client.process_id
 
-    async def _release_failed_auto_hook(client, handle) -> bool:
+    async def _release_failed_auto_hook(
+        client,
+        handle,
+        primary_error: BaseException | None = None,
+    ) -> bool:
         if client is None:
             return True
         try:
-            await client.close()
-        except Exception as cleanup_error:
+            await rollback_failed_manual_activation(
+                walker,
+                client_resizing_manager,
+                client,
+                handle,
+                primary_error=primary_error,
+            )
+        except BaseException as cleanup_error:
             _failed_hook_handles.add(handle)
             _log_native_failure(
                 f"Failed to clean up auto-hook attempt for client {handle}",
                 cleanup_error,
             )
+            if not isinstance(cleanup_error, Exception):
+                raise
             return False
-        walker.release_client(client)
+        _failed_hook_handles.discard(handle)
         return True
 
     async def _auto_hook_client(nc, handle):
@@ -2195,7 +2819,7 @@ async def main(agent_manager: Any = None):
             _restart_always_on_tasks()
             await _restart_active_toggle_tasks()
         except AutoHookClientNotReady as error:
-            cleaned = await _release_failed_auto_hook(nc, handle)
+            cleaned = await _release_failed_auto_hook(nc, handle, error)
             if cleaned:
                 delay = _auto_hook_retries.defer(handle)
                 logger.debug(
@@ -2204,13 +2828,13 @@ async def main(agent_manager: Any = None):
                 )
             else:
                 _auto_hook_retries.clear(handle)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             # Window closed before its wizard was selected — roll back registration
             # so the handle is clean (re-detected fresh if the window reappears).
-            await _release_failed_auto_hook(nc, handle)
+            await _release_failed_auto_hook(nc, handle, cancellation)
             raise
         except Exception as error:
-            cleaned = await _release_failed_auto_hook(nc, handle)
+            cleaned = await _release_failed_auto_hook(nc, handle, error)
             if cleaned:
                 decision = _auto_hook_retries.record_failure(handle)
                 if decision.retry:
@@ -2294,11 +2918,23 @@ async def main(agent_manager: Any = None):
     async def handle_controls():
         while True:
             try:
-                command = control_queue.get_nowait()
+                envelope = control_queue.get_nowait()
             except queue.Empty:
                 await asyncio.sleep(0.05)
                 continue
 
+            command = envelope.command
+            if agent_manager is not None and not generation_command_is_current(
+                envelope,
+                walker.agent_generation_token,
+                recovery_ready=_recovery_coordinator.ready,
+                generation_agnostic=command.com_type
+                in {
+                    deimosgui.GUICommandType.Close,
+                    deimosgui.GUICommandType.AttemptedClose,
+                },
+            ):
+                continue
             match command.com_type:
                 case (
                     deimosgui.GUICommandType.Close
@@ -2306,14 +2942,32 @@ async def main(agent_manager: Any = None):
                 ):
                     _write_lifecycle_event("backend received priority close request")
                     raise deimosgui.ToolClosedException
-                case deimosgui.GUICommandType.ToggleOption:
-                    await _handle_toggle_option(command.data)
-                case deimosgui.GUICommandType.KillFlythrough:
-                    await _stop_flythrough()
-                case deimosgui.GUICommandType.KillBot:
-                    _stop_bot()
-                case _:
-                    recv_queue.put(command)
+
+            async def dispatch_generation_control():
+                match command.com_type:
+                    case deimosgui.GUICommandType.ToggleOption:
+                        await _handle_toggle_option(command.data)
+                    case deimosgui.GUICommandType.KillFlythrough:
+                        await _stop_flythrough()
+                    case deimosgui.GUICommandType.KillBot:
+                        _stop_bot()
+                    case _:
+                        recv_queue.put(command)
+
+            dispatch_task = _start_client_generation_task(
+                dispatch_generation_control()
+            )
+            try:
+                await await_generation_control_dispatch(dispatch_task)
+            except Exception as error:
+                # A generation fence failure is expected when recovery retires
+                # an already-dequeued command.  Contain every dispatch failure
+                # so the persistent control consumer can process the next epoch.
+                _log_native_failure(
+                    "GUI control command failed",
+                    error,
+                    warning=True,
+                )
 
     async def handle_gui():
 
@@ -2538,15 +3192,81 @@ async def main(agent_manager: Any = None):
         current_rotation = None
 
         # Pause/resume state for client disconnect resilience
-        paused_task_names = None
-        previous_client_count = None
+        generation_state = reset_generation_runtime_state(
+            window_config_applied,
+            launching_status,
+            _client_runtime_epoch,
+        )
+        paused_task_names = generation_state.paused_task_names
+        previous_client_count = generation_state.previous_client_count
         # Track total wizard handle count to detect when unmanaged clients appear/disappear
-        last_known_handle_count = 0
+        last_known_handle_count = generation_state.last_known_handle_count
         # Zone whose collision caches we've kicked off a background pre-warm for, so the
         # first teleport (after hooking or a zone change) isn't stuck building them.
-        last_prewarm_zone = None
+        last_prewarm_zone = generation_state.last_prewarm_zone
+        observed_runtime_epoch = generation_state.epoch
 
         while True:
+            if observed_runtime_epoch != _client_runtime_epoch:
+                generation_state = reset_generation_runtime_state(
+                    window_config_applied,
+                    launching_status,
+                    _client_runtime_epoch,
+                )
+                paused_task_names = generation_state.paused_task_names
+                previous_client_count = generation_state.previous_client_count
+                last_known_handle_count = generation_state.last_known_handle_count
+                last_prewarm_zone = generation_state.last_prewarm_zone
+                observed_runtime_epoch = generation_state.epoch
+            try:
+                await walker.retry_retired_cleanup()
+            except Exception as cleanup_error:
+                logger.debug(
+                    "Native retired-client cleanup is still pending: {}",
+                    format_error_diagnostics(cleanup_error),
+                )
+            for failed_client in walker.cleanup_clients:
+                failed_identity = _client_identity(failed_client)
+                manual_cleanup = failed_identity in _failed_manual_hook_handles
+                if not manual_cleanup and failed_identity not in _failed_hook_handles:
+                    continue
+                pending_tasks = _pending_hook_failure_tasks.get(failed_identity)
+                if pending_tasks is not None:
+                    if not await try_drain_tasks(pending_tasks):
+                        continue
+                    _pending_hook_failure_tasks.pop(failed_identity, None)
+                    failed_client.release_cleanup_blocker("hook_task_drain")
+                    if _pending_hook_snapshot_restarts:
+                        _pending_hook_snapshot_restarts.clear()
+                        _restart_always_on_tasks()
+                try:
+                    if failed_identity in _terminal_hook_failure_handles:
+                        await client_resizing_manager.forget_terminated_client(
+                            failed_identity
+                        )
+                        await failed_client.close()
+                        walker.release_client(failed_client)
+                    else:
+                        await rollback_failed_manual_activation(
+                            walker,
+                            client_resizing_manager,
+                            failed_client,
+                            failed_identity,
+                        )
+                except Exception as cleanup_error:
+                    logger.debug(
+                        "Hook cleanup still pending for client {}: {}",
+                        failed_identity,
+                        format_error_diagnostics(cleanup_error),
+                    )
+                else:
+                    _failed_manual_hook_handles.discard(failed_identity)
+                    _failed_hook_handles.discard(failed_identity)
+                    _terminal_hook_failure_handles.discard(failed_identity)
+                    if manual_cleanup:
+                        released_handles.add(failed_identity)
+                    _send_hooked_clients_update()
+
             if walker.clients and foreground_client:
                 try:
                     current_zone = await foreground_client.zone_name()
@@ -2556,7 +3276,9 @@ async def main(agent_manager: Any = None):
                             # in the background now, during the loading screen / idle time, so
                             # the first collision teleport there is instant. Fire-and-forget.
                             last_prewarm_zone = current_zone
-                            asyncio.create_task(prewarm_zone(foreground_client, current_zone))
+                            _start_client_generation_task(
+                                prewarm_zone(foreground_client, current_zone)
+                            )
                         if await foreground_client.game_client.is_freecam():
                             camera = await foreground_client.game_client.free_camera_controller()
                             current_pos = await camera.position()
@@ -2638,9 +3360,18 @@ async def main(agent_manager: Any = None):
                             identity = _client_identity(c)
                             launched_account_map.pop(identity, None)
                             _hooking_in_progress.discard(identity)
-                            logger.info(
-                                f"Client '{_safe_client_title(c, live=False)}' disconnected."
-                            )
+                            if (
+                                identity in _failed_manual_hook_handles
+                                or identity in _failed_hook_handles
+                            ):
+                                logger.warning(
+                                    "Client {} is hidden while its hook cleanup remains pending.",
+                                    identity,
+                                )
+                            else:
+                                logger.info(
+                                    f"Client '{_safe_client_title(c, live=False)}' disconnected."
+                                )
                         _send_hooked_clients_update()
 
                         # Record which tasks were active, then cancel them all
@@ -2757,7 +3488,13 @@ async def main(agent_manager: Any = None):
 
             # Continuous detection — only auto-hook vault-launched clients
             if initial_setup_complete and not paused_task_names:
+                discovery_epoch = _client_runtime_epoch
                 all_handles = await _get_all_wizard_handles("client discovery")
+                if discovery_epoch != _client_runtime_epoch:
+                    # Recovery can retry discovery against the replacement
+                    # helper. Restart the loop first so every persistent local
+                    # is reset before any B client is managed or hooked.
+                    continue
                 if all_handles is None:
                     await asyncio.sleep(0.5)
                     continue
@@ -2784,6 +3521,7 @@ async def main(agent_manager: Any = None):
                 for handle in launch_order:
                     if handle in _hooking_tasks:
                         continue  # already waiting on this handle's hooks
+                    client_resizing_manager.resume_client(handle)
                     nc = walker.manage_client(handle)
                     existing_nums = set()
                     for c in walker.clients:
@@ -2804,7 +3542,7 @@ async def main(agent_manager: Any = None):
                     _wc_nick = launched_account_map.get(handle)
                     if client_resizing and _wc_nick and handle not in window_config_applied:
                         window_config_applied.add(handle)
-                        asyncio.create_task(
+                        _start_client_generation_task(
                             _apply_account_window_config(nc, handle, _wc_nick)
                         )
                     _hooking_tasks[handle] = asyncio.create_task(
@@ -2900,7 +3638,35 @@ async def main(agent_manager: Any = None):
             try:
                 # Eat as much as the queue gives us. We will be freed by exception
                 while True:
-                    com = recv_queue.get_nowait()
+                    envelope = recv_queue.get_nowait()
+                    com = envelope.command
+                    generation_agnostic = com.com_type in {
+                        deimosgui.GUICommandType.Close,
+                        deimosgui.GUICommandType.AttemptedClose,
+                        deimosgui.GUICommandType.CheckForUpdates,
+                        deimosgui.GUICommandType.ApplyUpdate,
+                        deimosgui.GUICommandType.UpdateSettings,
+                    }
+                    if agent_manager is not None and not generation_command_is_current(
+                        envelope,
+                        walker.agent_generation_token,
+                        recovery_ready=_recovery_coordinator.ready,
+                        generation_agnostic=generation_agnostic,
+                    ):
+                        logger.warning(
+                            "Discarded a GUI command queued for a retired helper generation."
+                        )
+                        continue
+                    command_generation = (
+                        envelope.generation
+                        if agent_manager is not None
+                        else None
+                    )
+                    command_runtime = (
+                        walker.bind_agent_manager(command_generation)
+                        if agent_manager is not None
+                        else None
+                    )
                     match com.com_type:
                         case deimosgui.GUICommandType.Close:
                             if len(walker.clients) != 0:
@@ -3922,7 +4688,7 @@ async def main(agent_manager: Any = None):
                                     )
                                 )
 
-                            asyncio.create_task(_search_bots())
+                            _start_client_generation_task(_search_bots())
                         case deimosgui.GUICommandType.ImportSearchedBot:
                             bot_path, run_after_import = com.data
 
@@ -3942,14 +4708,15 @@ async def main(agent_manager: Any = None):
                                 )
                                 if run:
                                     # Reuse the existing bot runner by re-enqueueing as a normal ExecuteBot command
-                                    recv_queue.put(
+                                    recv_queue.put_for_generation(
                                         deimosgui.GUICommand(
                                             deimosgui.GUICommandType.ExecuteBot,
                                             bot_text,
-                                        )
+                                        ),
+                                        command_generation,
                                     )
 
-                            asyncio.create_task(
+                            _start_client_generation_task(
                                 _import_searched_bot(bot_path, run_after_import)
                             )
                         case deimosgui.GUICommandType.PrepareBotPublish:
@@ -4012,7 +4779,7 @@ async def main(agent_manager: Any = None):
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    build_account_list_payload(),
+                                    build_account_list_payload(command_runtime),
                                 )
                             )
 
@@ -4020,8 +4787,14 @@ async def main(agent_manager: Any = None):
                             nickname, steam = com.data
                             try:
                                 await asyncio.to_thread(
-                                    wizlaunch.prompt_save_account, nickname
+                                    wizlaunch.prompt_save_account,
+                                    nickname,
+                                    _runtime_binding=command_runtime,
                                 )
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
                                 # Persist the per-account Steam-mode choice so the
                                 # entry is fully configured (and validates clean).
                                 wizlaunch.set_account_steam(nickname, bool(steam))
@@ -4031,7 +4804,7 @@ async def main(agent_manager: Any = None):
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    build_account_list_payload(),
+                                    build_account_list_payload(command_runtime),
                                 )
                             )
 
@@ -4042,7 +4815,7 @@ async def main(agent_manager: Any = None):
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    build_account_list_payload(),
+                                    build_account_list_payload(command_runtime),
                                 )
                             )
 
@@ -4052,7 +4825,7 @@ async def main(agent_manager: Any = None):
                             gui_send_queue.put(
                                 deimosgui.GUICommand(
                                     deimosgui.GUICommandType.UpdateAccountList,
-                                    build_account_list_payload(),
+                                    build_account_list_payload(command_runtime),
                                 )
                             )
 
@@ -4076,11 +4849,15 @@ async def main(agent_manager: Any = None):
                                 _auto_hook_retries.clear_all()
                                 if agent_manager is not None:
                                     response = await asyncio.to_thread(
-                                        agent_manager.launch_game,
+                                        command_runtime.launch_game,
                                         game_path,
                                         "login.us.wizard101.com:12000",
                                         30,
                                     )
+                                    if not _command_generation_still_current(
+                                        command_generation
+                                    ):
+                                        continue
                                     client = response.get("client", {})
                                     logger.info(
                                         "Launched Wizard101 client "
@@ -4100,7 +4877,10 @@ async def main(agent_manager: Any = None):
                             for c in walker.clients:
                                 gid = getattr(c, "player_gid", None)
                                 if gid:
-                                    vault_nick = wizlaunch.get_nickname_by_gid(gid)
+                                    vault_nick = wizlaunch.get_nickname_by_gid(
+                                        gid,
+                                        _runtime_binding=command_runtime,
+                                    )
                                     if vault_nick:
                                         already_managed.add(vault_nick)
                             nicknames = [
@@ -4169,6 +4949,7 @@ async def main(agent_manager: Any = None):
                                         launching_status[n] = "launching"
                                 _send_hooked_clients_update()
                             results = {}
+                            launch_command_current = True
                             _t_launch = time.time()
                             logger.info(
                                 f"launch_instances (wizlaunch v{getattr(wizlaunch, '__version__', '?')}): "
@@ -4176,8 +4957,16 @@ async def main(agent_manager: Any = None):
                             )
                             try:
                                 results = await asyncio.to_thread(
-                                    wizlaunch.launch_instances, nicknames, game_path
+                                    wizlaunch.launch_instances,
+                                    nicknames,
+                                    game_path,
+                                    _runtime_binding=command_runtime,
                                 )
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    launch_command_current = False
+                                    continue
                                 for nickname, handle in results.items():
                                     launched_account_map[handle] = nickname
                                     logger.info(f"Launched and logged in '{nickname}'.")
@@ -4192,15 +4981,19 @@ async def main(agent_manager: Any = None):
                                 # their client hooks (auto-cleared in _build_hooked_clients_info).
                                 # Drop placeholders for any that never got a handle so they don't
                                 # linger as a stuck spinner.
-                                launched = set(results)
-                                for n in nicknames:
-                                    if n not in launched:
-                                        launching_status.pop(n, None)
-                                if nicknames:
-                                    _send_hooked_clients_update()
+                                if launch_command_current:
+                                    launched = set(results)
+                                    for n in nicknames:
+                                        if n not in launched:
+                                            launching_status.pop(n, None)
+                                    if nicknames:
+                                        _send_hooked_clients_update()
 
                         case deimosgui.GUICommandType.ReorderAccounts:
-                            wizlaunch.reorder_accounts(com.data)
+                            wizlaunch.reorder_accounts(
+                                com.data,
+                                _runtime_binding=command_runtime,
+                            )
 
                         case deimosgui.GUICommandType.ReorderClients:
                             handles = com.data
@@ -4222,31 +5015,43 @@ async def main(agent_manager: Any = None):
 
                         case deimosgui.GUICommandType.UnhookClient:
                             handle = com.data
+                            unhook_command_current = True
                             for c in walker.clients[:]:
                                 if _client_identity(c) == handle:
-                                    # Stop managing the handle BEFORE tearing down so
-                                    # the resizing tick loop can't re-arm hooks during
-                                    # the teardown/close awaits.
-                                    released_handles.add(handle)
-                                    walker.release_client(c)
-                                    # Restore the in-process resolution/resize asm
-                                    # hooks while the client is still alive — close()
-                                    # rewrites the hook codecave, so leaving these
-                                    # jumps patched into the game = dangling jump =
-                                    # crash. Must happen before c.close().
-                                    try:
-                                        await client_resizing_manager.teardown_client(handle)
-                                    except Exception as e:
-                                        logger.opt(exception=e).debug(
-                                            f"resize teardown failed for {handle}"
-                                        )
                                     try:
                                         c.title = "Wizard101"
-                                        await c.close()
                                     except Exception:
                                         pass
-                                    logger.info(f"Unhooked client (handle {handle}).")
+                                    try:
+                                        await rollback_failed_manual_activation(
+                                            walker,
+                                            client_resizing_manager,
+                                            c,
+                                            handle,
+                                        )
+                                    except Exception as error:
+                                        if not _command_generation_still_current(
+                                            command_generation
+                                        ):
+                                            unhook_command_current = False
+                                            break
+                                        _failed_manual_hook_handles.add(handle)
+                                        _log_native_failure(
+                                            f"Could not safely unhook client {handle}",
+                                            error,
+                                        )
+                                    else:
+                                        if not _command_generation_still_current(
+                                            command_generation
+                                        ):
+                                            unhook_command_current = False
+                                            break
+                                        released_handles.add(handle)
+                                        _failed_manual_hook_handles.discard(handle)
+                                        logger.info(f"Unhooked client (handle {handle}).")
                                     break
+                            if not unhook_command_current:
+                                continue
                             _send_hooked_clients_update()
                             if walker.clients:
                                 _restart_always_on_tasks()
@@ -4264,13 +5069,17 @@ async def main(agent_manager: Any = None):
                                 )
                                 _send_hooked_clients_update()
                                 continue
-                            all_handles = get_all_wizard_handles()
+                            all_handles = get_all_wizard_handles(command_runtime)
                             if handle not in all_handles:
                                 logger.error(f"Handle {handle} no longer exists.")
                                 _send_hooked_clients_update()
                                 continue
                             # Create client, assign title, hook, init
-                            nc = walker.manage_client(handle)
+                            client_resizing_manager.resume_client(handle)
+                            nc = walker.manage_client(
+                                handle,
+                                expected_instance_id=command_generation,
+                            )
                             existing_nums = set()
                             for c in walker.clients:
                                 if c.title.startswith("p") and c.title[1:].isdigit():
@@ -4283,20 +5092,67 @@ async def main(agent_manager: Any = None):
                             _send_hooked_clients_update()
                             try:
                                 await nc.activate_hooks()
+                                if command_generation is not None:
+                                    walker.require_agent_generation(command_generation)
                                 await _init_client_attrs(nc)
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
                                 logger.info(
                                     f"Manually hooked client '{nc.title}' (handle {handle})."
                                 )
                             except wizwalker.errors.HookAlreadyActivated:
+                                if command_generation is not None:
+                                    walker.require_agent_generation(command_generation)
                                 await _init_client_attrs(nc)
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
                                 logger.info(
                                     f"Manually hooked client '{nc.title}' (handle {handle}, already hooked)."
                                 )
-                            except Exception as e:
-                                logger.error(
-                                    f"Failed to hook client (handle {handle}): {e}"
+                            except asyncio.CancelledError as cancellation:
+                                released_handles.add(handle)
+                                _failed_manual_hook_handles.add(handle)
+                                await rollback_failed_manual_activation(
+                                    walker,
+                                    client_resizing_manager,
+                                    nc,
+                                    handle,
+                                    primary_error=cancellation,
                                 )
-                                walker.release_client(nc)
+                                _failed_manual_hook_handles.discard(handle)
+                                _hooking_in_progress.discard(handle)
+                                _send_hooked_clients_update()
+                                raise
+                            except Exception as e:
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
+                                released_handles.add(handle)
+                                _failed_manual_hook_handles.add(handle)
+                                try:
+                                    await rollback_failed_manual_activation(
+                                        walker,
+                                        client_resizing_manager,
+                                        nc,
+                                        handle,
+                                        primary_error=e,
+                                    )
+                                except Exception as activation_error:
+                                    _log_native_failure(
+                                        f"Failed to hook and clean up client {handle}",
+                                        activation_error,
+                                    )
+                                else:
+                                    _failed_manual_hook_handles.discard(handle)
+                                    _log_native_failure(
+                                        f"Failed to hook client {handle}",
+                                        e,
+                                    )
                                 _hooking_in_progress.discard(handle)
                                 _send_hooked_clients_update()
                                 continue
@@ -4307,30 +5163,49 @@ async def main(agent_manager: Any = None):
 
                         case deimosgui.GUICommandType.KillClient:
                             handle = com.data
-                            # If handle belongs to a hooked client, unhook first
+                            managed_client = None
                             for c in walker.clients[:]:
                                 if _client_identity(c) == handle:
-                                    walker.release_client(c)
-                                    # Restore resolution/resize asm hooks before
-                                    # close() clears the codecave (dangling jump =
-                                    # crash, even briefly before the process dies).
-                                    try:
-                                        await client_resizing_manager.teardown_client(handle)
-                                    except Exception as e:
-                                        logger.opt(exception=e).debug(
-                                            f"resize teardown failed for {handle}"
-                                        )
+                                    managed_client = c
                                     try:
                                         c.title = "Wizard101"
-                                        await c.close()
                                     except Exception:
                                         pass
-                                    launched_account_map.pop(handle, None)
+                                    try:
+                                        await rollback_failed_manual_activation(
+                                            walker,
+                                            client_resizing_manager,
+                                            c,
+                                            handle,
+                                        )
+                                    except Exception as error:
+                                        if not _command_generation_still_current(
+                                            command_generation
+                                        ):
+                                            break
+                                        _failed_manual_hook_handles.add(handle)
+                                        _log_native_failure(
+                                            f"Client {handle} could not be safely closed before termination",
+                                            error,
+                                        )
                                     break
-                            # Terminate the OS process
-                            _kill_process_by_handle(handle)
-                            released_handles.discard(handle)
-                            logger.info(f"Killed client (handle {handle}).")
+                            if not _command_generation_still_current(
+                                command_generation
+                            ):
+                                continue
+                            killed = _kill_process_by_handle(handle, command_runtime)
+                            if killed:
+                                if managed_client in walker.clients:
+                                    walker.release_client(managed_client)
+                                await client_resizing_manager.forget_terminated_client(handle)
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
+                                launched_account_map.pop(handle, None)
+                                _failed_manual_hook_handles.discard(handle)
+                                released_handles.discard(handle)
+                                logger.info(f"Killed client (handle {handle}).")
                             _send_hooked_clients_update()
                             if walker.clients:
                                 _restart_always_on_tasks()
@@ -4338,50 +5213,81 @@ async def main(agent_manager: Any = None):
 
                         case deimosgui.GUICommandType.RelaunchClient:
                             handle, nickname = com.data
-                            # Unhook the hooked client
+                            managed_client = None
                             for c in walker.clients[:]:
                                 if _client_identity(c) == handle:
-                                    walker.release_client(c)
-                                    # Restore resolution/resize asm hooks before
-                                    # close() clears the codecave (dangling jump =
-                                    # crash, even briefly before the process dies).
-                                    try:
-                                        await client_resizing_manager.teardown_client(handle)
-                                    except Exception as e:
-                                        logger.opt(exception=e).debug(
-                                            f"resize teardown failed for {handle}"
-                                        )
+                                    managed_client = c
                                     try:
                                         c.title = "Wizard101"
-                                        await c.close()
                                     except Exception:
                                         pass
-                                    launched_account_map.pop(handle, None)
+                                    try:
+                                        await rollback_failed_manual_activation(
+                                            walker,
+                                            client_resizing_manager,
+                                            c,
+                                            handle,
+                                        )
+                                    except Exception as error:
+                                        if not _command_generation_still_current(
+                                            command_generation
+                                        ):
+                                            break
+                                        _failed_manual_hook_handles.add(handle)
+                                        _log_native_failure(
+                                            f"Client {handle} could not be safely closed before relaunch",
+                                            error,
+                                        )
                                     break
-                            # Kill the process
-                            _kill_process_by_handle(handle)
-                            released_handles.discard(handle)
-                            logger.info(
-                                f"Killed client for relaunch (handle {handle}, account '{nickname}')."
-                            )
+                            if not _command_generation_still_current(
+                                command_generation
+                            ):
+                                continue
+                            killed = _kill_process_by_handle(handle, command_runtime)
+                            if killed:
+                                if managed_client in walker.clients:
+                                    walker.release_client(managed_client)
+                                await client_resizing_manager.forget_terminated_client(handle)
+                                if not _command_generation_still_current(
+                                    command_generation
+                                ):
+                                    continue
+                                launched_account_map.pop(handle, None)
+                                _failed_manual_hook_handles.discard(handle)
+                                released_handles.discard(handle)
+                                logger.info(
+                                    f"Killed client for relaunch (handle {handle}, account '{nickname}')."
+                                )
                             _send_hooked_clients_update()
                             # Relaunch via wizlaunch (credentials stay in Rust)
-                            try:
-                                if agent_manager is not None:
-                                    from src.macos_runtime import configured_game_path
-
-                                    game_path = configured_game_path(settings)
-                                else:
-                                    game_path = str(utils.get_wiz_install())
-                                await asyncio.sleep(1)
-                                new_handle = await asyncio.to_thread(
-                                    wizlaunch.launch_instance, nickname, game_path
+                            if not killed:
+                                logger.error(
+                                    f"Relaunch aborted because client {handle} could not be terminated."
                                 )
-                                launched_account_map[new_handle] = nickname
-                                logger.info(f"Relaunched and logged in '{nickname}'.")
-                                _send_hooked_clients_update()
-                            except Exception as e:
-                                logger.error(f"Error relaunching '{nickname}': {e}")
+                            else:
+                                try:
+                                    if agent_manager is not None:
+                                        from src.macos_runtime import configured_game_path
+
+                                        game_path = configured_game_path(settings)
+                                    else:
+                                        game_path = str(utils.get_wiz_install())
+                                    await asyncio.sleep(1)
+                                    new_handle = await asyncio.to_thread(
+                                        wizlaunch.launch_instance,
+                                        nickname,
+                                        game_path,
+                                        _runtime_binding=command_runtime,
+                                    )
+                                    if not _command_generation_still_current(
+                                        command_generation
+                                    ):
+                                        continue
+                                    launched_account_map[new_handle] = nickname
+                                    logger.info(f"Relaunched and logged in '{nickname}'.")
+                                    _send_hooked_clients_update()
+                                except Exception as e:
+                                    logger.error(f"Error relaunching '{nickname}': {e}")
                             if walker.clients:
                                 _restart_always_on_tasks()
                                 await _restart_active_toggle_tasks()
@@ -4774,8 +5680,6 @@ async def main(agent_manager: Any = None):
         await asyncio.gather(*[async_zone_check(p) for p in walker.clients])
 
     await asyncio.sleep(0)
-    global walker
-    walker = ClientHandler(agent_manager=agent_manager)
     # walker.clients = []
     global gui_task
     gui_task = asyncio.create_task(handle_gui())
@@ -4856,8 +5760,6 @@ async def main(agent_manager: Any = None):
         while not shutdown_event.is_set():
             await asyncio.sleep(0.1)
         raise deimosgui.ToolClosedException
-
-    all_tasks = {}
 
     # Names of always-on tasks that use walker.clients snapshots and must be
     # restarted when the client list changes.
@@ -5031,17 +5933,29 @@ async def main(agent_manager: Any = None):
                         task_name in RESILIENT_TASK_FUNCS
                         and not shutdown_event.is_set()
                     ):
-                        await asyncio.sleep(0.5)
-                        all_tasks[task_name] = asyncio.create_task(
-                            RESILIENT_TASK_FUNCS[task_name]()
+                        replacement = await restart_resilient_task(
+                            task_name,
+                            t,
+                            all_tasks,
+                            RESILIENT_TASK_FUNCS[task_name],
+                            _recovery_coordinator,
                         )
-                        logger.warning(
-                            f"Task '{task_name}' restarted after a transient failure."
-                        )
+                        if replacement is not None:
+                            logger.warning(
+                                f"Task '{task_name}' restarted after a transient failure."
+                            )
             if should_exit:
                 break
 
     finally:
+        recovery_drained = await _recovery_coordinator.shutdown(
+            timeout_seconds=5.0
+        )
+        if not recovery_drained:
+            logger.error(
+                "Timed out draining helper recovery during shutdown; skipping "
+                "manager.stop so it cannot race a delayed manager.start."
+            )
         for task in all_tasks.values():
             if task is not None and not task.cancelled():
                 task.cancel()
@@ -5059,7 +5973,22 @@ async def main(agent_manager: Any = None):
                 task.cancel()
 
         await tool_finish()
-        if agent_manager is not None:
+        native_drained = recovery_drained
+        if (
+            agent_manager is not None
+            and native_drained
+            and walker.generation_context is not None
+        ):
+            native_drained = await asyncio.to_thread(
+                walker.generation_context.close_for_shutdown,
+                5.0,
+            )
+            if not native_drained:
+                logger.error(
+                    "Timed out draining native helper operations during shutdown; "
+                    "skipping manager.stop and retaining the generation context."
+                )
+        if agent_manager is not None and native_drained:
             try:
                 await asyncio.to_thread(agent_manager.stop, "Deimos desktop closed")
             except Exception as error:
@@ -5068,6 +5997,9 @@ async def main(agent_manager: Any = None):
                 )
             finally:
                 wizlaunch.clear_runtime()
+                release_manager_generation_context(agent_manager)
+        elif agent_manager is not None:
+            wizlaunch.clear_runtime()
         # Signal GUI thread that unhooking is done so it can exit cleanly
         try:
             gui_send_queue.put(deimosgui.GUICommand(deimosgui.GUICommandType.Close))
@@ -5096,8 +6028,8 @@ if __name__ == "__main__":
 
     # Set up GUI queues before starting anything
     gui_send_queue = queue.Queue()
-    recv_queue = queue.Queue()
-    control_queue = queue.Queue()
+    recv_queue = GenerationTaggedQueue()
+    control_queue = GenerationTaggedQueue()
     shutdown_event = threading.Event()
     agent_manager = None
     runtime_error = None

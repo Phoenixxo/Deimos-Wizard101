@@ -257,6 +257,7 @@ class HotkeyListener:
         self._callbacks = {}
         self._last_triggered = {}
         self._callback_tasks = set()
+        self._callbacks_suspended = False
         self._message_loop_task = None
         self._connected = False
 
@@ -362,6 +363,40 @@ class HotkeyListener:
         if first_error is not None:
             raise first_error
 
+    async def cancel_pending_callbacks(self, *, timeout_seconds: float = 5.0):
+        """Drain callbacks without unregistering the configured hotkeys."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        current = asyncio.current_task()
+        callback_tasks = [
+            task
+            for task in self._callback_tasks
+            if task is not current and not task.done()
+        ]
+        for task in callback_tasks:
+            task.cancel()
+        if callback_tasks:
+            _, stubborn = await asyncio.wait(
+                callback_tasks,
+                timeout=timeout_seconds,
+            )
+            if stubborn:
+                error = RuntimeError(
+                    f"Timed out draining {len(stubborn)} hotkey callback(s)."
+                )
+                error.code = "generation_callback_drain_timeout"
+                error.operation = "agent.generation.callback_drain"
+                raise error
+        self._callback_tasks.difference_update(callback_tasks)
+
+    def suspend_callbacks(self):
+        """Drop new callback dispatches until the runtime is safe again."""
+        self._callbacks_suspended = True
+
+    def resume_callbacks(self):
+        """Allow registered callbacks to be dispatched again."""
+        self._callbacks_suspended = False
+
     async def _message_loop(self):
         while True:
             for chord, registration_id in list(self._hotkeys.items()):
@@ -383,6 +418,8 @@ class HotkeyListener:
             await asyncio.sleep(self.sleep_time)
 
     def _handle_hotkey(self, chord: tuple[int, int]):
+        if self._callbacks_suspended:
+            return
         task = asyncio.create_task(self._callbacks[chord]())
         self._callback_tasks.add(task)
         task.add_done_callback(self._callback_tasks.discard)

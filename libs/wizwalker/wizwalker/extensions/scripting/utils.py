@@ -29,8 +29,11 @@ async def paint_window_for(window, time: float = 2):
                 await window.debug_paint()
 
     paint_task = asyncio.create_task(_paint_task())
-    await asyncio.sleep(time)
-    paint_task.cancel()
+    try:
+        await asyncio.sleep(time)
+    finally:
+        paint_task.cancel()
+        await asyncio.gather(paint_task, return_exceptions=True)
 
 
 async def _maybe_get_named_window(parent, name: str, retries: int = 4):

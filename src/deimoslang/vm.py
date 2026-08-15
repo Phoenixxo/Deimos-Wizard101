@@ -1843,5 +1843,19 @@ class VM:
 
     async def run(self):
         self.running = True
-        while self.running:
-            await self.step()
+        try:
+            while self.running:
+                await self.step()
+        finally:
+            waitfor_tasks = tuple(
+                task.waitfor
+                for task in self._scheduler.tasks
+                if task.waitfor is not None and not task.waitfor.done()
+            )
+            for waitfor in waitfor_tasks:
+                waitfor.cancel()
+            if waitfor_tasks:
+                await asyncio.gather(*waitfor_tasks, return_exceptions=True)
+            for task in self._scheduler.tasks:
+                if task.waitfor is not None and task.waitfor.done():
+                    task.waitfor = None

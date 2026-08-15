@@ -144,6 +144,40 @@ class HotkeyAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(callback_count, 1)
         await listener.stop()
 
+    async def test_pending_callbacks_can_be_drained_without_losing_registrations(self):
+        callback_started = asyncio.Event()
+        callback_finished = False
+
+        async def callback():
+            nonlocal callback_finished
+            callback_started.set()
+            await asyncio.Event().wait()
+            callback_finished = True
+
+        listener = HotkeyListener()
+        await listener.add_hotkey(Keycode.F4, callback)
+        chord = (Keycode.F4.value, 0)
+        registration_id = listener._hotkeys[chord]
+
+        listener._handle_hotkey(chord)
+        await asyncio.wait_for(callback_started.wait(), timeout=0.25)
+        listener.suspend_callbacks()
+        await listener.cancel_pending_callbacks()
+        listener._handle_hotkey(chord)
+        await asyncio.sleep(0)
+
+        self.assertFalse(callback_finished)
+        self.assertFalse(listener._callback_tasks)
+        self.assertEqual(listener._hotkeys[chord], registration_id)
+        self.assertIs(listener._callbacks[chord], callback)
+        self.assertIn(registration_id, self.backend.registrations)
+        listener.resume_callbacks()
+        listener._handle_hotkey(chord)
+        await asyncio.sleep(0)
+        self.assertTrue(listener._callback_tasks)
+        await listener.cancel_pending_callbacks()
+        await listener.clear()
+
     async def test_conflict_is_structured_and_human_readable(self):
         first = HotkeyListener()
         second = HotkeyListener()

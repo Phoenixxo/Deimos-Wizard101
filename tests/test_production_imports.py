@@ -128,7 +128,7 @@ class ProductionImportTests(unittest.TestCase):
         self.assertIn("ctx.account_prompt(nick)", gui_source)
         self.assertIn("logger.info(", source)
         self.assertIn("Launching Wizard101 without automatic login...", source)
-        self.assertIn("agent_manager.launch_game", source)
+        self.assertIn("command_runtime.launch_game", source)
         self.assertIn("walker.start_wiz_client", source)
 
     def test_unsafe_agent_custom_teleport_is_contained(self):
