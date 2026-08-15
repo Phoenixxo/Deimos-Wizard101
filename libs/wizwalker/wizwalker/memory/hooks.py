@@ -8,6 +8,7 @@ import warnings
 
 from loguru import logger
 
+from wizwalker.errors import preserve_cleanup_errors
 from .memory_reader import MemoryReader
 from wizwalker.constants import kernel32
 
@@ -24,6 +25,7 @@ class MemoryHook(MemoryReader):
 
         self.jump_bytecode = None
         self.hook_bytecode = None
+        self._jump_write_started = False
 
         # so we can dealloc it on unhook
         self._allocated_addresses = []
@@ -48,7 +50,13 @@ class MemoryHook(MemoryReader):
         """
         Allocate <size> bytes
         """
-        addr = await self.allocate(size)
+        try:
+            addr = await self.allocate(size)
+        except asyncio.CancelledError as error:
+            addr = getattr(error, "settled_result", None)
+            if isinstance(addr, int) and not isinstance(addr, bool):
+                self._allocated_addresses.append(addr)
+            raise
         self._allocated_addresses.append(addr)
         return addr
 
@@ -118,21 +126,48 @@ class MemoryHook(MemoryReader):
         await self.prehook()
 
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
 
         await self.posthook()
+
+    async def _install_jump(self):
+        self._jump_write_started = True
+        await self.write_bytes(self.jump_address, self.jump_bytecode)
+
+    async def _restore_jump(self):
+        if not self._jump_write_started:
+            return
+        if self.jump_address is None or self.jump_original_bytecode is None:
+            raise RuntimeError("Cannot restore a hook without its original jump bytes")
+        logger.debug(
+            f"Writing original bytecode {self.jump_original_bytecode} to {self.jump_address}"
+        )
+        await self.write_bytes(self.jump_address, self.jump_original_bytecode)
+        self._jump_write_started = False
 
     async def unhook(self):
         """
         Deallocates hook memory and rewrites jump addr to it's original code,
         also called when a client is closed
         """
-        logger.debug(
-            f"Writing original bytecode {self.jump_original_bytecode} to {self.jump_address}"
-        )
-        await self.write_bytes(self.jump_address, self.jump_original_bytecode)
+        await self._restore_jump()
+        cleanup_errors = []
+        remaining_addresses = []
         for addr in self._allocated_addresses:
-            await self.free(addr)
+            try:
+                await self.free(addr)
+            except Exception as error:
+                remaining_addresses.append(addr)
+                cleanup_errors.append(error)
+        self._allocated_addresses = remaining_addresses
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation="hook allocation cleanup",
+            )
+            raise primary_error
 
 
 class AutoBotBaseHook(MemoryHook):
@@ -146,10 +181,7 @@ class AutoBotBaseHook(MemoryHook):
 
     # TODO: tell handler those bytes are free now?
     async def unhook(self):
-        logger.debug(
-            f"Writing original bytecode {self.jump_original_bytecode} to {self.jump_address}"
-        )
-        await self.write_bytes(self.jump_address, self.jump_original_bytecode)
+        await self._restore_jump()
 
 
 class SimpleHook(AutoBotBaseHook):
@@ -197,11 +229,30 @@ class SimpleHook(AutoBotBaseHook):
 
         return bytecode
 
+    async def _free_exports(self):
+        cleanup_errors = []
+        for export in self.exports:
+            name = export[0]
+            address = getattr(self, name, None)
+            if address:
+                try:
+                    await self.free(address)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                else:
+                    setattr(self, name, None)
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation="hook export cleanup",
+            )
+            raise primary_error
+
     async def unhook(self):
         await super().unhook()
-        for export in self.exports:
-            if getattr(self, export[0], None):
-                await self.free(getattr(self, export[0]))
+        await self._free_exports()
 
 
 class PlayerHook(SimpleHook):
@@ -498,40 +549,90 @@ class MovementTeleportHook(SimpleHook):
         await self.prehook()
 
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
 
         await self.posthook()
 
     async def unhook(self):
-        # with suppress(ExceptionalTimeout):
-        #     await maybe_wait_for_value_with_timeout(
-        #         self.hook_handler.client._teleport_helper.should_update,
-        #         value=False,
-        #         timeout=0.5,
-        #     )
+        # Waiting on TeleportHelper is only valid after both the target jump and
+        # its export have been published.  Construction can fail before either
+        # point, in which case the helper object deliberately reports inactive.
+        published_helper = self.hook_handler._base_addrs.get("teleport_helper")
+        if (
+            self._jump_write_started
+            and published_helper is not None
+            and published_helper == getattr(self, "teleport_helper", None)
+        ):
+            await self._wait_for_update_bool_unset_with_timeout()
 
-        # await wait_for_value(
-        #     self.hook_handler.client._teleport_helper.should_update,
-        #     False,
-        #     ignore_errors=False,
-        # )
+        # Stop execution from entering the codecave before restoring any of the
+        # auxiliary patches.  Do not free the export until every restoration is
+        # confirmed: a failed restoration must leave an exact, retryable owner.
+        await AutoBotBaseHook.unhook(self)
 
-        await self._wait_for_update_bool_unset_with_timeout()
+        cleanup_errors = []
+        jes = None
+        if (
+            self._old_jes_bytes is not None
+            or self._old_je_page_protection is not None
+        ):
+            try:
+                jes = (
+                    await self.hook_handler.client
+                    ._get_je_instruction_forward_backwards()
+                )
+            except Exception as error:
+                cleanup_errors.append(error)
 
-        await super().unhook()
+        if self._old_jes_bytes is not None and jes is not None:
+            restore_failed = False
+            for je, je_bytes in zip(jes, self._old_jes_bytes):
+                try:
+                    await self.hook_handler.write_bytes(je, je_bytes)
+                except Exception as error:
+                    restore_failed = True
+                    cleanup_errors.append(error)
+            if not restore_failed:
+                self._old_jes_bytes = None
 
-        if self._old_jes_bytes is None:
-            return
+        collision_addrs = self._collision_je_addrs
+        collision_bytes = self._old_collision_jes_bytes
+        if collision_addrs is not None and collision_bytes is not None:
+            restore_failed = False
+            for addr, old_bytes in zip(collision_addrs, collision_bytes):
+                try:
+                    await self.write_bytes(addr, old_bytes)
+                except Exception as error:
+                    restore_failed = True
+                    cleanup_errors.append(error)
+            if not restore_failed:
+                self._collision_je_addrs = None
+                self._old_collision_jes_bytes = None
+        elif collision_addrs is not None or collision_bytes is not None:
+            cleanup_errors.append(
+                RuntimeError(
+                    "Movement teleport collision restoration state is incomplete"
+                )
+            )
 
-        jes = await self.hook_handler.client._get_je_instruction_forward_backwards()
+        if self._old_je_page_protection is not None and jes is not None:
+            try:
+                self._set_page_protection(jes[0], self._old_je_page_protection)
+            except Exception as error:
+                cleanup_errors.append(error)
+            else:
+                self._old_je_page_protection = None
 
-        for je, je_bytes in zip(jes, self._old_jes_bytes):
-            await self.hook_handler.write_bytes(je, je_bytes)
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation="movement teleport hook cleanup",
+            )
+            raise primary_error
 
-        for addr, old_bytes in zip(self._collision_je_addrs, self._old_collision_jes_bytes):
-            await self.write_bytes(addr, old_bytes)
-
-        self._set_page_protection(jes[0], self._old_je_page_protection)
+        await self._free_exports()
 
 
 class DropsToggleHook(SimpleHook):
@@ -605,12 +706,14 @@ class User32GetClassInfoBaseHook(AutoBotBaseHook):
         return await super().hook()
 
     async def unhook(self):
-        self._hooked_instances -= 1
-        await self.write_bytes(self.jump_address, self.jump_original_bytecode)
+        if self._hooked_instances > 0:
+            self._hooked_instances -= 1
+        await self._restore_jump()
 
-        if self._hooked_instances == 0:
+        if self._hooked_instances == 0 and self._autobot_original_bytes is not None:
             await self.write_bytes(self._autobot_addr, self._autobot_original_bytes)
             self._autobot_bytes_offset = 0
+            self._autobot_original_bytes = None
 
 
 class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
@@ -650,7 +753,7 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
         await self.prehook()
 
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
 
         await self.posthook()
 
@@ -701,10 +804,25 @@ class MouselessCursorMoveHook(User32GetClassInfoBaseHook):
 
     async def set_mouse_pos_addr(self):
         if not self._is_cached("mouse_pos_addr"):
-            self.mouse_pos_addr = await self.allocate(8)
+            try:
+                self.mouse_pos_addr = await self.allocate(8)
+            except asyncio.CancelledError as error:
+                address = getattr(error, "settled_result", None)
+                if isinstance(address, int) and not isinstance(address, bool):
+                    self.mouse_pos_addr = address
+                    self.hook_handler._register_cached_hook_allocation(
+                        type(self), "mouse_pos_addr", address
+                    )
+                raise
+            self.hook_handler._register_cached_hook_allocation(
+                type(self), "mouse_pos_addr", self.mouse_pos_addr
+            )
             self._cache("mouse_pos_addr", self.mouse_pos_addr)
         else:
             self.mouse_pos_addr = self._get_cached("mouse_pos_addr")
+            self.hook_handler._register_cached_hook_allocation(
+                type(self), "mouse_pos_addr", self.mouse_pos_addr
+            )
 
     async def get_jump_address(self) -> int:
         """
@@ -845,7 +963,7 @@ class ChatHook(SimpleHook):
 
         await self.prehook()
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
         await self.posthook()
 
     async def bytecode_generator(self, packed_exports):
@@ -1093,7 +1211,7 @@ class ChatSendHook(SimpleHook):
 
         await self.prehook()
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
         await self.posthook()
 
     def _build_action_block(self, trigger_addr, save_restore, call_setup, clear_trigger):

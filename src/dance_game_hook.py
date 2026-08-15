@@ -1,6 +1,12 @@
 import asyncio
 
-from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady, Client
+from wizwalker import (
+    Client,
+    HookAlreadyActivated,
+    HookNotActive,
+    HookNotReady,
+    await_cleanup_preserving_cancellation,
+)
 from wizwalker.memory import HookHandler, SimpleHook
 
 from loguru import logger
@@ -37,28 +43,43 @@ async def activate_dance_game_moves_hook(
             DanceGameMovesHook,
             "dance_game_moves",
             {"dance_game_moves": "dance_game_moves"},
+            initialize=(
+                lambda: self._wait_for_value(
+                    self._base_addrs["dance_game_moves"], timeout
+                )
+            ) if wait_for_ready else None,
         )
-        if wait_for_ready:
-            address = await self._read_feature_hook_export(
-                "dance_game_moves", "DanceGameMovesHook"
-            )
-            await self._wait_for_value(address, timeout)
         return
 
     await self._check_for_autobot()
 
     hook = DanceGameMovesHook(self)
-    await hook.hook()
+    await self._activate_legacy_hook(
+        DanceGameMovesHook,
+        hook,
+        {"dance_game_moves": "dance_game_moves"},
+        initialize=(
+            lambda: self._wait_for_value(hook.dance_game_moves, timeout)
+        ) if wait_for_ready else None,
+    )
 
-    self._active_hooks[DanceGameMovesHook] = hook
-    #self._active_hooks.append(hook)
-    self._base_addrs["dance_game_moves"] = hook.dance_game_moves
 
-    if wait_for_ready:
-        await self._wait_for_value(hook.dance_game_moves, timeout)
+async def serialized_activate_dance_game_moves_hook(self, *args, **kwargs):
+    async with self._close_lock:
+        self._ensure_hook_activation_allowed()
+        try:
+            return await activate_dance_game_moves_hook(self, *args, **kwargs)
+        except BaseException as activation_error:
+            if not isinstance(activation_error, Exception):
+                await await_cleanup_preserving_cancellation(
+                    self._rollback_unused_legacy_storage(),
+                    activation_error,
+                    operation="dance game hook legacy storage rollback",
+                )
+            raise
 
 
-HookHandler.activate_dance_game_moves_hook = activate_dance_game_moves_hook
+HookHandler.activate_dance_game_moves_hook = serialized_activate_dance_game_moves_hook
 
 
 async def deactivate_dance_game_moves_hook(self):
@@ -72,22 +93,24 @@ async def deactivate_dance_game_moves_hook(self):
             ("dance_game_moves",),
         )
 
-    hook = self._get_hook_by_type(DanceGameMovesHook)
-    #self._active_hooks.remove(hook)
-    del self._active_hooks[DanceGameMovesHook]
-    await hook.unhook()
-
-    del self._base_addrs["dance_game_moves"]
+    await self._deactivate_legacy_hook(
+        DanceGameMovesHook, ("dance_game_moves",)
+    )
 
 
-HookHandler.deactivate_dance_game_moves_hook = deactivate_dance_game_moves_hook
+async def serialized_deactivate_dance_game_moves_hook(self, *args, **kwargs):
+    async with self._close_lock:
+        return await deactivate_dance_game_moves_hook(self, *args, **kwargs)
+
+
+HookHandler.deactivate_dance_game_moves_hook = serialized_deactivate_dance_game_moves_hook
 
 async def attempt_activate_dance_hook(client: Client, sleep_time: float = 0.1):
     # Attempts to activate dance hook, in a try block in case it's already off for this client
     if not client.dance_hook_status:
         try:
             await client.hook_handler.activate_dance_game_moves_hook()
-        except:
+        except Exception:
             logger.debug("failed to activate dance hook")
             logger.debug(traceback.print_exc())
             pass
@@ -100,7 +123,7 @@ async def attempt_deactivate_dance_hook(client: Client, sleep_time: float = 0.1)
     if client.dance_hook_status:
         try:
             await client.hook_handler.deactivate_dance_game_moves_hook()
-        except:
+        except Exception:
             pass
 
         client.dance_hook_status = False

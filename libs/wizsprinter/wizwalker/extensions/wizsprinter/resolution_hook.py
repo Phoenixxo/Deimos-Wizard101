@@ -26,6 +26,10 @@ resizing) since it derives from the frustum, not the backbuffer.
 """
 import struct
 
+from wizwalker.errors import (
+    await_cleanup_preserving_cancellation,
+    preserve_cleanup_errors,
+)
 from wizwalker.memory.hooks import SimpleHook
 from wizwalker.memory.memory_reader import Primitive
 
@@ -115,7 +119,7 @@ class ResolutionForcer:
 
     @property
     def installed(self) -> bool:
-        return self._setmode is not None
+        return self._setmode is not None or self._vm is not None
 
     async def install(self):
         if self.installed:
@@ -129,19 +133,33 @@ class ResolutionForcer:
             await self._setmode.hook()
             self._vm = VideoManagerHook(self.hook_handler)
             await self._vm.hook()
-        except Exception:
-            await self.uninstall()
+        except BaseException as activation_error:
+            await await_cleanup_preserving_cancellation(
+                self.uninstall(),
+                activation_error,
+                operation="resolution hook installation",
+            )
             raise
 
     async def uninstall(self):
-        for hook in (self._setmode, self._vm):
+        cleanup_errors = []
+        for attribute in ("_setmode", "_vm"):
+            hook = getattr(self, attribute)
             if hook is not None:
                 try:
                     await hook.unhook()
-                except Exception:
-                    pass
-        self._setmode = None
-        self._vm = None
+                except Exception as error:
+                    cleanup_errors.append(error)
+                else:
+                    setattr(self, attribute, None)
+        if cleanup_errors:
+            primary_error, *secondary_errors = cleanup_errors
+            preserve_cleanup_errors(
+                primary_error,
+                secondary_errors,
+                operation="resolution hook uninstall",
+            )
+            raise primary_error
 
     async def _manager_address(self) -> int:
         """The captured video-manager pointer (0 until the checker has run once)."""
@@ -358,14 +376,22 @@ class WindowResizeBorder:
             return
         await self.hook_handler._check_for_autobot()
         self._hook = WndProcNCHitHook(self.hook_handler)
-        await self._hook.hook()
+        try:
+            await self._hook.hook()
+        except BaseException as activation_error:
+            await await_cleanup_preserving_cancellation(
+                self.uninstall(),
+                activation_error,
+                operation="resize border hook installation",
+            )
+            raise
 
     async def uninstall(self):
         if self._hook is not None:
             try:
                 await self._hook.unhook()
             except Exception:
-                pass
+                raise
             self._hook = None
 
     async def update_rect(self, left: int, top: int, right: int, bottom: int,

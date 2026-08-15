@@ -5,6 +5,7 @@ from typing import Any, Union
 
 from wizwalker.constants import Primitive
 from wizwalker.errors import (
+    await_critical_operation,
     AddressOutOfRange,
     ClientClosedError,
     MemoryReadError,
@@ -137,7 +138,26 @@ class MemoryReader:
         loop = asyncio.get_event_loop()
         function = functools.partial(func, *args, **kwargs)
 
-        return await loop.run_in_executor(None, function)
+        result = await await_critical_operation(
+            loop.run_in_executor(None, function),
+            operation=getattr(func, "__name__", "native memory operation"),
+        )
+        owner = getattr(func, "__self__", None)
+        backend = getattr(owner, "_backend", owner)
+        require_current = getattr(backend, "require_current", None)
+        if callable(require_current):
+            require_current()
+        return result
+
+    @staticmethod
+    async def _run_cleanup_in_executor(func, *args, **kwargs):
+        """Deliver exact-helper cleanup without stale normal-result checks."""
+        loop = asyncio.get_event_loop()
+        function = functools.partial(func, *args, **kwargs)
+        return await await_critical_operation(
+            loop.run_in_executor(None, function),
+            operation=getattr(func, "__name__", "native memory cleanup"),
+        )
 
     def _get_symbols(self, file_path: str, *, force_reload: bool = False):
         if (dll_table := self._symbol_table.get(file_path)) and not force_reload:
@@ -413,6 +433,8 @@ class MemoryReader:
                 size,
             )
         except Exception as error:
+            if getattr(error, "code", None) == "generation_unavailable":
+                raise
             mapped = await self._mapped_read_error(error, address)
             if mapped is not None:
                 raise mapped from error
@@ -435,6 +457,8 @@ class MemoryReader:
                 value,
             )
         except Exception as error:
+            if getattr(error, "code", None) == "generation_unavailable":
+                raise
             if not self._backend.is_write_error(error):
                 raise
 
