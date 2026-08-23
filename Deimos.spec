@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -127,6 +128,61 @@ else:
     print(f"WARNING: {_wizpatch_exe} not found; game-file patching will be unavailable in this build.")
 
 
+# The Windows version resource is derived from tool_version rather than read
+# straight from version_info.txt. The release workflows rewrite tool_version in
+# Deimos.py but never touch that file, so it had drifted: 3.14.0 builds shipped
+# reporting 3.10.0.0 under Properties -> Details. version_info.txt stays the
+# template for everything else (company, description, copyright); only the
+# version fields are substituted, into a generated copy, so a build never
+# modifies a tracked file.
+def _render_version_info():
+    template = 'version_info.txt'
+    try:
+        source = open('Deimos.py', encoding='utf-8').read()
+        match = re.search(
+            r"^tool_version:\s*str\s*=\s*['\"]([^'\"]+)['\"]", source, re.MULTILINE
+        )
+        if not match:
+            print("WARNING: could not read tool_version from Deimos.py; "
+                  f"using {template} unchanged.")
+            return template
+
+        version = match.group(1)
+        # PE version fields are numeric only, so a pre-release suffix
+        # (3.14.0-beta.1) contributes its release core alone.
+        core = version.split('-', 1)[0]
+        numbers = [int(p) if p.isdigit() else 0 for p in core.split('.')]
+        numbers = (numbers + [0, 0, 0, 0])[:4]
+        dotted = '.'.join(str(n) for n in numbers)
+        tup = '({})'.format(', '.join(str(n) for n in numbers))
+
+        text = open(template, encoding='utf-8').read()
+        # Lambda replacements: the substituted text is data, not a regex
+        # template, so backslashes and group refs in it stay literal.
+        text = re.sub(r'filevers=\([^)]*\)', lambda m: f'filevers={tup}', text)
+        text = re.sub(r'prodvers=\([^)]*\)', lambda m: f'prodvers={tup}', text)
+        for field in ('FileVersion', 'ProductVersion'):
+            text = re.sub(
+                r"(StringStruct\(u'" + field + r"',\s*u')[^']*(')",
+                lambda m: m.group(1) + dotted + m.group(2),
+                text,
+            )
+
+        out_dir = os.path.join('build', 'Deimos')
+        os.makedirs(out_dir, exist_ok=True)
+        rendered = os.path.join(out_dir, 'version_info.generated.txt')
+        with open(rendered, 'w', encoding='utf-8') as f:
+            f.write(text)
+        print(f"Version resource: tool_version {version} -> {dotted}")
+        return rendered
+    except OSError as e:
+        print(f"WARNING: could not render version resource ({e}); "
+              f"using {template} unchanged.")
+        return template
+
+
+_version_file = _render_version_info()
+
 a = Analysis(
     ['Deimos.py'],
     pathex=[str(path) for path in workspace_package_roots],
@@ -196,6 +252,6 @@ else:
         codesign_identity=None,
         entitlements_file=None,
         icon='Deimos-logo.ico',
-        version='version_info.txt' if sys.platform == 'win32' else None,
+        version=_version_file if sys.platform == 'win32' else None,
         manifest='app.manifest' if sys.platform == 'win32' else None,
     )
