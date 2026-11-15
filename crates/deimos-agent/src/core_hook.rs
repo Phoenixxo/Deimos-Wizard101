@@ -50,11 +50,63 @@ fn activate_resolved<B: MutationBackend>(
     now: Instant,
 ) -> Result<CoreHookResponse, HookApiError> {
     let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
-    let template = template_for_target(request.hook, fixture);
+    let mut template = template_for_target(request.hook, fixture);
+    let mut signature = template.signature.to_string();
+    let mut resolved_target = resolved_target;
+    if request.hook == CoreHook::RootWindow && !fixture {
+        let original =
+            match hooks.original_target_bytes(&request.session_id, &hook_key(request.hook)) {
+                Some(bytes) => bytes[..7.min(bytes.len())].to_vec(),
+                None => {
+                    let target = match resolved_target {
+                        Some(target) => target,
+                        None => memory::scan_optional_unique_signatures(
+                            sessions,
+                            backend,
+                            &request.session_id,
+                            &scan_scope(false),
+                            &[template.signature],
+                        )?[0]
+                            .ok_or_else(|| {
+                                HookApiError::request(
+                                    RpcErrorCode::MemoryRequiredMatchNotFound,
+                                    "the root-window instruction could not be located uniquely",
+                                )
+                            })?,
+                    };
+                    resolved_target = Some(target);
+                    memory::read(
+                        sessions,
+                        backend,
+                        &MemoryReadRequest {
+                            session_id: request.session_id.clone(),
+                            address: format!("{target:#x}"),
+                            size: 7,
+                        },
+                    )?
+                    .bytes
+                }
+            };
+        let capture = root_window_capture(&original)?;
+        (template.payload, template.export_offset) = capture_payload(&capture);
+        // Recheck the decoded instruction exactly when committing the patch.
+        signature = original
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .chain(
+                template
+                    .signature
+                    .split_whitespace()
+                    .skip(7)
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
     let hook_request = HookActivateRequest {
         session_id: request.session_id.clone(),
         hook_key: hook_key(request.hook),
-        signature: template.signature.to_string(),
+        signature,
         scope: scan_scope(fixture),
         payload: template.payload,
     };
@@ -367,7 +419,7 @@ pub fn read_base<B: MutationBackend>(
             .try_into()
             .expect("an eight-byte agent read must return eight bytes"),
     );
-    if request.hook == CoreHook::PlayerStat && value != 0 {
+    if matches!(request.hook, CoreHook::PlayerStat | CoreHook::RootWindow) && value != 0 {
         if value % 8 != 0 {
             return Err(HookApiError::request(
                 RpcErrorCode::MemoryInvalidAddress,
@@ -444,10 +496,10 @@ fn template(hook: CoreHook) -> Template {
             &[0x48, 0x89, 0xc8][..], // mov rax, rcx
         ),
         CoreHook::RootWindow => (
-            "49 8B 8D D8 00 00 00 48 8B 01 ?? ?? ?? ?? ?? ?? ?? FF 50 70 84 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??",
+            "?? 8B ?? ?? ?? ?? ?? 48 8B 01 ?? ?? ?? ?? ?? ?? ?? FF 50 70 84 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??",
             0,
             0,
-            &[0x49, 0x8b, 0x85, 0xd8, 0x00, 0x00, 0x00][..], // mov rax,[r13+0xd8]
+            &[0x49, 0x8b, 0x87, 0xd8, 0x00, 0x00, 0x00][..], // mov rax,[r15+0xd8]
         ),
         CoreHook::RenderContext => (
             "F3 44 0F 10 8B 98 00 00 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? F3 41 0F 10 28 F3 0F 10 56 04 48 63 C1 ??",
@@ -508,6 +560,25 @@ fn capture_payload(capture: &[u8]) -> (Vec<u8>, usize) {
     (payload, export_offset)
 }
 
+fn root_window_capture(instruction: &[u8]) -> Result<Vec<u8>, HookApiError> {
+    // Decode only MOV RCX,[base+disp32]. Stack-based operands would shift when
+    // the capture payload saves RAX, and SIB forms need a separate decoder.
+    if instruction.len() != 7
+        || !matches!(instruction[0], 0x48 | 0x49)
+        || instruction[1] != 0x8b
+        || instruction[2] & 0xf8 != 0x88
+        || instruction[2] & 7 == 4
+    {
+        return Err(HookApiError::request(
+            RpcErrorCode::MemoryRequiredMatchNotFound,
+            "the root-window candidate uses an unsupported pointer-load instruction; no hook was installed",
+        ));
+    }
+    let mut capture = instruction.to_vec();
+    capture[2] &= 0xc7; // Preserve the memory operand while changing RCX to RAX.
+    Ok(capture)
+}
+
 fn player_payload() -> (Vec<u8>, usize) {
     let mut payload = vec![
         0x51, // push rcx
@@ -565,13 +636,36 @@ mod tests {
     }
 
     #[test]
-    fn root_window_hook_captures_the_current_r13_root_pointer() {
-        let template = template(CoreHook::RootWindow);
-        assert!(template.signature.starts_with("49 8B 8D D8 00 00 00"));
-        assert_eq!(
-            &template.payload[1..8],
-            &[0x49, 0x8b, 0x85, 0xd8, 0x00, 0x00, 0x00]
-        );
+    fn root_window_capture_follows_the_live_register_and_displacement() {
+        for (load, capture) in [
+            (
+                [0x49, 0x8b, 0x8d, 0xd8, 0, 0, 0],
+                [0x49, 0x8b, 0x85, 0xd8, 0, 0, 0],
+            ),
+            (
+                [0x49, 0x8b, 0x8f, 0xd8, 0, 0, 0],
+                [0x49, 0x8b, 0x87, 0xd8, 0, 0, 0],
+            ),
+            (
+                [0x48, 0x8b, 0x8b, 0x20, 1, 0, 0],
+                [0x48, 0x8b, 0x83, 0x20, 1, 0, 0],
+            ),
+        ] {
+            assert_eq!(super::root_window_capture(&load).unwrap(), capture);
+        }
+    }
+
+    #[test]
+    fn root_window_capture_rejects_unknown_and_stack_addressing_forms() {
+        for instruction in [
+            vec![0x48, 0x8b, 0x8c, 0x24, 0xd8, 0, 0],
+            vec![0x49, 0x8b, 0x8c, 0x24, 0xd8, 0, 0],
+            vec![0x49, 0x89, 0x8f, 0xd8, 0, 0, 0],
+            vec![0x49, 0x8b, 0x87, 0xd8, 0, 0, 0],
+            vec![0x49, 0x8b],
+        ] {
+            assert!(super::root_window_capture(&instruction).is_err());
+        }
     }
 
     #[test]

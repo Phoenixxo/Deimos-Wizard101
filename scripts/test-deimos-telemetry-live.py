@@ -150,7 +150,10 @@ async def capture(options: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 f"{sorted(missing_capabilities)}"
             )
 
-        handler = ClientHandler(agent_manager=manager)
+        handler = ClientHandler(
+            agent_manager=manager,
+            agent_instance_id=report["agent"]["identity"]["instance_id"],
+        )
         clients = handler.get_new_clients()
         if not clients:
             raise RuntimeError(

@@ -81,6 +81,15 @@ pub struct HookState {
 }
 
 impl HookState {
+    pub(crate) fn original_target_bytes(
+        &self,
+        session_id: &ProcessSessionId,
+        hook_key: &str,
+    ) -> Option<&[u8]> {
+        self.get(session_id, hook_key)
+            .map(|record| record.target.original_bytes.as_slice())
+    }
+
     pub fn tracked_count(&self, session_id: &ProcessSessionId) -> usize {
         self.hooks.get(session_id).map_or(0, BTreeMap::len)
     }

@@ -182,7 +182,10 @@ async def run(options: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 f"the agent did not negotiate required capabilities: {sorted(missing)}"
             )
 
-        handler = ClientHandler(agent_manager=manager)
+        handler = ClientHandler(
+            agent_manager=manager,
+            agent_instance_id=report["agent"]["identity"]["instance_id"],
+        )
         clients = handler.get_new_clients()
         if not clients:
             raise RuntimeError(f"{options.target} was not found in the selected bottle")

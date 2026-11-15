@@ -1011,7 +1011,7 @@ class LiveAcceptanceReportTests(unittest.IsolatedAsyncioTestCase):
             stopped = False
 
             def start(self):
-                return {"state": "ready"}
+                return {"identity": {"instance_id": "acceptance-generation"}}
 
             def capabilities(self):
                 return sorted(module.REQUIRED_CAPABILITIES)
@@ -1065,7 +1065,13 @@ class LiveAcceptanceReportTests(unittest.IsolatedAsyncioTestCase):
         module.deimos_native = SimpleNamespace(
             AgentManager=lambda *args, **kwargs: manager
         )
-        module.ClientHandler = lambda **kwargs: handler
+        handler_arguments = {}
+
+        def create_handler(**kwargs):
+            handler_arguments.update(kwargs)
+            return handler
+
+        module.ClientHandler = create_handler
         options = SimpleNamespace(
             bottle="/bottle",
             wine="/wine",
@@ -1082,6 +1088,7 @@ class LiveAcceptanceReportTests(unittest.IsolatedAsyncioTestCase):
 
         report, exit_code = await module.capture(options)
 
+        self.assertEqual(handler_arguments["agent_instance_id"], "acceptance-generation")
         self.assertTrue(report["capture_completed"])
         self.assertFalse(report["acceptance"]["passed"])
         self.assertFalse(report["acceptance"]["full_snapshot_parity"])
