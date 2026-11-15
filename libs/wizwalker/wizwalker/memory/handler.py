@@ -119,6 +119,7 @@ class HookHandler(MemoryReader):
         self._base_addrs = {}
         self._agent_feature_exports = {}
         self._agent_feature_hook_exports: dict[str, set[str]] = {}
+        self._feature_hook_availability: dict[str, dict[str, Any]] = {}
         self._legacy_hook_exports: dict[type, set[str]] = {}
 
         self._hook_cache = {}
@@ -1032,6 +1033,42 @@ class HookHandler(MemoryReader):
             timeout=timeout,
         )
 
+    @property
+    def feature_hook_availability(self) -> dict[str, dict[str, Any]]:
+        """Return the feature layouts resolved for this client session."""
+        return {name: dict(status) for name, status in self._feature_hook_availability.items()}
+
+    async def _preflight_agent_features(self) -> None:
+        if not self._uses_agent_feature_hooks():
+            return
+        inspect_features = getattr(self._backend, "preflight_feature_hooks", None)
+        if not callable(inspect_features):
+            return
+        report = await self.run_in_executor(inspect_features)
+        if report is None:
+            return
+        entries = report.get("hooks") if isinstance(report, dict) else None
+        if not isinstance(entries, list):
+            raise RuntimeError("The helper returned an invalid feature-hook preflight report.")
+        statuses = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("available"), bool):
+                raise RuntimeError("The helper returned an invalid feature-hook availability entry.")
+            if entry.get("error") is not None and not isinstance(entry["error"], dict):
+                raise RuntimeError("The helper returned invalid feature-hook diagnostics.")
+            name = entry.get("hook")
+            if name not in self._AGENT_FEATURE_HOOK_NAMES or name in statuses:
+                raise RuntimeError("The helper returned an unknown or duplicate feature hook.")
+            statuses[name] = entry
+        if set(statuses) != self._AGENT_FEATURE_HOOK_NAMES:
+            raise RuntimeError("The helper did not inspect every supported feature hook.")
+        self._feature_hook_availability = statuses
+        for name, entry in statuses.items():
+            if not entry["available"]:
+                error = entry.get("error") or {}
+                logger.warning("Feature '{}' is unavailable in this game build: {}", name,
+                               error.get("message", "No validated runtime target was found."))
+
     async def _activate_all_hooks_leased(
         self, *, wait_for_ready: bool = True, timeout: float = None
     ):
@@ -1047,6 +1084,7 @@ class HookHandler(MemoryReader):
             if self._active_hooks:
                 duplicate = next(iter(self._active_hooks))
                 raise HookAlreadyActivated(duplicate.__name__.removesuffix("Hook"))
+            await self._preflight_agent_features()
             mappings = (
                 (PlayerHook, "player", "player_struct"),
                 (QuestHook, "quest", "quest_struct"),
@@ -1092,7 +1130,9 @@ class HookHandler(MemoryReader):
                     register_started,
                     hook_count=len(mappings),
                 )
-                if self._uses_agent_feature_hooks():
+                if self._uses_agent_feature_hooks() and self._feature_hook_availability.get(
+                    "movement_teleport", {}
+                ).get("available", True):
                     await self._activate_agent_feature_hook(
                         MovementTeleportHook,
                         "movement_teleport",

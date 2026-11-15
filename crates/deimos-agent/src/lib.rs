@@ -35,11 +35,11 @@ use deimos_core::memory::{
     OP_CORE_HOOK_ACTIVATE, OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE,
     OP_CORE_HOOK_DEACTIVATE_ALL, OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE,
     OP_FEATURE_BUDDY_ADD, OP_FEATURE_CHAT_SEND, OP_FEATURE_HOOK_ACTIVATE,
-    OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL, OP_FEATURE_HOOK_READ_EXPORT,
-    OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT, OP_HOOK_ACTIVATE, OP_HOOK_DEACTIVATE,
-    OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE, OP_MEMORY_POINTER_CHAIN,
-    OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
-    OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
+    OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL, OP_FEATURE_HOOK_PREFLIGHT,
+    OP_FEATURE_HOOK_READ_EXPORT, OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT, OP_HOOK_ACTIVATE,
+    OP_HOOK_DEACTIVATE, OP_HOOK_HEARTBEAT, OP_MEMORY_ALLOCATE, OP_MEMORY_FREE,
+    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_PROTECT, OP_MEMORY_READ, OP_MEMORY_READ_BATCH,
+    OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE, OP_THREAD_START,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessAccessMode, ProcessIdentityStatusRequest,
@@ -968,6 +968,27 @@ impl<B: MutationBackend> AgentService<B> {
                     .map_err(|error| {
                         Box::new(error.into_rpc_error(call.request_id, &call.operation))
                     })?;
+                encode_payload(call, response)
+            }
+            OP_FEATURE_HOOK_PREFLIGHT => {
+                require_capabilities(
+                    call,
+                    capabilities,
+                    &[
+                        CAPABILITY_PROCESS_READ_ONLY,
+                        CAPABILITY_MEMORY_READ_ONLY,
+                        CAPABILITY_FEATURE_HOOK,
+                    ],
+                )?;
+                let request: FeatureHookSessionRequest = decode_payload(call)?;
+                let _gate = self.lock_mutation_gate(call)?;
+                let mut hooks = self.lock_hooks(call)?;
+                let mut sessions = self.lock_sessions(call)?;
+                let response =
+                    feature_hook::preflight(&mut sessions, &self.backend, &mut hooks, &request)
+                        .map_err(|error| {
+                            Box::new(error.into_rpc_error(call.request_id, &call.operation))
+                        })?;
                 encode_payload(call, response)
             }
             OP_FEATURE_HOOK_ACTIVATE => {
@@ -2314,6 +2335,36 @@ mod tests {
                 .expect("read-only open should remain available"),
         )
         .expect("session response should deserialize");
+        let inspection_call = RpcCall {
+            request_id: 2,
+            operation: deimos_core::memory::OP_FEATURE_HOOK_PREFLIGHT.to_string(),
+            payload: to_value(deimos_core::memory::FeatureHookSessionRequest {
+                session_id: session.session_id.clone(),
+            })
+            .expect("preflight request should serialize"),
+            native_context: None,
+        };
+        let inspection: deimos_core::memory::FeatureHookPreflightResponse = serde_json::from_value(
+            service
+                .handle_call_with_capabilities(
+                    &inspection_call,
+                    &[
+                        CAPABILITY_PROCESS_READ_ONLY.to_string(),
+                        deimos_core::memory::CAPABILITY_MEMORY_READ_ONLY.to_string(),
+                        deimos_core::memory::CAPABILITY_FEATURE_HOOK.to_string(),
+                    ],
+                )
+                .expect("runtime inspection must not require mutation capabilities"),
+        )
+        .expect("preflight response should deserialize");
+        assert_eq!(
+            inspection.hooks.len(),
+            deimos_core::memory::FeatureHook::ALL.len()
+        );
+        assert!(inspection
+            .hooks
+            .iter()
+            .all(|hook| !hook.available && hook.error.is_some()));
         let write_call = RpcCall {
             request_id: 2,
             operation: OP_MEMORY_WRITE.to_string(),

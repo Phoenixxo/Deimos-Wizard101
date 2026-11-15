@@ -34,6 +34,7 @@ pub const OP_CORE_HOOK_DEACTIVATE_ALL: &str = "core_hook.deactivate_all";
 pub const OP_CORE_HOOK_HEARTBEAT_ALL: &str = "core_hook.heartbeat_all";
 pub const OP_CORE_HOOK_READ_BASE: &str = "core_hook.read_base";
 pub const OP_FEATURE_HOOK_ACTIVATE: &str = "feature_hook.activate";
+pub const OP_FEATURE_HOOK_PREFLIGHT: &str = "feature_hook.preflight";
 pub const OP_FEATURE_HOOK_DEACTIVATE: &str = "feature_hook.deactivate";
 pub const OP_FEATURE_HOOK_HEARTBEAT_ALL: &str = "feature_hook.heartbeat_all";
 pub const OP_FEATURE_HOOK_READ_EXPORT: &str = "feature_hook.read_export";
@@ -374,6 +375,20 @@ pub struct FeatureHookRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FeatureHookSessionRequest {
     pub session_id: ProcessSessionId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookAvailability {
+    pub hook: FeatureHook,
+    pub available: bool,
+    pub target_address: Option<String>,
+    pub error: Option<crate::rpc::RpcError>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FeatureHookPreflightResponse {
+    pub session_id: ProcessSessionId,
+    pub hooks: Vec<FeatureHookAvailability>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

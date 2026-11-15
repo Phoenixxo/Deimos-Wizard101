@@ -27,9 +27,9 @@ use deimos_core::memory::{
     OP_CORE_HOOK_ACTIVATE_ALL, OP_CORE_HOOK_DEACTIVATE, OP_CORE_HOOK_DEACTIVATE_ALL,
     OP_CORE_HOOK_HEARTBEAT_ALL, OP_CORE_HOOK_READ_BASE, OP_FEATURE_BUDDY_ADD, OP_FEATURE_CHAT_SEND,
     OP_FEATURE_HOOK_ACTIVATE, OP_FEATURE_HOOK_DEACTIVATE, OP_FEATURE_HOOK_HEARTBEAT_ALL,
-    OP_FEATURE_HOOK_READ_EXPORT, OP_FEATURE_MOUSE_POSITION, OP_FEATURE_TELEPORT,
-    OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH, OP_MEMORY_READ_TYPED,
-    OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
+    OP_FEATURE_HOOK_PREFLIGHT, OP_FEATURE_HOOK_READ_EXPORT, OP_FEATURE_MOUSE_POSITION,
+    OP_FEATURE_TELEPORT, OP_MEMORY_POINTER_CHAIN, OP_MEMORY_READ, OP_MEMORY_READ_BATCH,
+    OP_MEMORY_READ_TYPED, OP_MEMORY_REGIONS, OP_MEMORY_SCAN, OP_MEMORY_WRITE,
 };
 use deimos_core::process::{
     ListProcessesRequest, OpenProcessRequest, ProcessIdentity, ProcessIdentityStatusRequest,
@@ -1805,6 +1805,18 @@ impl PyAgentManager {
         })?;
         parse_hex_u64(&response.base_address, OP_CORE_HOOK_READ_BASE)
             .map_err(|error| error.into_pyerr(py))
+    }
+
+    /// Inspect every feature hook for this process session without installing hooks.
+    fn preflight_feature_hooks(&self, py: Python<'_>, session_id: String) -> PyResult<Py<PyAny>> {
+        let request = serialize_request(
+            OP_FEATURE_HOOK_PREFLIGHT,
+            FeatureHookSessionRequest {
+                session_id: ProcessSessionId(session_id),
+            },
+        )
+        .map_err(|error| error.into_pyerr(py))?;
+        self.call_as_python_with_timeout(py, OP_FEATURE_HOOK_PREFLIGHT, request, 30_000)
     }
 
     fn activate_feature_hook(

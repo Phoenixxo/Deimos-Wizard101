@@ -338,6 +338,13 @@ class DeimosNativeMemoryBackend(MemoryBackend):
     def activate_feature_hook(self, hook: str) -> dict[str, Any]:
         return self._call_manager(self.manager.activate_feature_hook, self.session_id, hook)
 
+    def preflight_feature_hooks(self) -> dict[str, Any] | None:
+        """Inspect optional hooks without modifying the process or allocating memory."""
+        inspect_features = getattr(self.manager, "preflight_feature_hooks", None)
+        if not callable(inspect_features):
+            return None
+        return self._call_manager(inspect_features, self.session_id)
+
     def deactivate_feature_hook(self, hook: str) -> dict[str, Any]:
         cleanup = getattr(
             self.manager,

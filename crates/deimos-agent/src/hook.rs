@@ -78,6 +78,10 @@ struct PatchRecord {
 #[derive(Default)]
 pub struct HookState {
     hooks: HashMap<ProcessSessionId, BTreeMap<String, HookRecord>>,
+    pub(crate) feature_resolutions: HashMap<
+        ProcessSessionId,
+        BTreeMap<deimos_core::memory::FeatureHook, crate::feature_hook::Resolution>,
+    >,
 }
 
 impl HookState {
@@ -115,6 +119,7 @@ impl HookState {
     }
 
     fn forget_session(&mut self, session_id: &ProcessSessionId) -> usize {
+        self.feature_resolutions.remove(session_id);
         self.hooks
             .remove(session_id)
             .map_or(0, |records| records.len())
@@ -1205,7 +1210,9 @@ pub fn cleanup_session<B: MutationBackend>(
             failures.push(format!("hook {key:?}: {}", error.summary()));
         }
     }
-    cleanup_failures("session", Some(session_id), failures)
+    cleanup_failures("session", Some(session_id), failures)?;
+    hooks.feature_resolutions.remove(session_id);
+    Ok(())
 }
 
 pub fn cleanup_all<B: MutationBackend>(
@@ -1214,7 +1221,12 @@ pub fn cleanup_all<B: MutationBackend>(
     mutations: &mut MutationState<B::ThreadHandle>,
     hooks: &mut HookState,
 ) -> Result<(), HookApiError> {
-    let session_ids = hooks.hooks.keys().cloned().collect::<Vec<_>>();
+    let session_ids = hooks
+        .hooks
+        .keys()
+        .chain(hooks.feature_resolutions.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut failures = Vec::new();
     for session_id in session_ids {
         if let Err(error) = cleanup_session(sessions, backend, mutations, hooks, &session_id) {
@@ -1508,7 +1520,7 @@ fn validate_hook_key(value: &str) -> Result<(), HookApiError> {
     Ok(())
 }
 
-fn signature_matches(bytes: &[u8], signature: &[Option<u8>]) -> bool {
+pub(crate) fn signature_matches(bytes: &[u8], signature: &[Option<u8>]) -> bool {
     bytes.len() == signature.len()
         && bytes
             .iter()

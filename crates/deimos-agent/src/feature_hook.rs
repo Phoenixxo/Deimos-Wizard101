@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use deimos_core::memory::{
     CoreHook, CoreHookRequest, FeatureActionResponse, FeatureBuddyAddRequest,
-    FeatureChatSendRequest, FeatureHook, FeatureHookDeactivateResponse, FeatureHookExport,
-    FeatureHookExportRequest, FeatureHookExportResponse, FeatureHookRequest, FeatureHookResponse,
+    FeatureChatSendRequest, FeatureHook, FeatureHookAvailability, FeatureHookDeactivateResponse,
+    FeatureHookExport, FeatureHookExportRequest, FeatureHookExportResponse,
+    FeatureHookPreflightResponse, FeatureHookRequest, FeatureHookResponse,
     FeatureHookSessionRequest, FeatureHooksResponse, FeatureMousePositionRequest,
     FeatureTeleportRequest, HookActivateRequest, HookDeactivateRequest, HookHeartbeatRequest,
     MemoryReadRequest, MemoryScanRequest, MemoryScanScope, MemoryWriteRequest,
+    OP_FEATURE_HOOK_PREFLIGHT,
 };
 use deimos_core::process::{ModuleDescriptor, ProcessKind, ProcessSessionId};
 use deimos_core::rpc::{RpcError, RpcErrorCode};
@@ -48,6 +50,128 @@ struct Template {
     payload_kind: PayloadKind,
     replay_original: bool,
     quiescence_offset: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct Resolution {
+    template: Option<Template>,
+    report: FeatureHookAvailability,
+}
+
+/// Resolve every optional hook without allocating memory or modifying the game.
+/// Resolutions belong to this process session and are discarded with its cleanup.
+pub fn preflight<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    hooks: &mut HookState,
+    request: &FeatureHookSessionRequest,
+) -> Result<FeatureHookPreflightResponse, FeatureHookApiError> {
+    let timing = HookTimingSpan::new(OP_FEATURE_HOOK_PREFLIGHT, "total");
+    sessions.status(backend, &request.session_id)?;
+    let fixture = sessions.process_kind(&request.session_id) == Some(ProcessKind::MemoryFixture);
+    let mut reports = Vec::new();
+    let mut cached_count = 0;
+    for selected in FeatureHook::ALL {
+        if let Some(cached) = hooks
+            .feature_resolutions
+            .get(&request.session_id)
+            .and_then(|resolutions| resolutions.get(&selected))
+        {
+            reports.push(cached.report.clone());
+            cached_count += 1;
+            continue;
+        }
+        let result = template_for_target(sessions, backend, &request.session_id, selected, fixture)
+            .and_then(|template| {
+                validate_preflight_template(sessions, backend, &request.session_id, &template)?;
+                Ok(template)
+            });
+        let resolution = match result {
+            Ok(template) => Resolution {
+                report: FeatureHookAvailability {
+                    hook: selected,
+                    available: true,
+                    target_address: template.resolved_target.map(format_address),
+                    error: None,
+                },
+                template: Some(template),
+            },
+            Err(error) => Resolution {
+                report: FeatureHookAvailability {
+                    hook: selected,
+                    available: false,
+                    target_address: None,
+                    error: Some(error.into_rpc_error(0, OP_FEATURE_HOOK_PREFLIGHT)),
+                },
+                template: None,
+            },
+        };
+        reports.push(resolution.report.clone());
+        hooks
+            .feature_resolutions
+            .entry(request.session_id.clone())
+            .or_default()
+            .insert(selected, resolution);
+    }
+    timing.finish(
+        "ok",
+        json!({
+            "feature_count": reports.len(),
+            "available_count": reports.iter().filter(|report| report.available).count(),
+            "cached_count": cached_count,
+        }),
+    );
+    Ok(FeatureHookPreflightResponse {
+        session_id: request.session_id.clone(),
+        hooks: reports,
+    })
+}
+
+fn validate_preflight_template<B: MutationBackend>(
+    sessions: &mut ProcessSessionRegistry<B::Handle>,
+    backend: &B,
+    session_id: &ProcessSessionId,
+    template: &Template,
+) -> Result<(), FeatureHookApiError> {
+    let target = template.resolved_target.ok_or_else(|| {
+        FeatureHookApiError::request(
+            RpcErrorCode::MemoryRequiredMatchNotFound,
+            "feature preflight did not resolve a hook target",
+        )
+    })?;
+    let signature = memory::parse_signature(&template.signature)?;
+    let bytes = read_at(sessions, backend, session_id, target, signature.len())?;
+    if !hook::signature_matches(&bytes, &signature) {
+        return Err(FeatureHookApiError::request(
+            RpcErrorCode::MemoryRequiredMatchNotFound,
+            "feature code changed during runtime discovery",
+        ));
+    }
+    if template.replay_original {
+        let original = bytes.get(..template.overwrite_size).ok_or_else(|| {
+            FeatureHookApiError::request(
+                RpcErrorCode::MemoryPatternInvalid,
+                "feature overwrite extends beyond its verified signature",
+            )
+        })?;
+        hook::validate_relocatable_x64(original)?;
+    }
+    for patch in &template.auxiliary_patches {
+        let actual = read_at(
+            sessions,
+            backend,
+            session_id,
+            patch.address,
+            patch.expected_bytes.len(),
+        )?;
+        if actual != patch.expected_bytes {
+            return Err(FeatureHookApiError::request(
+                RpcErrorCode::MemoryRequiredMatchNotFound,
+                "an auxiliary feature target changed during runtime discovery",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -162,13 +286,27 @@ pub fn activate<B: MutationBackend>(
     let operation = format!("feature_hook.activate.{}", hook_key(request.hook));
     let timing = HookTimingSpan::new(&operation, "total");
     let template_timing = HookTimingSpan::new(&operation, "build_template");
-    let template = template_for_target(
+    preflight(
         sessions,
         backend,
-        &request.session_id,
-        request.hook,
-        fixture,
+        hooks,
+        &FeatureHookSessionRequest {
+            session_id: request.session_id.clone(),
+        },
     )?;
+    let resolution = hooks
+        .feature_resolutions
+        .get(&request.session_id)
+        .and_then(|resolutions| resolutions.get(&request.hook))
+        .expect("preflight covers every feature hook");
+    let template = resolution.template.clone().ok_or_else(|| {
+        let error = resolution
+            .report
+            .error
+            .as_ref()
+            .expect("unavailable features carry diagnostics");
+        FeatureHookApiError::request(error.code.clone(), error.message.clone())
+    })?;
     template_timing.finish(
         "ok",
         json!({
@@ -2309,6 +2447,109 @@ mod tests {
     use crate::hook::tests::{registry, Backend, Failure};
     use crate::hook::{self, HookState, HOOK_LEASE};
     use crate::mutation::MutationState;
+
+    #[test]
+    fn feature_preflight_inspects_every_hook_without_installing_any() {
+        let backend = Backend::feature(None);
+        let before = backend.primary();
+        let (mut sessions, session_id) = registry(&backend);
+        let mut hooks = HookState::default();
+        let report = super::preflight(
+            &mut sessions,
+            &backend,
+            &mut hooks,
+            &deimos_core::memory::FeatureHookSessionRequest {
+                session_id: session_id.clone(),
+            },
+        )
+        .expect("the fixture layouts should resolve");
+        assert_eq!(report.hooks.len(), FeatureHook::ALL.len());
+        assert!(report
+            .hooks
+            .iter()
+            .all(|entry| entry.available && entry.target_address.is_some()));
+        assert_eq!(backend.primary(), before);
+        assert_eq!(backend.allocation_count(), 0);
+        assert_eq!(hooks.tracked_count(&session_id), 0);
+    }
+
+    #[test]
+    fn preflight_cache_does_not_allow_changed_code_to_be_installed() {
+        let backend = Backend::feature(None);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut hooks = HookState::default();
+        let request = deimos_core::memory::FeatureHookSessionRequest {
+            session_id: session_id.clone(),
+        };
+        let before = super::preflight(&mut sessions, &backend, &mut hooks, &request).unwrap();
+        let movement_marker = backend
+            .primary()
+            .windows(5)
+            .position(|bytes| bytes == [0xb8, 1, 0xd1, 0xc0, 0])
+            .expect("fixture contains the movement marker");
+        backend.corrupt_primary_byte(movement_marker);
+        let cached = super::preflight(&mut sessions, &backend, &mut hooks, &request).unwrap();
+        assert_eq!(cached, before);
+        let mut mutations = MutationState::new();
+        let error = activate(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &FeatureHookRequest {
+                session_id: session_id.clone(),
+                hook: FeatureHook::MovementTeleport,
+            },
+            Instant::now(),
+        )
+        .expect_err("activation must recheck cached code bytes");
+        assert_eq!(
+            error.into_rpc_error(1, "feature_hook.activate").code,
+            RpcErrorCode::MemoryRequiredMatchNotFound
+        );
+        assert_eq!(backend.allocation_count(), 0);
+        assert_eq!(hooks.tracked_count(&session_id), 0);
+    }
+
+    #[test]
+    fn unavailable_features_are_isolated_and_cleanup_discards_resolutions() {
+        let backend = Backend::feature(None);
+        let movement_marker = backend
+            .primary()
+            .windows(5)
+            .position(|bytes| bytes == [0xb8, 1, 0xd1, 0xc0, 0])
+            .expect("fixture contains the movement marker");
+        backend.corrupt_primary_byte(movement_marker);
+        let (mut sessions, session_id) = registry(&backend);
+        let mut hooks = HookState::default();
+        let request = deimos_core::memory::FeatureHookSessionRequest {
+            session_id: session_id.clone(),
+        };
+        let report = super::preflight(&mut sessions, &backend, &mut hooks, &request).unwrap();
+        assert!(
+            !report
+                .hooks
+                .iter()
+                .find(|entry| entry.hook == FeatureHook::MovementTeleport)
+                .unwrap()
+                .available
+        );
+        assert_eq!(
+            report.hooks.iter().filter(|entry| entry.available).count(),
+            4
+        );
+        let mut mutations = MutationState::new();
+        hook::cleanup_session(
+            &mut sessions,
+            &backend,
+            &mut mutations,
+            &mut hooks,
+            &session_id,
+        )
+        .unwrap();
+        assert!(!hooks.feature_resolutions.contains_key(&session_id));
+        assert_eq!(backend.allocation_count(), 0);
+    }
 
     fn activate_client_base(
         sessions: &mut crate::process::ProcessSessionRegistry<crate::hook::tests::Handle>,

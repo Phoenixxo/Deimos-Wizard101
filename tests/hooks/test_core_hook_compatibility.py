@@ -143,6 +143,34 @@ class CoreHookCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.backend = AgentCoreHookBackend()
         self.handler = HookHandler(self.backend, client=object())
 
+    async def test_startup_inspects_all_features_before_installing_core_hooks(self):
+        self.backend.supports_feature_hooks = True
+
+        def preflight():
+            self.backend.calls.append(("preflight",))
+            return {"hooks": [
+                {"hook": name, "available": False,
+                 "error": {"message": "No validated runtime target"}}
+                for name in self.handler._AGENT_FEATURE_HOOK_NAMES
+            ]}
+
+        self.backend.preflight_feature_hooks = preflight
+        self.backend.activate_feature_hook = MagicMock()
+        await self.handler.activate_all_hooks(wait_for_ready=False)
+        self.assertEqual(self.backend.calls[:2], [("preflight",), ("activate_all",)])
+        self.assertEqual(self.backend.active, CORE_HOOKS)
+        self.assertEqual(set(self.handler.feature_hook_availability), self.handler._AGENT_FEATURE_HOOK_NAMES)
+        self.backend.activate_feature_hook.assert_not_called()
+        await self.handler.close()
+
+    async def test_incomplete_startup_discovery_cannot_install_any_hooks(self):
+        self.backend.supports_feature_hooks = True
+        self.backend.preflight_feature_hooks = lambda: {"hooks": []}
+        with self.assertRaisesRegex(RuntimeError, "did not inspect every"):
+            await self.handler.activate_all_hooks(wait_for_ready=False)
+        self.assertFalse(self.backend.active)
+        self.assertFalse(self.handler._active_hooks)
+
     async def test_each_legacy_entrypoint_uses_an_isolated_high_level_operation(self):
         for index, (hook, activate, deactivate, read_base) in enumerate(HOOK_CASES, 1):
             self.backend.bases[hook] = 0x1000 + index
