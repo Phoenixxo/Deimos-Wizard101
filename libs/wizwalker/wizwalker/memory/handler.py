@@ -1,4 +1,5 @@
 import asyncio
+from os import getenv
 import struct
 from typing import Any
 import warnings
@@ -8,6 +9,7 @@ import pymem.exception
 from loguru import logger
 
 from wizwalker import HookAlreadyActivated, HookNotActive, HookNotReady
+from .generated_hooks import GeneratedHookResolver
 from .hooks import (
     ChatHook,
     ChatSendHook,
@@ -45,6 +47,9 @@ class HookHandler(MemoryReader):
         super().__init__(process)
 
         self.client = client
+        self._generated_hooks = GeneratedHookResolver()
+        if getenv("DEIMOS_TRACE_GENERATED_HOOKS") == "1":
+            logger.enable(__name__)
 
         self._autobot_address = None
         self._autobot_lock = None
@@ -56,6 +61,14 @@ class HookHandler(MemoryReader):
         self._base_addrs = {}
 
         self._hook_cache = {}
+
+    async def resolve_generated_hook(
+        self, name: str, *, original: bytes | None = None
+    ) -> int | None:
+        address = await self._generated_hooks.resolve(self, name, original=original)
+        if address is not None:
+            logger.debug("Resolved generated hook {} at {:#x}", name, address)
+        return address
 
     async def _get_open_autobot_address(self, size: int) -> int:
         if self._autobot_pos + size > self.AUTOBOT_SIZE:

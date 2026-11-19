@@ -54,6 +54,11 @@ class MemoryReader:
 
         return await loop.run_in_executor(None, function)
 
+    async def loaded_module(self, name: str):
+        return await self.run_in_executor(
+            pymem.process.module_from_name, self.process.process_handle, name
+        )
+
     def _get_symbols(self, file_path: str, *, force_reload: bool = False):
         if (dll_table := self._symbol_table.get(file_path)) and not force_reload:
             return dll_table

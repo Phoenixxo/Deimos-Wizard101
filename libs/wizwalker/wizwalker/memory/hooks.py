@@ -8,6 +8,7 @@ import warnings
 
 from loguru import logger
 
+from wizwalker.errors import MemoryReadError
 from .memory_reader import MemoryReader
 from wizwalker.constants import kernel32
 
@@ -89,13 +90,15 @@ class MemoryHook(MemoryReader):
     async def get_pattern(self) -> Tuple[bytes, str]:
         raise NotImplemented()
 
+    async def _resolve_jump_address(self) -> int:
+        pattern, module = await self.get_pattern()
+        return await self.get_jump_address(pattern, module=module)
+
     async def hook(self):
         """
         Writes jump_bytecode to jump address and hook bytecode to hook address
         """
-        pattern, module = await self.get_pattern()
-
-        self.jump_address = await self.get_jump_address(pattern, module=module)
+        self.jump_address = await self._resolve_jump_address()
         self.hook_address = await self.get_hook_address(50)
 
         logger.debug(f"Got hook address {self.hook_address} in {type(self)}")
@@ -118,9 +121,12 @@ class MemoryHook(MemoryReader):
         await self.prehook()
 
         await self.write_bytes(self.hook_address, self.hook_bytecode)
-        await self.write_bytes(self.jump_address, self.jump_bytecode)
+        await self._install_jump()
 
         await self.posthook()
+
+    async def _install_jump(self):
+        await self.write_bytes(self.jump_address, self.jump_bytecode)
 
     async def unhook(self):
         """
@@ -162,9 +168,33 @@ class SimpleHook(AutoBotBaseHook):
     instruction_length = 5
     exports = None
     noops = 0
+    generated_name = None
+    generated_original = b""
+    _generated_target = False
 
     async def get_pattern(self):
         return self.pattern, self.module
+
+    async def _resolve_jump_address(self) -> int:
+        if self._generated_target:
+            del self.instruction_length
+            self._generated_target = False
+        if self.generated_name is not None and len(self.generated_original) == 5 + self.noops:
+            address = await self.hook_handler.resolve_generated_hook(
+                self.generated_name, original=self.generated_original
+            )
+            if address is not None:
+                self.instruction_length = len(self.generated_original)
+                self._generated_target = True
+                return address
+        return await super()._resolve_jump_address()
+
+    async def _install_jump(self):
+        if self._generated_target:
+            original = await self.read_bytes(self.jump_address, len(self.generated_original))
+            if original != self.generated_original:
+                raise MemoryReadError("The bytes at the hook address changed before installation.")
+        await super()._install_jump()
 
     async def get_jump_bytecode(self) -> bytes:
         distance = self.hook_address - self.jump_address
@@ -205,6 +235,8 @@ class SimpleHook(AutoBotBaseHook):
 
 
 class PlayerHook(SimpleHook):
+    generated_name = "core.player"
+    generated_original = b"\xF2\x0F\x10\x40\x58"
     pattern = rb"\xF2\x0F\x10\x40\x58\xF2"
     exports = [("player_struct", 8)]
 
@@ -220,12 +252,14 @@ class PlayerHook(SimpleHook):
             # mov(abs) [addr], rax
             b"\x48\xA3" + packed_exports[0][1] +
             # original code
-            b"\xF2\x0F\x10\x40\x58"  # movsd xxmo,[rax+58]
+            self.generated_original
         )
         return bytecode
 
 
 class PlayerStatHook(SimpleHook):
+    generated_name = "core.player_stat"
+    generated_original = b"\x2B\xD8\xB8\x00\x00\x00\x00"
     pattern = rb"\x2B\xD8\xB8....\x0F\x49\xC3\x48\x83\xC4\x20\x5B\xC3"
     instruction_length = 7
     exports = [("stat_addr", 8)]
@@ -237,16 +271,17 @@ class PlayerStatHook(SimpleHook):
                 b"\x50"  # push rax
                 b"\x48\x89\xC8"  # mov rax, rcx
                 b"\x48\xA3" + packed_exports[0][1] +  # mov qword ptr [stat_export], rax
-                b"\x58"  # pop rax
+                b"\x58" +  # pop rax
                 # original code
-                b"\x2B\xD8"  # sub ebx, eax
-                b"\xB8\x00\x00\x00\x00"  # mov eax, 0
+                self.generated_original
         )
         # fmt: on
         return bytecode
 
 
 class QuestHook(SimpleHook):
+    generated_name = "core.quest"
+    generated_original = b"\xF3\x41\x0F\x10\x87\xFC\x0C\x00\x00"
     pattern = rb"\xF3\x41\x0F\x10.\xFC\x0C\x00\x00\xF3\x0F\x11"
     exports = [("cord_struct", 4)]
     noops = 4
@@ -258,14 +293,16 @@ class QuestHook(SimpleHook):
                 b"\x49\x8D\x87\xFC\x0C\x00\x00"  #lea rax,[r15+00000CFC]
 
                 b"\x48\xA3" + packed_exports[0][1] +  # mov [export],rax
-                b"\x58"  # pop rax
-                b"\xF3\x41\x0F\x10\x87\xFC\x0C\x00\x00"  # original code 
+                b"\x58" +  # pop rax
+                self.generated_original
         )
         # fmt: on
         return bytecode
 
 
 class ClientHook(SimpleHook):
+    generated_name = "core.client"
+    generated_original = b"\x48\x8B\x9B\xC0\x01\x00\x00"
     pattern = (
         rb"\x18\x48......\x48\x8B\x7C\x24\x38\x48\x85\xFF\x74\x29\x8B\xC6\xF0\x0F\xC1\x47\x08\x83\xF8\x01\x75\x1D"
         rb"\x48\x8B\x07\x48\x8B\xCF\xFF\x50\x08\xF0\x0F\xC1\x77\x0C"
@@ -289,8 +326,8 @@ class ClientHook(SimpleHook):
                 b"\x50"  # push rax
                 b"\x48\x8B\xC7"  # mov rax,rdi
                 b"\x48\xA3" + packed_exports[0][1] +  # mov [current_client], rax
-                b"\x58"  # pop rax
-                b"\x48\x8B\x9B\xC0\x01\x00\x00"  # original instruction
+                b"\x58" +  # pop rax
+                self.generated_original
         )
         # fmt: on
 
@@ -298,6 +335,8 @@ class ClientHook(SimpleHook):
 
 
 class RootWindowHook(SimpleHook):
+    generated_name = "core.root_window"
+    generated_original = b"\x49\x8B\x8D\xD8\x00\x00\x00"
     pattern = rb".......\x48\x8B\x01.......\xFF\x50\x70\x84"
     instruction_length = 7
     noops = 2
@@ -309,8 +348,8 @@ class RootWindowHook(SimpleHook):
             b"\x50"  # push rax
             b"\x49\x8B\x85\xD8\x00\x00\x00"  # mov rax,[r13+D8]
             b"\x48\xA3" + packed_exports[0][1] +  # mov [current_root_window_addr], rax
-            b"\x58"  # pop rax
-            b"\x49\x8B\x8D\xD8\x00\x00\x00"  # original instruction
+            b"\x58" +  # pop rax
+            self.generated_original
         )
         # fmt: on
 
@@ -318,6 +357,8 @@ class RootWindowHook(SimpleHook):
 
 
 class RenderContextHook(SimpleHook):
+    generated_name = "core.render_context"
+    generated_original = b"\xF3\x44\x0F\x10\x8B\x98\x00\x00\x00"
     pattern = rb"..................\xF3\x41\x0F\x10\x28\xF3\x0F\x10\x56\x04\x48\x63\xC1"
     instruction_length = 9
     noops = 4
@@ -329,8 +370,8 @@ class RenderContextHook(SimpleHook):
             b"\x50"  # push rax
             b"\x48\x89\xd8"  # mov rax,rbx
             b"\x48\xA3" + packed_exports[0][1] +  # mov [current_ui_scale_addr],rax
-            b"\x58"  # pop rax
-            b"\xF3\x44\x0F\x10\x8B\x98\x00\x00\x00"  # original instruction
+            b"\x58" +  # pop rax
+            self.generated_original
         )
         # fmt: on
 

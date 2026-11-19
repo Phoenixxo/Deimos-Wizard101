@@ -361,6 +361,10 @@ class CurrentDuel(Duel):
 
     async def read_base_address(self) -> int:
         if not self._duel_manager_addr:
+            self._duel_manager_addr = await self.hook_handler.resolve_generated_hook(
+                "combat.duel_manager"
+            )
+        if not self._duel_manager_addr:
             mov_instruction_addr = await self.hook_handler.pattern_scan(
                 rb".......\xE8....\x90.......\x48\x85\xC9\x74.\x0F\x28\x45",
                 module="WizardGraphicalClient.exe"
